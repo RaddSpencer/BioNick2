@@ -50,6 +50,9 @@ enum : uint32_t {
 
 static uint32_t g_regs[0x10000];
 static bool g_constDirty = true;
+// Display gamma ramp the game programs into the display controller. Scanout applies it, so presenting must too.
+static uint32_t g_lutEntries[256], g_lutIndex = 0;
+static bool g_lutDirty = false, g_lutSet = false;
 static uint8_t* g_base = nullptr;
 static int g_trace = 0;
 
@@ -72,6 +75,16 @@ void gpu_reg(uint32_t r, uint32_t v) {
     if (r >= 0x10000) return;
     g_regs[r] = v;
     if (r >= R_CONST && r < R_CONST + 0x800) g_constDirty = true;
+    if (r == 0x1922) g_lutIndex = v & 0xFF;                                 // DC_LUT_RW_INDEX
+    else if (r == 0x1925) {                                                 // DC_LUT_30_COLOR: 10 bits each, red high, auto-increments
+        g_lutEntries[g_lutIndex] = v;
+        g_lutIndex = (g_lutIndex + 1) & 0xFF;
+        g_lutDirty = g_lutSet = true;
+    }
+    if (r >= 0x1900 && r < 0x1B00 && r != 0x1925) {                         // other display controller registers, for reference
+        static int shown = 0;
+        if (shown++ < 40) fprintf(stderr, "[dc] reg %04X = %08X\n", r, v);
+    }
 }
 
 static inline float reg_f(uint32_t r) { float f; memcpy(&f, &g_regs[r], 4); return f; }
@@ -105,7 +118,9 @@ static ComPtr<ID3D11Buffer> g_cbFloat, g_cbState, g_cbBlit, g_vbRing, g_ibRing;
 static ComPtr<ID3D11ShaderResourceView> g_vbSrv;
 static ComPtr<ID3D11GeometryShader> g_gsRect;
 static ComPtr<ID3D11VertexShader> g_vsBlit;
-static ComPtr<ID3D11PixelShader> g_psBlit, g_psBlitDepth, g_psBlitRaw, g_psColorToDepth;
+static ComPtr<ID3D11PixelShader> g_psBlit, g_psBlitDepth, g_psBlitRaw, g_psColorToDepth, g_psPresentLut;
+static ComPtr<ID3D11Texture2D> g_lutTex;
+static ComPtr<ID3D11ShaderResourceView> g_lutSrv;
 static ComPtr<ID3D11SamplerState> g_blitSampler;
 static const uint32_t kVbRingSize = 96u << 20, kIbRingSize = 16u << 20;
 static uint32_t g_vbPos = 0, g_ibPos = 0;
@@ -227,6 +242,18 @@ static bool device_init() {
         "float4 main(float4 p:SV_Position):SV_Target { int3 c=int3(int2(p.xy*scale+ofs),0); float x=src.Load(c); uint d=(x>=0.5)?((uint)round(x*16777216.0)-1u):(uint)round(x*16777215.0); d=min(d,0xFFFFFFu); uint s=sten.Load(c).g;\n"
         "  uint w=(d<<8)|(s&255); return float4(w&255,(w>>8)&255,(w>>16)&255,(w>>24)&255)/255.0; }\n";
     if (auto b = compile_cached(blitRaw, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psBlitRaw);
+    const char* presentLut =
+        "Texture2D src:register(t0); Texture2D lut:register(t1); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
+        "float4 main(float4 p:SV_Position):SV_Target { float4 c=src.Load(int3(int2(p.xy*scale+ofs),0)); if(swaprb) c=c.bgra;\n"
+        "  int3 i=(int3)round(saturate(c.rgb)*255.0);\n"
+        "  return float4(lut.Load(int3(i.r,0,0)).r, lut.Load(int3(i.g,0,0)).g, lut.Load(int3(i.b,0,0)).b, 1.0); }\n";
+    if (auto b = compile_cached(presentLut, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentLut);
+    {
+        D3D11_TEXTURE2D_DESC d{}; d.Width = 256; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R10G10B10A2_UNORM; d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        g_dev->CreateTexture2D(&d, nullptr, &g_lutTex);
+        if (g_lutTex) g_dev->CreateShaderResourceView(g_lutTex.Get(), nullptr, &g_lutSrv);
+    }
     // EDRAM aliasing: as 8_8_8_8 the sample is A<<24|B<<16|G<<8|R, as D24S8 the same dword is D24<<8|S8. Depth tiles
     // also have their 40-pixel left and right halves swapped relative to colour (the game's restore shader assumes this).
     const char* c2d =
@@ -1971,7 +1998,20 @@ static void do_swap(uint32_t front) {
     if (s) {
         if (s->base != fp) logf_once("frontoff", "front buffer %X inside surface %X", fp, s->base);
         // A swapped resolve holds what guest memory would hold (B in the low byte); scanout undoes that.
-        blit(s->srv.Get(), g_psBlit.Get(), g_backRtv.Get(), 1280, 720, 0, 0, 1280, 720, 0, 0, s->swapped, (float)s->w / 1280.0f, (float)s->h / 720.0f);
+        static const bool kNoRamp = getenv("BCR2_NOGAMMARAMP") != nullptr;
+        if (g_lutDirty && g_lutTex) {
+            uint32_t texel[256];
+            for (int i = 0; i < 256; i++) {                                 // register holds red in the high bits, the texture in the low bits
+                uint32_t v = g_lutEntries[i];
+                texel[i] = ((v >> 20) & 0x3FF) | (((v >> 10) & 0x3FF) << 10) | ((v & 0x3FF) << 20) | (3u << 30);
+            }
+            g_ctx->UpdateSubresource(g_lutTex.Get(), 0, nullptr, texel, sizeof(texel), 0);
+            g_lutDirty = false;
+            static int nl = 0;
+            if (nl++ < 4) fprintf(stderr, "[gfx] display gamma ramp loaded: in 64 -> %u, 128 -> %u, 192 -> %u, 255 -> %u (of 1023)\n", g_lutEntries[64] & 0x3FF, g_lutEntries[128] & 0x3FF, g_lutEntries[192] & 0x3FF, g_lutEntries[255] & 0x3FF);
+        }
+        bool useRamp = g_lutSet && !kNoRamp && g_psPresentLut && g_lutSrv;
+        blit(s->srv.Get(), useRamp ? g_psPresentLut.Get() : g_psBlit.Get(), g_backRtv.Get(), 1280, 720, 0, 0, 1280, 720, 0, 0, s->swapped, (float)s->w / 1280.0f, (float)s->h / 720.0f, useRamp ? g_lutSrv.Get() : nullptr);
     } else {
         float c[4] = { 0.05f, 0.0f, 0.1f, 1 };
         g_ctx->ClearRenderTargetView(g_backRtv.Get(), c);

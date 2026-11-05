@@ -1537,6 +1537,14 @@ static bool fast_clear(bool withColor) {
     return true;
 }
 
+// The slowest single draw of the frame, for the [spike] line: one stalled call and evenly slow draws need different fixes.
+static double g_worstDrawMs = 0; static uint64_t g_worstVs = 0; static uint32_t g_worstNum = 0, g_worstSurf = 0;
+struct WorstDraw {
+    uint32_t num; LARGE_INTEGER a;
+    explicit WorstDraw(uint32_t n) : num(n) { QueryPerformanceCounter(&a); }
+    ~WorstDraw() { LARGE_INTEGER b; QueryPerformanceCounter(&b); double ms = (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs; if (ms > g_worstDrawMs) { g_worstDrawMs = ms; g_worstVs = g_vsHash; g_worstNum = num; g_worstSurf = g_regs[R_SURFACE_INFO]; } }
+};
+
 static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBase, uint32_t dmaSize) {
     uint32_t prim = init & 63, srcSel = (init >> 6) & 3, idx32 = (init >> 11) & 1, num = init >> 16;
     uint32_t edram = g_regs[R_MODECONTROL] & 7;
@@ -1549,6 +1557,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     watch_surface("before draw/resolve");
     if (edram == 6) { PerfScope perfRes(g_tResolve); do_resolve(); watch_surface("after resolve"); return; }
     PerfScope perfDraw(g_tDraw);
+    WorstDraw worstDraw(num);
     if (edram == 0 || num == 0 || prim == 0) return;
     if (prim >= 0x10) { logf_once(S("prim%u", prim).c_str(), "unsupported primitive type %u", prim); return; }
     if (prim == 1) logf_once("points", "point list drawn as 1-pixel points (no sprite expansion yet)");
@@ -2564,14 +2573,15 @@ static void do_swap(uint32_t front) {
             static double pD = 0, pT = 0, pR = 0, pP = 0; static uint64_t pW0 = 0, pW1 = 0, pW2 = 0, pCompiles = 0, pUploads = 0, pUpBytes = 0;
             uint64_t w0 = g_waitTicks[0].load(), w1 = g_waitTicks[1].load(), w2 = g_waitTicks[2].load();
             double ms = prevSwap.QuadPart ? (double)(now.QuadPart - prevSwap.QuadPart) * g_perfTicksToMs : 0;
+            const double worstDraw = g_worstDrawMs; g_worstDrawMs = 0;
             if (ms > 20.0 && g_frame > 300) {
                 static int nSpike = 0;
-                if (nSpike++ < 400)
-                    fprintf(stderr, "[spike] frame=%llu ms=%.1f draw=%.1f tex=%.1f res=%.1f pres=%.1f ring=%.1f reg=%.1f intr=%.1f compiles=%llu uploads=%llu upKB=%llu\n",
+                if (nSpike++ < 20000)
+                    fprintf(stderr, "[spike] frame=%llu ms=%.1f draw=%.1f tex=%.1f res=%.1f pres=%.1f ring=%.1f reg=%.1f intr=%.1f compiles=%llu uploads=%llu upKB=%llu worst=%.1f vs=%016llX num=%u surf=%08X\n",
                             (unsigned long long)g_frame, ms, g_tDraw >= pD ? g_tDraw - pD : g_tDraw, g_tTex >= pT ? g_tTex - pT : g_tTex,
                             g_tResolve >= pR ? g_tResolve - pR : g_tResolve, g_tPresent >= pP ? g_tPresent - pP : g_tPresent,
                             (w0 >= pW0 ? w0 - pW0 : w0) * g_perfTicksToMs, (w1 >= pW1 ? w1 - pW1 : w1) * g_perfTicksToMs, (w2 >= pW2 ? w2 - pW2 : w2) * g_perfTicksToMs,
-                            (unsigned long long)(g_nCompiles - pCompiles), (unsigned long long)(g_nUploads - pUploads), (unsigned long long)((g_upBytes - pUpBytes) / 1024));
+                            (unsigned long long)(g_nCompiles - pCompiles), (unsigned long long)(g_nUploads - pUploads), (unsigned long long)((g_upBytes - pUpBytes) / 1024), worstDraw, (unsigned long long)g_worstVs, g_worstNum, g_worstSurf);
             }
             pD = g_tDraw; pT = g_tTex; pR = g_tResolve; pP = g_tPresent; pW0 = w0; pW1 = w1; pW2 = w2; pCompiles = g_nCompiles; pUploads = g_nUploads; pUpBytes = g_upBytes;
         }

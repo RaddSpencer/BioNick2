@@ -290,6 +290,7 @@ static void MmQueryAllocationSize_(PPCContext& ctx, uint8_t*) {
 }
 
 #include "gpu.h"
+#include "audio.h"
 // ---- GPU interface (stage 1: record parameters; a null GPU will consume them later) ----
 struct GpuState {
     uint32_t intrCb = 0, intrCtx = 0;       // VdSetGraphicsInterruptCallback
@@ -1855,7 +1856,7 @@ static void XAudioGetSpeakerConfig_(PPCContext& ctx, uint8_t* base) {
     if (ctx.r3.u32) wr32(base, ctx.r3.u32, 0x00010001);
     ctx.r3.u64 = 0;
 }
-// ---- null audio output: asks the client for a frame every 256 samples at 48 kHz (5.33 ms) and discards the result ----
+// ---- audio output: asks the client for a frame whenever the device has room for 256 samples at 48 kHz; with no device, every 5.33 ms ----
 static std::atomic<uint32_t> g_audioCb{0}, g_audioArg{0};
 static std::atomic<uint64_t> g_audioFrames{0};
 static void audio_thread(uint8_t* base) {
@@ -1875,7 +1876,8 @@ static void audio_thread(uint8_t* base) {
         uint32_t cb = g_audioCb.load();
         if (!cb) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); next = std::chrono::steady_clock::now(); continue; }
         auto now = std::chrono::steady_clock::now();
-        if (now < next) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+        int room = audio_out_room();
+        if (room == 0 || (room < 0 && now < next)) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
         next += kFrame;
         if (next < now - std::chrono::milliseconds(100)) next = now;   // don't try to catch up after a long stall
         ctx.r1.u32  = STK + STKSZ - 0x100;
@@ -1909,6 +1911,12 @@ static void XAudioUnregisterRenderDriverClient_(PPCContext& ctx, uint8_t*) {
     ctx.r3.u64 = 0;
 }
 
+// XAudioSubmitRenderDriverFrame(driver, samples*): called from inside the client's callback, on the audio thread
+static void XAudioSubmitRenderDriverFrame_(PPCContext& ctx, uint8_t* base) {
+    if (ctx.r4.u32) audio_out_submit(base + ctx.r4.u32);
+    ctx.r3.u64 = 0;
+}
+
 static void XAudioGetVoiceCategoryVolume_(PPCContext& ctx, uint8_t* base) {
     if (ctx.r4.u32) wr32(base, ctx.r4.u32, 0x3F800000);   // 1.0f
     ctx.r3.u64 = 0;
@@ -1926,9 +1934,18 @@ static void XGetGameRegion_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = 0xFFFF; }
 static void XamInputGetKeystrokeEx_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = 0x10D2; }   // ERROR_EMPTY
 
 // XMsgInProcessCall(app, message, buffer*, size): unknown XAM service request -> report "not found" and log it
-static void XMsgInProcessCall_(PPCContext& ctx, uint8_t*) {
+static void XMsgInProcessCall_(PPCContext& ctx, uint8_t* base) {
     fprintf(stderr, "[xam] XMsgInProcessCall app=%08X msg=%08X buf=%08X size=%08X lr=%08X\n",
             ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, (uint32_t)ctx.lr);
+    // XMP (media player) GetPlaybackController {client, controller*, locked*}: 0 and 0 means the title controls playback, not the user's own music.
+    // The game reads both as soon as this returns without a negative status, so leaving them unset silences its music.
+    if (ctx.r3.u32 == 0xFA && ctx.r4.u32 == 0x0007001B && ctx.r5.u32) {
+        uint32_t controller = rd32(base, ctx.r5.u32 + 4), locked = rd32(base, ctx.r5.u32 + 8);
+        if (controller) wr32(base, controller, 0);
+        if (locked) wr32(base, locked, 0);
+        ctx.r3.u64 = 0;
+        return;
+    }
     ctx.r3.u64 = 0x490;   // ERROR_NOT_FOUND
 }
 
@@ -2300,7 +2317,7 @@ register_by_name("XamInputSetState",         XamInputSetState_);
 register_by_name("XAudioGetSpeakerConfig",            XAudioGetSpeakerConfig_);
 register_by_name("XAudioRegisterRenderDriverClient",  XAudioRegisterRenderDriverClient_);
 register_by_name("XAudioUnregisterRenderDriverClient", XAudioUnregisterRenderDriverClient_);
-register_by_name("XAudioSubmitRenderDriverFrame",     ReturnZero_);
+register_by_name("XAudioSubmitRenderDriverFrame",     XAudioSubmitRenderDriverFrame_);
 register_by_name("XAudioGetVoiceCategoryVolume",  XAudioGetVoiceCategoryVolume_);
 register_by_name("XAudioSetVoiceCategoryVolume",  ReturnZero_);
 

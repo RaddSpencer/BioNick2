@@ -1327,6 +1327,14 @@ static ID3D11SamplerState* get_sampler(const uint32_t* tf, const TexUse& u) {
     static const int kAnisoForce = getenv("BCR2_ANISO") ? atoi(getenv("BCR2_ANISO")) : -1;
     uint32_t anisoField = (tf[3] >> 25) & 7, aniso = (anisoField >= 2 && anisoField <= 5) ? (1u << (anisoField - 1)) : 1;
     if (kAnisoForce >= 0 && aniso > 1) aniso = kAnisoForce > 1 ? (uint32_t)std::min(kAnisoForce, 16) : 1;
+    {   // experiment: BCR2_DEPTHPOINT samples depth textures without filtering, since blending depth values gives depths that exist nowhere in the scene
+        static const bool kDepthPoint = getenv("BCR2_DEPTHPOINT") != nullptr;
+        uint32_t texFmt = tf[1] & 63;
+        if (kDepthPoint && (texFmt == 22 || texFmt == 23)) { mag = min = mip = 0; aniso = 1; }
+        static std::set<uint64_t> seen;
+        if (g_trace > 1000 && (texFmt == 22 || texFmt == 23) && seen.insert(((uint64_t)tf[1] << 8) | u.slot).second)
+            fprintf(stderr, "[depthfetch] slot=%u base=%08X fmt=%u mag=%u min=%u mip=%u (fetch %u %u %u, shader %d %d %d)\n", u.slot, tf[1] & 0xFFFFF000u, texFmt, mag, min, mip, (tf[3] >> 19) & 3, (tf[3] >> 21) & 3, (tf[3] >> 23) & 3, u.magf, u.minf, u.mipf);
+    }
     uint32_t in[11] = { cx, cy, cz, mag, min, mip, border, minL, maxL, (uint32_t)lodBias32, aniso };
     uint64_t k = fnv64(in, sizeof(in));
     auto& e = g_samplers[k];
@@ -1352,6 +1360,7 @@ static ID3D11SamplerState* get_sampler(const uint32_t* tf, const TexUse& u) {
 }
 
 // ---- draw ----
+static bool g_probeQLight = false;                                          // BCR2_PROBEQLIGHT: probe the BCR2_DUMPFRAME range without the draw trace, which changes timing
 struct ProbeQ { ComPtr<ID3D11Texture2D> st; ID3D11Resource* res = nullptr; std::string text; };
 static std::vector<ProbeQ> g_probeQ;
 static void probeq_report() {
@@ -1939,6 +1948,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             res->Release();
         }
     } probe(rtvs[0], rw, rh, 0);
+    {   // experiment: BCR2_SKIPVS=<hash> leaves out draws using this vertex shader, to test what depends on them
+        static const char* kSkip = getenv("BCR2_SKIPVS");
+        if (kSkip && S("%016llX", (unsigned long long)vs->hash) == kSkip) return;
+    }
     if (useIdx) {
         uint32_t bytes = drawCount * 4;
         if (bytes > kIbRingSize) { logf_once("ibbig", "index data too large"); return; }
@@ -1954,9 +1967,28 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     } else {
         g_ctx->Draw(drawCount, 0);
     }
+    {   // BCR2_DRAWPRINT=<surface info hex>, with BCR2_PROBEQLIGHT: a fingerprint of each draw to that target, to compare a frame's draws against another frame's
+        static const char* kPrint = getenv("BCR2_DRAWPRINT");
+        static const uint32_t kPrintSurf = kPrint ? (uint32_t)strtoul(kPrint, nullptr, 16) : 0;
+        if (kPrint && g_probeQLight && g_regs[R_SURFACE_INFO] == kPrintSurf) {
+            uint64_t ch = fnv64(&g_regs[R_CONST], 8192), rh = fnv64(&g_regs[0x2000], 0x400 * 4), fh = fnv64(&g_regs[R_FETCH], 0xC0 * 4);
+            uint64_t ih = useIdx ? fnv64(useIdx->data(), useIdx->size() * 4) : 0;
+            uint32_t vf0 = g_regs[R_FETCH + 95 * 2] & ~3u, vfw = (g_regs[R_FETCH + 95 * 2 + 1] >> 2) & 0xFFFFFF;
+            uint64_t vh = vf0 ? fnv64(phys(vf0), vfw * 4) : 0;
+            static const char* kFull = getenv("BCR2_DRAWPRINTFULL");        // vertex shader hash: also print every register and shader constant at its draws
+            if (kFull && (kFull[0] == '*' || S("%016llX", (unsigned long long)vs->hash) == kFull)) {
+                fprintf(stderr, "[dpfull] f=%llu", (unsigned long long)g_frame);
+                for (uint32_t r = 0x2000; r < 0x2400; r++) if (g_regs[r]) fprintf(stderr, " r%04X=%08X", r, g_regs[r]);
+                for (uint32_t r = 0; r < 512; r++) { const uint32_t* c = &g_regs[R_CONST + r * 4]; if (c[0] | c[1] | c[2] | c[3]) fprintf(stderr, " c%u=%08X,%08X,%08X,%08X", r, c[0], c[1], c[2], c[3]); }
+                for (uint32_t r = 0; r < 8; r++) fprintf(stderr, " b%u=%08X", r, g_regs[R_BOOL + r]);
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "[dp] f=%llu vs=%016llX ps=%016llX num=%u vf=%08X/%u idx=%016llX vb=%016llX const=%016llX regs=%016llX fetch=%016llX c204=%08X,%08X,%08X,%08X\n", (unsigned long long)g_frame, (unsigned long long)vs->hash, ps ? (unsigned long long)ps->hash : 0ull, drawCount, vf0, vfw, (unsigned long long)ih, (unsigned long long)vh, (unsigned long long)ch, (unsigned long long)rh, (unsigned long long)fh, g_regs[R_CONST + 204 * 4], g_regs[R_CONST + 204 * 4 + 1], g_regs[R_CONST + 204 * 4 + 2], g_regs[R_CONST + 204 * 4 + 3]);
+        }
+    }
     // BCR2_PROBEQ="x,y": like BCR2_PROBE, but only queues a pixel copy after each draw and reads them at the end of the frame, so nothing forces a sync.
     static const char* kProbeQ = getenv("BCR2_PROBEQ");
-    if (kProbeQ && g_trace > 1000 && rtvs[0]) {
+    if (kProbeQ && (g_trace > 1000 || g_probeQLight) && rtvs[0]) {
         uint32_t qx = 0, qy = 0; sscanf(kProbeQ, "%u,%u", &qx, &qy);
         ComPtr<ID3D11Resource> res; rtvs[0]->GetResource(&res);
         D3D11_TEXTURE2D_DESC d; ((ID3D11Texture2D*)res.Get())->GetDesc(&d);
@@ -1970,6 +2002,15 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
                 q.text = S("num=%u prim=%u idx=%d vs=%016llX ps=%016llX blend0=%08X dc=%08X mask=%08X col=%08X surf=%08X vf95=%08X/%08X c0=%g,%g,%g,%g tf0=%08X",
                            drawCount, prim, useIdx ? 1 : 0, (unsigned long long)vs->hash, ps ? (unsigned long long)ps->hash : 0ull, g_regs[R_BLEND0], g_regs[R_DEPTHCONTROL], g_regs[R_COLOR_MASK], g_regs[R_COLOR_INFO], g_regs[R_SURFACE_INFO],
                            g_regs[R_FETCH + 95 * 2], g_regs[R_FETCH + 95 * 2 + 1], reg_f(R_CONST), reg_f(R_CONST + 1), reg_f(R_CONST + 2), reg_f(R_CONST + 3), t0[1]);
+                static const char* kLightC = getenv("BCR2_LIGHTC");         // pixel shader hash: add its constants and fetch states to the probe line
+                if (kLightC && ps && S("%016llX", (unsigned long long)ps->hash) == kLightC) {
+                    q.text += S(" sr=%08X srbf=%08X surfd=%08X", g_regs[R_STENCIL], g_regs[R_STENCIL_BF], g_regs[R_DEPTH_INFO]) + " PC:";
+                    for (int k = 256; k < 276; k++) q.text += S(" c%d=%.7g,%.7g,%.7g,%.7g", k, reg_f(R_CONST + k * 4), reg_f(R_CONST + k * 4 + 1), reg_f(R_CONST + k * 4 + 2), reg_f(R_CONST + k * 4 + 3));
+                    for (int k = 508; k < 512; k++) q.text += S(" c%d=%.7g,%.7g,%.7g,%.7g", k, reg_f(R_CONST + k * 4), reg_f(R_CONST + k * 4 + 1), reg_f(R_CONST + k * 4 + 2), reg_f(R_CONST + k * 4 + 3));
+                    q.text += " VC:";
+                    for (int k = 0; k < 12; k++) q.text += S(" c%d=%.7g,%.7g,%.7g,%.7g", k, reg_f(R_CONST + k * 4), reg_f(R_CONST + k * 4 + 1), reg_f(R_CONST + k * 4 + 2), reg_f(R_CONST + k * 4 + 3));
+                    q.text += S(" tf0=%08X,%08X,%08X,%08X tf1=%08X,%08X,%08X,%08X", g_regs[R_FETCH], g_regs[R_FETCH + 1], g_regs[R_FETCH + 2], g_regs[R_FETCH + 3], g_regs[R_FETCH + 6], g_regs[R_FETCH + 7], g_regs[R_FETCH + 8], g_regs[R_FETCH + 9]);
+                }
                 g_probeQ.push_back(std::move(q));
             }
         }
@@ -2257,7 +2298,9 @@ static void dump_surfaces() {
     const char* dir = getenv("BCR2_SHOTDIR");
     if (!dir) return;
     std::vector<std::pair<Surface*, bool>> all;
-    for (auto& kv : g_surfaces) { all.push_back({ kv.second, false }); if (kv.second->rawTex) all.push_back({ kv.second, true }); }
+    static const char* kOnly = getenv("BCR2_DUMPONLY");                     // hex base address: dump just this surface
+    const uint32_t onlyBase = kOnly ? (uint32_t)strtoul(kOnly, nullptr, 16) : 0;
+    for (auto& kv : g_surfaces) { if (kOnly && kv.first != onlyBase) continue; all.push_back({ kv.second, false }); if (kv.second->rawTex) all.push_back({ kv.second, true }); }
     for (auto& ent : all) {
         Surface* s = ent.first;
         ID3D11Texture2D* from = ent.second ? s->rawTex.Get() : s->tex.Get();
@@ -2344,11 +2387,21 @@ static void update_display() {
 static void do_swap(uint32_t front) {
     update_display();
     static const int64_t kDumpCount = getenv("BCR2_DUMPCOUNT") ? _atoi64(getenv("BCR2_DUMPCOUNT")) : 1;   // that many consecutive frames, to compare stages between frames
+    static const bool kProbeLight = getenv("BCR2_PROBEQLIGHT") != nullptr;
+    if (kProbeLight) {
+        const bool closing = g_dumpFrame >= 0 && (int64_t)g_frame >= g_dumpFrame && (int64_t)g_frame < g_dumpFrame + kDumpCount;
+        g_probeQLight = g_dumpFrame >= 0 && (int64_t)g_frame + 1 >= g_dumpFrame && (int64_t)g_frame + 1 < g_dumpFrame + kDumpCount;
+        if (closing) { probeq_report(); if (getenv("BCR2_DUMPONLY")) dump_surfaces(); fprintf(stderr, "[frame-end] %llu\n", (unsigned long long)g_frame); }
+        g_trace = 0;
+    } else
     if (g_dumpFrame >= 0 && (int64_t)g_frame >= g_dumpFrame && (int64_t)g_frame < g_dumpFrame + kDumpCount) {
-        probeq_report(); dump_surfaces();
+        probeq_report();
+        static const bool kNoSurf = getenv("BCR2_DUMPNOSURF") != nullptr;   // pixel traces over many frames don't need the surface files
+        if (!kNoSurf) dump_surfaces();
+        fprintf(stderr, "[frame-end] %llu\n", (unsigned long long)g_frame);
         if ((int64_t)g_frame == g_dumpFrame + kDumpCount - 1) g_trace = 0;
     }
-    if ((int64_t)g_frame + 1 == g_dumpFrame) g_trace = 100000;
+    if ((int64_t)g_frame + 1 == g_dumpFrame && !kProbeLight) g_trace = 100000;
     uint32_t fp = front & 0x1FFFFFFFu;
     Surface* s = surface_at(fp);
     static int nl = 0;

@@ -1,0 +1,37 @@
+# game files and code generated from them
+private/
+ppc/
+*.xex
+*.bin
+
+# build output
+build/
+host/build/
+recomp_check/
+*.obj
+*.exe
+*.map
+
+# stale or empty tables
+*.bak
+functions_round2.toml
+
+# saves and test data
+host/saves*/
+
+# logs and captured output
+*.log
+*.out
+host/*.txt
+!host/CMakeLists.txt
+d[0-9]*.txt
+dump*.txt
+errctx.txt
+ppc_errors.txt
+errors_summary.txt
+classify.txt
+round2_ctx.txt
+bctr_*.txt
+imports.txt
+build_log.txt
+missing_entries.txt

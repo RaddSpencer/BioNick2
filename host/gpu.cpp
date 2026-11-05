@@ -114,6 +114,9 @@ static ComPtr<ID3D11DeviceContext1> g_ctx1;
 static ComPtr<IDXGISwapChain> g_swap;
 static ComPtr<ID3D11RenderTargetView> g_backRtv;
 static ComPtr<ID3D11Texture2D> g_backTex;
+static ComPtr<ID3D11SamplerState> g_presentSampler;
+static ComPtr<ID3D11PixelShader> g_psPresentPlain;
+static uint32_t g_backW = 1280, g_backH = 720;
 static bool g_devOk = false, g_noOverwriteSrv = false;
 static ComPtr<ID3D11Buffer> g_cbFloat, g_cbState, g_cbBlit, g_vbRing, g_ibRing;
 static ComPtr<ID3D11ShaderResourceView> g_vbSrv;
@@ -127,8 +130,25 @@ static const uint32_t kVbRingSize = 96u << 20, kIbRingSize = 16u << 20;
 static uint32_t g_vbPos = 0, g_ibPos = 0;
 static uint64_t g_frame = 0, g_draws = 0, g_resolves = 0, g_drawsFrame = 0;
 
+// Display modes. The window thread only asks; the GPU thread owns the swap chain and makes the change between frames.
+// Alt+Enter or F11: windowed fullscreen. Shift+Alt+Enter: exclusive fullscreen. BCR2_DISPLAY=window|borderless|fullscreen picks the starting mode.
+enum DisplayMode { kWindowed = 0, kBorderless = 1, kExclusive = 2 };
+static std::atomic<int> g_modeWanted{kWindowed};
+static std::atomic<bool> g_sizeChanged{false};
+static int g_modeNow = kWindowed;
+
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }
+    if (m == WM_SIZE) g_sizeChanged = true;
+    if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
+    if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29))) || (m == WM_KEYDOWN && w == VK_F11)) {
+        if (!(l & (1 << 30))) {                                             // ignore auto-repeat
+            int want = (m == WM_SYSKEYDOWN && (GetKeyState(VK_SHIFT) & 0x8000)) ? kExclusive : kBorderless;
+            g_modeWanted = g_modeWanted.load() == kWindowed ? want : kWindowed;
+        }
+        return 0;
+    }
+    if (m == WM_SYSCHAR && w == VK_RETURN) return 0;                        // no error beep
     return DefWindowProcW(h, m, w, l);
 }
 static DWORD WINAPI window_thread(LPVOID ev) {
@@ -202,6 +222,16 @@ static bool device_init() {
     if (SUCCEEDED(g_dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opt, sizeof(opt)))) g_noOverwriteSrv = opt.MapNoOverwriteOnDynamicBufferSRV && !getenv("BCR2_NONOOVERWRITE");
     g_swap->GetBuffer(0, IID_PPV_ARGS(&g_backTex));
     g_dev->CreateRenderTargetView(g_backTex.Get(), nullptr, &g_backRtv);
+    {
+        ComPtr<IDXGIFactory1> factory;
+        if (SUCCEEDED(g_swap->GetParent(IID_PPV_ARGS(&factory)))) factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+        if (const char* mode = getenv("BCR2_DISPLAY")) {
+            if (!strcmp(mode, "borderless")) g_modeWanted = kBorderless;
+            else if (!strcmp(mode, "fullscreen")) g_modeWanted = kExclusive;
+        }
+        D3D11_SAMPLER_DESC sd2{}; sd2.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; sd2.AddressU = sd2.AddressV = sd2.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; sd2.MaxLOD = D3D11_FLOAT32_MAX;
+        g_dev->CreateSamplerState(&sd2, &g_presentSampler);
+    }
 
     auto mkcb = [](UINT size, ComPtr<ID3D11Buffer>& out) {
         D3D11_BUFFER_DESC d{}; d.ByteWidth = size; d.Usage = D3D11_USAGE_DYNAMIC; d.BindFlags = D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -243,12 +273,17 @@ static bool device_init() {
         "float4 main(float4 p:SV_Position):SV_Target { int3 c=int3(int2(p.xy*scale+ofs),0); float x=src.Load(c); uint d=(x>=0.5)?((uint)round(x*16777216.0)-1u):(uint)round(x*16777215.0); d=min(d,0xFFFFFFu); uint s=sten.Load(c).g;\n"
         "  uint w=(d<<8)|(s&255); return float4(w&255,(w>>8)&255,(w>>16)&255,(w>>24)&255)/255.0; }\n";
     if (auto b = compile_cached(blitRaw, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psBlitRaw);
+    // Present samples with a filter, so the picture can be scaled. At 1:1 every sample lands on a texel centre, which gives the texel unchanged.
     const char* presentLut =
-        "Texture2D src:register(t0); Texture2D lut:register(t1); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
-        "float4 main(float4 p:SV_Position):SV_Target { float4 c=src.Load(int3(int2(p.xy*scale+ofs),0)); if(swaprb) c=c.bgra;\n"
-        "  int3 i=(int3)round(saturate(c.rgb)*255.0);\n"
-        "  return float4(lut.Load(int3(i.r,0,0)).r, lut.Load(int3(i.g,0,0)).g, lut.Load(int3(i.b,0,0)).b, 1.0); }\n";
+        "Texture2D src:register(t0); Texture2D lut:register(t1); SamplerState smp:register(s0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
+        "float4 main(float4 p:SV_Position):SV_Target { float w,h; src.GetDimensions(w,h); float4 c=src.SampleLevel(smp,(p.xy*scale+ofs)/float2(w,h),0); if(swaprb) c=c.bgra;\n"
+        "  float3 u=(saturate(c.rgb)*255.0+0.5)/256.0;\n"
+        "  return float4(lut.SampleLevel(smp,float2(u.r,0.5),0).r, lut.SampleLevel(smp,float2(u.g,0.5),0).g, lut.SampleLevel(smp,float2(u.b,0.5),0).b, 1.0); }\n";
     if (auto b = compile_cached(presentLut, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentLut);
+    const char* presentPlain =
+        "Texture2D src:register(t0); SamplerState smp:register(s0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
+        "float4 main(float4 p:SV_Position):SV_Target { float w,h; src.GetDimensions(w,h); float4 c=src.SampleLevel(smp,(p.xy*scale+ofs)/float2(w,h),0); return float4(swaprb? c.bgr : c.rgb,1.0); }\n";
+    if (auto b = compile_cached(presentPlain, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentPlain);
     {
         D3D11_TEXTURE2D_DESC d{}; d.Width = 256; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R10G10B10A2_UNORM; d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -1648,8 +1683,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         uint64_t avail = (uint64_t)words * 4;
         if (last > avail) last = avail;
         if (first >= last) { first = 0; last = std::min<uint64_t>(avail, 4096); }
-        // Upload the whole stream. Some draws read vertices outside the range their indices cover (why isn't known yet), and those landed on whatever
-        // sat next in the ring: stray black geometry and heavy flicker, even with a still camera. BCR2_VBRANGE restores the narrow upload, for comparison.
+        // Upload the whole stream: the index buffer doesn't say which vertices a shader reads. Instanced meshes compute vertex = index mod instance size
+        // in the vertex shader (vs 2090BFF4A9951B2D), so instance 5's indices are large while it reads the first vertices of the stream. A range taken from
+        // the indices missed those, and the shader read whatever sat nearby in the ring: stray black geometry and heavy flicker, even with a still camera.
+        // BCR2_VBRANGE restores the narrow upload, for comparison.
         static const bool kVbRange = getenv("BCR2_VBRANGE") != nullptr;
         if (!kVbRange) { first = 0; last = avail; }
         uint32_t size = (uint32_t)std::min<uint64_t>(last - first + 64, kVbRingSize / 2);
@@ -1872,12 +1909,13 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
 
 // ---- resolve ----
 static void blit(ID3D11ShaderResourceView* src, ID3D11PixelShader* ps, ID3D11RenderTargetView* dst, uint32_t dw, uint32_t dh,
-                 int dx0, int dy0, int dx1, int dy1, int sx, int sy, bool swaprb, float scaleX = 1, float scaleY = 1, ID3D11ShaderResourceView* src2 = nullptr) {
+                 int dx0, int dy0, int dx1, int dy1, int sx, int sy, bool swaprb, float scaleX = 1, float scaleY = 1, ID3D11ShaderResourceView* src2 = nullptr, const float* ofsOverride = nullptr) {
     ID3D11ShaderResourceView* nul[32] = {};
     g_ctx->PSSetShaderResources(0, 32, nul);
     g_ctx->OMSetRenderTargets(1, &dst, nullptr);
     invalidate_binds();
     struct { float ofs[2]; float scale[2]; uint32_t sw; uint32_t pad[3]; } p{ { (float)(sx - dx0), (float)(sy - dy0) }, { scaleX, scaleY }, swaprb ? 1u : 0u, {} };
+    if (ofsOverride) { p.ofs[0] = ofsOverride[0]; p.ofs[1] = ofsOverride[1]; }
     upload_cb(g_cbBlit.Get(), &p, sizeof(p));
     ID3D11Buffer* cb = g_cbBlit.Get();
     g_ctx->PSSetConstantBuffers(2, 1, &cb);
@@ -2183,7 +2221,58 @@ static void dump_surfaces() {
     fprintf(stderr, "[gfx] dumped %zu surfaces at frame %llu\n", g_surfaces.size(), (unsigned long long)g_frame);
 }
 
+// Between frames: switch display mode if asked to, and match the back buffer to the window.
+static void update_display() {
+    static WINDOWPLACEMENT savedPlace{ sizeof(WINDOWPLACEMENT) };
+    static LONG_PTR savedStyle = 0;
+    int want = g_modeWanted.load();
+    if (g_modeNow == kExclusive && want == kExclusive) {                    // Alt+Tab or another app can end exclusive mode behind our back
+        BOOL fs = FALSE;
+        if (SUCCEEDED(g_swap->GetFullscreenState(&fs, nullptr)) && !fs) {
+            fprintf(stderr, "[display] exclusive fullscreen was lost, back to a window\n");
+            g_modeNow = kWindowed; g_modeWanted = want = kWindowed; g_sizeChanged = true;
+        }
+    }
+    if (want != g_modeNow) {
+        if (g_modeNow == kExclusive) g_swap->SetFullscreenState(FALSE, nullptr);
+        if (g_modeNow == kBorderless) {
+            SetWindowLongPtrW(g_hwnd, GWL_STYLE, savedStyle);
+            SetWindowPlacement(g_hwnd, &savedPlace);
+            SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        }
+        if (want == kBorderless) {
+            savedStyle = GetWindowLongPtrW(g_hwnd, GWL_STYLE);
+            GetWindowPlacement(g_hwnd, &savedPlace);
+            MONITORINFO mi{ sizeof(mi) };
+            GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+            SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowPos(g_hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        }
+        if (want == kExclusive) {
+            HRESULT hr = g_swap->SetFullscreenState(TRUE, nullptr);
+            if (FAILED(hr)) { fprintf(stderr, "[display] exclusive fullscreen failed: %08lX\n", hr); g_modeWanted = want = kWindowed; }
+        }
+        fprintf(stderr, "[display] mode %d -> %d\n", g_modeNow, want);
+        g_modeNow = want; g_sizeChanged = true;
+    }
+    if (!g_sizeChanged.exchange(false)) return;
+    RECT rc{}; GetClientRect(g_hwnd, &rc);
+    uint32_t w = (uint32_t)(rc.right - rc.left), h = (uint32_t)(rc.bottom - rc.top);
+    if (w == 0 || h == 0 || (w == g_backW && h == g_backH)) return;         // minimised, or nothing to do
+    ID3D11RenderTargetView* none = nullptr;
+    g_ctx->OMSetRenderTargets(1, &none, nullptr);
+    invalidate_binds();
+    g_backRtv.Reset(); g_backTex.Reset();
+    g_ctx->Flush();
+    HRESULT hr = g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr)) fprintf(stderr, "[display] ResizeBuffers %ux%u failed: %08lX\n", w, h, hr);
+    else { g_backW = w; g_backH = h; fprintf(stderr, "[display] back buffer %ux%u\n", w, h); }
+    g_swap->GetBuffer(0, IID_PPV_ARGS(&g_backTex));
+    g_dev->CreateRenderTargetView(g_backTex.Get(), nullptr, &g_backRtv);
+}
+
 static void do_swap(uint32_t front) {
+    update_display();
     if ((int64_t)g_frame == g_dumpFrame) { probeq_report(); dump_surfaces(); g_trace = 0; }
     if ((int64_t)g_frame + 1 == g_dumpFrame) g_trace = 100000;
     uint32_t fp = front & 0x1FFFFFFFu;
@@ -2206,7 +2295,16 @@ static void do_swap(uint32_t front) {
             if (nl++ < 4) fprintf(stderr, "[gfx] display gamma ramp loaded: in 64 -> %u, 128 -> %u, 192 -> %u, 255 -> %u (of 1023)\n", g_lutEntries[64] & 0x3FF, g_lutEntries[128] & 0x3FF, g_lutEntries[192] & 0x3FF, g_lutEntries[255] & 0x3FF);
         }
         bool useRamp = g_lutSet && !kNoRamp && g_psPresentLut && g_lutSrv;
-        blit(s->srv.Get(), useRamp ? g_psPresentLut.Get() : g_psBlit.Get(), g_backRtv.Get(), 1280, 720, 0, 0, 1280, 720, 0, 0, s->swapped, (float)s->w / 1280.0f, (float)s->h / 720.0f, useRamp ? g_lutSrv.Get() : nullptr);
+        // Keep 16:9 in whatever size the back buffer is now, with black bars where it doesn't fit.
+        const float fit = std::min(g_backW / 1280.0f, g_backH / 720.0f);
+        const int pw = std::max((int)std::lround(1280.0f * fit), 1), ph = std::max((int)std::lround(720.0f * fit), 1);
+        const int px = ((int)g_backW - pw) / 2, py = ((int)g_backH - ph) / 2;
+        const float black[4] = { 0, 0, 0, 1 };
+        if (pw != (int)g_backW || ph != (int)g_backH) g_ctx->ClearRenderTargetView(g_backRtv.Get(), black);
+        const float sxs = (float)s->w / pw, sys = (float)s->h / ph, ofs[2] = { -px * sxs, -py * sys };
+        ID3D11SamplerState* presentSamp = g_presentSampler.Get();
+        g_ctx->PSSetSamplers(0, 1, &presentSamp);
+        blit(s->srv.Get(), useRamp ? g_psPresentLut.Get() : g_psPresentPlain.Get(), g_backRtv.Get(), g_backW, g_backH, px, py, px + pw, py + ph, 0, 0, s->swapped, sxs, sys, useRamp ? g_lutSrv.Get() : nullptr, ofs);
     } else {
         float c[4] = { 0.05f, 0.0f, 0.1f, 1 };
         g_ctx->ClearRenderTargetView(g_backRtv.Get(), c);

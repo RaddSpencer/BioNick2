@@ -706,10 +706,11 @@ static void vsync_thread(uint8_t* base) {
 
         auto now = std::chrono::steady_clock::now();
         if (synced && now - lastTick < std::chrono::milliseconds(10)) continue;   // a stale signal, just after a late tick
-        if (synced || now >= next) {                          // vsync, 60 Hz
+        if (synced || now >= next) {                          // vsync, 60 Hz unless BCR2_TICKHZ asks for another rate (experiment, keeps the free-running clock)
+            static const auto kTick = std::chrono::microseconds(getenv("BCR2_TICKHZ") ? 1000000 / atoi(getenv("BCR2_TICKHZ")) : 16667);
             lastTick = now;
-            next = synced ? now + std::chrono::microseconds(16667) : next + std::chrono::microseconds(16667);
-            if (next < now) next = now + std::chrono::microseconds(16667);
+            next = synced ? now + kTick : next + kTick;
+            if (next < now) next = now + kTick;
             ctx.r1.u32  = STK + STKSZ - 0x100;
             ctx.r13.u32 = PCR;
             *(volatile uint32_t*)(base + 0x7FC86544) = _byteswap_ulong(1);
@@ -817,7 +818,7 @@ static void gpu_thread(uint8_t* base) {
             for (uint32_t k = 0; k < pend; k++) { uint32_t a = ringGa + ((rptr + k) & mask) * 4; v[k] = PPC_LOAD_U32(a); }
             if (!g_vsyncStarted.exchange(true)) {
                 std::thread(vsync_thread, base).detach();
-                if (!getenv("BCR2_NOVBLANKSYNC")) std::thread(vblank_thread).detach();
+                if (!getenv("BCR2_NOVBLANKSYNC") && !getenv("BCR2_TICKHZ")) std::thread(vblank_thread).detach();
                 std::thread(cp_intr_thread, base).detach();
             }
             g_batchRptr = rptr; g_batchMask = mask; g_batchLast = 0xFFFFFFFFu;

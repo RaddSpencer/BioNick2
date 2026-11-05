@@ -391,6 +391,13 @@ static void gpu_exec(uint8_t* base, const uint32_t* p, uint32_t n, int depth) {
         uint32_t cnt = ((hdr >> 16) & 0x3FFF) + 1, op = (hdr >> 8) & 0x7F;
         const uint32_t* b = p + i + 1;
         if (i + 1 + cnt > n) { fprintf(stderr, "[gpu] truncated packet op=%02X\n", op); note_lost(p, i, n, depth, "type3"); return; }
+        if (kGpuOn && gpu_tracing() && (op == 0x22 || op == 0x36 || op == 0x3F || op == 0x37 || (op >= 0x60 && op <= 0x63)))   // BCR2_DUMPFRAME packet trace
+            fprintf(stderr, "[pk] op=%02X b0=%08X %s mask=%08X sel=%08X depth=%d ib1=%08X i=%u\n", op, b[0], (hdr & 1) ? "pred" : "always", g_binMaskLo, g_binSelLo, depth, depth >= 1 ? t_ibGa[1] : 0u, i);
+        if (kGpuOn && gpu_tracing() && (op == 0x45 || op == 0x3D || op == 0x3C || op == 0x3E || op == 0x5A || op == 0x5B || op == 0x23 || op == 0x54 || op == 0x58 || op == 0x46)) {
+            fprintf(stderr, "[pk2] op=%02X %s cnt=%u mask=%08X sel=%08X depth=%d ib1=%08X i=%u :", op, (hdr & 1) ? "pred" : "always", cnt, g_binMaskLo, g_binSelLo, depth, depth >= 1 ? t_ibGa[1] : 0u, i);
+            for (uint32_t k = 0; k < cnt && k < 8; k++) fprintf(stderr, " %08X", b[k]);
+            fprintf(stderr, "\n");
+        }
         if (hdr & 1) {                                  // log only: what a predicate check would decide here
             static uint32_t predFire[128], predSkip[128]; static uint32_t predN = 0;
             bool fire = (((uint64_t)g_binSelHi << 32 | g_binSelLo) & ((uint64_t)g_binMaskHi << 32 | g_binMaskLo)) != 0;
@@ -487,6 +494,15 @@ static void gpu_exec(uint8_t* base, const uint32_t* p, uint32_t n, int depth) {
                 break;
             }
             PPC_STORE_U32(ga, data);
+            break; }
+          case 0x5A: {                                    // EVENT_WRITE_EXT: screen extents of the preceding draw
+            // The game reads these to patch per-draw bin masks, so zeros cull nearly everything. Report full-screen,
+            // as Xenia does: every draw goes to every tile and scissoring clips it. Big-endian u16s {minX, maxX, minY, maxY, minZ, maxZ}.
+            if (cnt >= 2) {
+                uint8_t* ext = base + (0xA0000000u | (b[1] & 0x1FFFFFFCu));
+                static const uint16_t kExtents[6] = { 0, 8192 >> 3, 0, 8192 >> 3, 0, 1 };
+                for (int k = 0; k < 6; k++) *(uint16_t*)(ext + k * 2) = _byteswap_ushort(kExtents[k]);
+            }
             break; }
           case 0x3C: {                                    // WAIT_REG_MEM: poll until the CPU acknowledges
             uint32_t fn = b[0] & 7, ref = b[2], msk = b[3];
@@ -926,7 +942,20 @@ static void KeQuerySystemTime_(PPCContext& ctx, uint8_t* base) {
     uint64_t t = (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
     wr64(base, ctx.r3.u32, t);
 }
-static void KeQueryPerformanceFrequency_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = 50000000; }
+// mftb is recompiled to raw __rdtsc(), so the game's timebase ticks at the host TSC rate. Report that rate. Reporting the
+// console's 50 MHz made game time run about 60x fast (3-second splash screens lasted one frame).
+static void KeQueryPerformanceFrequency_(PPCContext& ctx, uint8_t*) {
+    static const uint64_t kTsc = [] {
+        LARGE_INTEGER f, a, b; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a);
+        uint64_t t0 = __rdtsc();
+        do { QueryPerformanceCounter(&b); } while ((uint64_t)(b.QuadPart - a.QuadPart) * 1000 < (uint64_t)f.QuadPart * 50);
+        uint64_t t1 = __rdtsc();
+        uint64_t hz = (t1 - t0) * (uint64_t)f.QuadPart / (uint64_t)(b.QuadPart - a.QuadPart);
+        fprintf(stderr, "[time] KeQueryPerformanceFrequency = %llu Hz (measured TSC)\n", (unsigned long long)hz);
+        return hz;
+    }();
+    ctx.r3.u64 = getenv("BCR2_FREQ50") ? 50000000 : kTsc;                   // BCR2_FREQ50 restores the old value, for comparison
+}
 
 // ---- NT string helpers ----
 static void RtlInitAnsiString_(PPCContext& ctx, uint8_t* base) {

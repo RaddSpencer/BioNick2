@@ -54,6 +54,7 @@ static uint8_t* g_base = nullptr;
 static int g_trace = 0;
 
 bool gpu_enabled() { static const bool on = getenv("BCR2_NOGPU") == nullptr; return on; }
+bool gpu_tracing() { return g_trace > 1000; }
 
 void gpu_reg(uint32_t r, uint32_t v) {
     if (r >= 0x10000) return;
@@ -92,7 +93,7 @@ static ComPtr<ID3D11Buffer> g_cbFloat, g_cbState, g_cbBlit, g_vbRing, g_ibRing;
 static ComPtr<ID3D11ShaderResourceView> g_vbSrv;
 static ComPtr<ID3D11GeometryShader> g_gsRect;
 static ComPtr<ID3D11VertexShader> g_vsBlit;
-static ComPtr<ID3D11PixelShader> g_psBlit, g_psBlitDepth;
+static ComPtr<ID3D11PixelShader> g_psBlit, g_psBlitDepth, g_psBlitRaw, g_psColorToDepth;
 static ComPtr<ID3D11SamplerState> g_blitSampler;
 static const uint32_t kVbRingSize = 96u << 20, kIbRingSize = 16u << 20;
 static uint32_t g_vbPos = 0, g_ibPos = 0;
@@ -204,6 +205,19 @@ static bool device_init() {
         "Texture2D src:register(t0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
         "float4 main(float4 p:SV_Position):SV_Target { float d=src.Load(int3(int2(p.xy*scale+ofs),0)).r; return float4(d,d,d,1); }\n";
     if (auto b = compile_cached(blitDs, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psBlitDepth);
+    const char* blitRaw =
+        "Texture2D<float> src:register(t0); Texture2D<uint2> sten:register(t1); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
+        "float4 main(float4 p:SV_Position):SV_Target { int3 c=int3(int2(p.xy*scale+ofs),0); uint d=min((uint)(src.Load(c)*16777215.0+0.5),0xFFFFFFu); uint s=sten.Load(c).g;\n"
+        "  uint w=(d<<8)|(s&255); return float4(w&255,(w>>8)&255,(w>>16)&255,(w>>24)&255)/255.0; }\n";
+    if (auto b = compile_cached(blitRaw, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psBlitRaw);
+    // EDRAM aliasing: as 8_8_8_8 the sample is A<<24|B<<16|G<<8|R, as D24S8 the same dword is D24<<8|S8. Depth tiles
+    // also have their 40-pixel left and right halves swapped relative to colour (the game's restore shader assumes this).
+    const char* c2d =
+        "Texture2D src:register(t0);\n"
+        "float main(float4 p:SV_Position):SV_Depth { int x=(int)p.x; x+=((x%80)<40)?40:-40; float4 c=src.Load(int3(x,(int)p.y,0));\n"
+        "  uint a=(uint)(c.a*255.0+0.5), b=(uint)(c.b*255.0+0.5), g=(uint)(c.g*255.0+0.5);\n"
+        "  return (float)((a<<16)|(b<<8)|g)/16777215.0; }\n";
+    if (auto b = compile_cached(c2d, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psColorToDepth);
     fprintf(stderr, "[gfx] D3D11 ready, feature level %X, noOverwriteSrv=%d\n", (unsigned)got, (int)g_noOverwriteSrv);
     return true;
 }
@@ -217,6 +231,7 @@ struct XShader {
     std::vector<TexUse> tex;
     std::vector<VfUse> vf;
     bool ok = false;
+    uint64_t hash = 0;
 };
 
 // Declarations shared by both stages.
@@ -242,7 +257,9 @@ float4 texfix(float4 t, int n) {
   uint4 g = tfsg[n];
   float4 b = t * 2.0 - 1.0;
   float4 s = (t >= 0.5) ? (t * 255.0 - 256.0) / 127.0 : t * 255.0 / 127.0;
-  t = (g == 1) ? s : ((g == 2) ? b : t);
+  // Xenos piecewise-linear gamma to linear
+  float4 lin = (t < 0.25) ? t * 0.25 : ((t < 0.375) ? t * 0.5 - 0.0625 : ((t < 0.75) ? t - 0.25 : t * 2.0 - 1.0));
+  t = (g == 1) ? s : ((g == 2) ? b : ((g == 3) ? lin : t));
   t *= tfp[n].z;
   float v6[6] = { t.x, t.y, t.z, t.w, 0.0, 1.0 };
   int4 w = min(tfsw[n], 5);
@@ -721,6 +738,7 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     auto it = cache.find(h);
     if (it != cache.end()) return it->second;
     XShader* sh = new XShader();
+    sh->hash = h;
     cache[h] = sh;
     Translator T; T.ucode = code.data(); T.words = (uint32_t)code.size(); T.isVs = isVs; T.out = sh;
     T.decode_cf();
@@ -759,6 +777,14 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         src += " uint af=(uint)alpha.x; if(af!=7){ float aa=oC[0].a, rf=alpha.y; bool atok=true;\n"
                "  if(af==0) atok=false; else if(af==1) atok=aa<rf; else if(af==2) atok=aa==rf; else if(af==3) atok=aa<=rf;\n"
                "  else if(af==4) atok=aa>rf; else if(af==5) atok=aa!=rf; else if(af==6) atok=aa>=rf; if(!atok) discard; }\n";
+        // 8_8_8_8_GAMMA targets store piecewise-linear gamma (colour only). Inverse of the ramp in texfix.
+        src += " if(alpha.z!=0.0){ float3 lc=saturate(oC[0].rgb);\n"
+               "  oC[0].rgb=(lc<0.0625)?lc*4.0:((lc<0.125)?lc*2.0+0.125:((lc<0.5)?lc+0.25:lc*0.5+0.5)); }\n";
+        // BCR2_DBGPS="<ps hash>:<hlsl float4 expr>" replaces that pixel shader's first output, to view one input at a time
+        if (const char* dbg = getenv("BCR2_DBGPS")) {
+            std::string ds = dbg, hs = S("%016llX:", (unsigned long long)h);
+            if (ds.rfind(hs, 0) == 0) { src += " oC[0]=" + ds.substr(hs.size()) + ";\n"; fprintf(stderr, "[gfx] debug override on ps %s\n", hs.c_str()); }
+        }
         src += " POut o; o.c0=oC[0]; o.c1=oC[1]; o.c2=oC[2]; o.c3=oC[3];";
         if (T.writesDepth) src += " o.d=oDepth;";
         src += " return o; }\n";
@@ -787,10 +813,12 @@ struct Rt {
     ComPtr<ID3D11Texture2D> tex;
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11DepthStencilView> dsv;
-    ComPtr<ID3D11ShaderResourceView> srv;
+    ComPtr<ID3D11ShaderResourceView> srv, stencilSrv;
     uint32_t w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    uint64_t seq = 0;                                                       // write order, for colour/depth EDRAM aliasing
 };
 static std::unordered_map<uint64_t, Rt*> g_rts;
+static uint64_t g_rtSeq = 0;
 
 static DXGI_FORMAT rt_dxgi(uint32_t f) {
     switch (f) {
@@ -836,6 +864,8 @@ static Rt* get_depth_rt(uint32_t base, uint32_t pitch) {
     g_dev->CreateDepthStencilView(r->tex.Get(), &dv, &r->dsv);
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{}; sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
     g_dev->CreateShaderResourceView(r->tex.Get(), &sv, &r->srv);
+    sv.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    g_dev->CreateShaderResourceView(r->tex.Get(), &sv, &r->stencilSrv);
     g_ctx->ClearDepthStencilView(r->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     fprintf(stderr, "[gfx] depth target base=%X pitch=%u -> %ux%u\n", base, pitch, r->w, r->h);
     return g_rts[key] = r;
@@ -846,6 +876,8 @@ struct Surface {
     uint32_t base = 0, end = 0, w = 0, h = 0, pitch = 0;
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11RenderTargetView> rtv; ComPtr<ID3D11ShaderResourceView> srv;
+    // Depth surfaces also keep the bytes guest memory would hold (D24 << 8 | S8), because shaders read depth as k_8_8_8_8.
+    ComPtr<ID3D11Texture2D> rawTex; ComPtr<ID3D11RenderTargetView> rawRtv; ComPtr<ID3D11ShaderResourceView> rawSrv;
     uint64_t guestHash = 0;
     bool swapped = false;
 };
@@ -869,6 +901,12 @@ static Surface* make_surface(uint32_t base, uint32_t pitch, uint32_t height, uin
     if (!s->tex) { delete s; return nullptr; }
     g_dev->CreateRenderTargetView(s->tex.Get(), nullptr, &s->rtv);
     g_dev->CreateShaderResourceView(s->tex.Get(), nullptr, &s->srv);
+    if (fmt == DXGI_FORMAT_R32_FLOAT) {
+        d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g_dev->CreateTexture2D(&d, nullptr, &s->rawTex);
+        g_dev->CreateRenderTargetView(s->rawTex.Get(), nullptr, &s->rawRtv);
+        g_dev->CreateShaderResourceView(s->rawTex.Get(), nullptr, &s->rawSrv);
+    }
     fprintf(stderr, "[gfx] resolve surface base=%X %ux%u fmt=%d\n", base, pitch, height, (int)fmt);
     g_surfaces[base] = s;
     s->guestHash = guest_sample_hash(base, bytes);
@@ -1096,6 +1134,8 @@ static ID3D11RasterizerState* get_rs(uint32_t mode, bool rect, bool clipOff, flo
     if (e) return e.Get();
     D3D11_RASTERIZER_DESC d{}; d.FillMode = D3D11_FILL_SOLID;
     d.CullMode = cull == 1 ? D3D11_CULL_FRONT : cull == 2 ? D3D11_CULL_BACK : D3D11_CULL_NONE;
+    static const bool kNoCull = getenv("BCR2_NOCULL") != nullptr;           // debugging: draw both faces
+    if (kNoCull) d.CullMode = D3D11_CULL_NONE;
     d.FrontCounterClockwise = face == 0;
     d.DepthClipEnable = !clipOff; d.ScissorEnable = TRUE;
     d.SlopeScaledDepthBias = scale; d.DepthBias = (INT)(offset * 16777216.0f);
@@ -1183,11 +1223,91 @@ static void compute_scissor(int& x0, int& y0, int& x1, int& y1) {
     x0 = std::max(x0, 0); y0 = std::max(y0, 0); x1 = std::max(x1, x0); y1 = std::max(y1, y0);
 }
 
+// BCR2_WATCHSURF="hexbase,x,y": during the traced frame, log whenever that pixel of that resolved surface has changed.
+static void watch_surface(const char* where) {
+    static const char* e = getenv("BCR2_WATCHSURF");
+    if (!e || g_trace <= 1000) return;
+    uint32_t base = 0, x = 0, y = 0; sscanf(e, "%x,%u,%u", &base, &x, &y);
+    auto it = g_surfaces.find(base);
+    static uint32_t last = 0xDEADBEEF; static void* lastTex = nullptr;
+    if (it == g_surfaces.end()) return;
+    Surface* s = it->second;
+    D3D11_TEXTURE2D_DESC d; s->tex->GetDesc(&d);
+    d.Width = 1; d.Height = 1; d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return;
+    D3D11_BOX box{ x, y, 0, x + 1, y + 1, 1 };
+    g_ctx->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, s->tex.Get(), 0, &box);
+    D3D11_MAPPED_SUBRESOURCE ms; if (FAILED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) return;
+    uint32_t v = *(uint32_t*)ms.pData; g_ctx->Unmap(st.Get(), 0);
+    if (v != last || lastTex != s->tex.Get()) { fprintf(stderr, "[watch-surf] %s tex=%p %08X -> %08X\n", where, s->tex.Get(), last, v); last = v; lastTex = s->tex.Get(); }
+}
+
 static ID3D11RenderTargetView* g_curRtv[4] = {}; static ID3D11DepthStencilView* g_curDsv = nullptr;
 static void invalidate_binds() { memset(g_curRtv, 0, sizeof(g_curRtv)); g_curDsv = nullptr; }
 
 static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBase, uint32_t dmaSize);
 static void do_resolve();
+static void sync_depth_alias(Rt* depth, uint32_t base, uint32_t pitch);
+
+// The game's fast clear: a depth-only rectangle with z always passing and writing, at half pitch with 4x MSAA. It writes a
+// constant dword (D24 << 8 | S8) over that part of EDRAM, which also clears any colour target sharing the base. Host targets are
+// separate per pitch and format, so apply it to all of them directly. Returns false to fall back to an ordinary draw.
+// withColor is the mode=4 form: the same rectangle also writes a colour taken from its vertices, to the bound colour targets.
+static bool fast_clear(bool withColor) {
+    const uint32_t* vf = &g_regs[R_FETCH];
+    if ((vf[0] & 3) != 3) return false;
+    uint32_t surf = g_regs[R_SURFACE_INFO], pitch = surf & 0x3FFF, msaa = (surf >> 16) & 3;
+    if (!pitch) return false;
+    uint32_t hostPitch = pitch << (msaa >= 2 ? 1 : 0);                      // host targets hold pixels, the clear covers samples
+    uint32_t vaddr = vf[0] & ~3u, endian = vf[1] & 3;
+    uint32_t raw = *(const uint32_t*)phys(vaddr + 8);                       // first vertex: x, y, z
+    if (endian == 2) raw = _byteswap_ulong(raw);
+    else if (endian == 1) raw = ((raw & 0xFF00FF00u) >> 8) | ((raw & 0x00FF00FFu) << 8);
+    else if (endian == 3) raw = (raw >> 16) | (raw << 16);
+    float z; memcpy(&z, &raw, 4);
+    z = std::clamp(z, 0.0f, 1.0f);
+    uint32_t dc = g_regs[R_DEPTHCONTROL], sr = g_regs[R_STENCIL], stencil = 0;
+    if ((dc & 1) && ((dc >> 14) & 7) == 2) stencil = sr & 0xFF;             // z-pass op: replace
+    uint32_t d24 = std::min((uint32_t)(z * 16777215.0 + 0.5), 0xFFFFFFu), base = g_regs[R_DEPTH_INFO] & 0xFFF;
+    uint32_t word = (d24 << 8) | stencil;
+    float col[4] = { (word & 255) / 255.0f, ((word >> 8) & 255) / 255.0f, ((word >> 16) & 255) / 255.0f, (word >> 24) / 255.0f };
+    ID3D11RenderTargetView* none[1] = { nullptr };
+    g_ctx->OMSetRenderTargets(1, none, nullptr);
+    invalidate_binds();
+    Rt* depth = get_depth_rt(base, hostPitch);
+    g_ctx->ClearDepthStencilView(depth->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, (UINT8)stencil);
+    depth->seq = ++g_rtSeq;
+    for (uint32_t f : { 0u, 1u }) {
+        uint64_t key = ((uint64_t)base << 32) | ((uint64_t)f << 16) | (hostPitch & 0xFFFF);
+        auto it = g_rts.find(key);
+        if (it != g_rts.end()) { g_ctx->ClearRenderTargetView(it->second->rtv.Get(), col); it->second->seq = g_rtSeq - 1; }
+    }
+    if (withColor) {
+        float vc[4];
+        for (int i = 0; i < 4; i++) {
+            uint32_t w = *(const uint32_t*)phys(vaddr + 12 + i * 4);
+            if (endian == 2) w = _byteswap_ulong(w);
+            else if (endian == 1) w = ((w & 0xFF00FF00u) >> 8) | ((w & 0x00FF00FFu) << 8);
+            else if (endian == 3) w = (w >> 16) | (w << 16);
+            memcpy(&vc[i], &w, 4);
+        }
+        static const uint32_t regs[4] = { R_COLOR_INFO, R_COLOR1_INFO, R_COLOR2_INFO, R_COLOR3_INFO };
+        uint32_t mask = g_regs[R_COLOR_MASK];
+        for (int i = 0; i < 4; i++) {
+            if (((mask >> (4 * i)) & 0xF) == 0) continue;
+            uint32_t ci = g_regs[regs[i]];
+            uint64_t key = ((uint64_t)(ci & 0xFFF) << 32) | ((uint64_t)((ci >> 16) & 0xF) << 16) | (hostPitch & 0xFFFF);
+            if (i == 0 || g_rts.count(key)) {                               // later slots may hold stale registers: only touch known targets
+                Rt* r = get_color_rt(ci & 0xFFF, (ci >> 16) & 0xF, hostPitch);
+                g_ctx->ClearRenderTargetView(r->rtv.Get(), vc);
+                r->seq = g_rtSeq - 1;
+            }
+        }
+    }
+    static int nl = 0;
+    if (nl++ < 6 || g_trace > 0) fprintf(stderr, "[gfx] fast clear base=%X pitch=%u(%u) z=%g stencil=%u word=%08X\n", base, pitch, hostPitch, z, stencil, word);
+    return true;
+}
 
 static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBase, uint32_t dmaSize) {
     uint32_t prim = init & 63, srcSel = (init >> 6) & 3, idx32 = (init >> 11) & 1, num = init >> 16;
@@ -1198,18 +1318,49 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
                 prim, srcSel, num, edram, g_regs[R_SURFACE_INFO], g_regs[R_COLOR_INFO], g_regs[R_DEPTH_INFO], g_regs[R_WINDOW_OFFSET], g_regs[R_WINDOW_TL], g_regs[R_WINDOW_BR],
                 g_regs[R_COLOR_MASK], g_regs[R_DEPTHCONTROL], g_regs[R_VTE_CNTL], (unsigned long long)g_vsHash, (unsigned long long)g_psHash);
     }
-    if (edram == 6) { do_resolve(); return; }
+    watch_surface("before draw/resolve");
+    if (edram == 6) { do_resolve(); watch_surface("after resolve"); return; }
     if (edram == 0 || num == 0 || prim == 0) return;
     if (prim >= 0x10) { logf_once(S("prim%u", prim).c_str(), "unsupported primitive type %u", prim); return; }
     if (prim == 1) logf_once("points", "point list drawn as 1-pixel points (no sprite expansion yet)");
     if (g_vsCode.empty()) return;
     g_draws++; g_drawsFrame++;
+    // Stencil-only form of the same trick: a half-pitch 4x MSAA rectangle, no depth test, stencil always/replace. Host targets
+    // are per pitch, so apply it to the real depth buffer. Without this, marks from an earlier pass survive into the composite.
+    {
+        uint32_t dcS = g_regs[R_DEPTHCONTROL], surfS = g_regs[R_SURFACE_INFO];
+        if (prim == 8 && srcSel == 2 && edram == 5 && ((surfS >> 16) & 3) >= 2 && (surfS & 0x3FFF) != 0 && (dcS & 3) == 1 &&
+            ((dcS >> 8) & 7) == 7 && ((dcS >> 14) & 7) == 2) {
+            uint32_t base = g_regs[R_DEPTH_INFO] & 0xFFF, hostPitch = (surfS & 0x3FFF) << 1;
+            Rt* d = get_depth_rt(base, hostPitch);
+            sync_depth_alias(d, base, hostPitch);
+            ID3D11RenderTargetView* none[1] = { nullptr };
+            g_ctx->OMSetRenderTargets(1, none, nullptr);
+            invalidate_binds();
+            g_ctx->ClearDepthStencilView(d->dsv.Get(), D3D11_CLEAR_STENCIL, 1.0f, (UINT8)(g_regs[R_STENCIL] & 0xFF));
+            static int nl = 0;
+            if (nl++ < 4 || g_trace > 0) fprintf(stderr, "[gfx] stencil clear base=%X pitch=%u ref=%u\n", base, hostPitch, g_regs[R_STENCIL] & 0xFF);
+            return;
+        }
+    }
+    if (prim == 8 && srcSel == 2 && (g_regs[R_DEPTHCONTROL] & 0x76) == 0x76 &&
+        (edram == 5 || (edram == 4 && ((g_regs[R_SURFACE_INFO] >> 16) & 3) != 0)) && fast_clear(edram == 4)) return;
 
     XShader* vs = build_shader(g_vsCode, true, 0xFFFFFFFFu);
     uint32_t misc = g_regs[R_CONTEXT_MISC], pcntl = g_regs[R_PROGRAM_CNTL];
     uint32_t paramGen = ((pcntl >> 18) & 1) ? ((misc >> 8) & 0xFF) : 0xFFFFFFFFu;
     bool depthOnly = edram == 5;
     XShader* ps = g_psCode.empty() ? nullptr : build_shader(g_psCode, false, paramGen);
+    if (g_trace > 0) {
+        fprintf(stderr, "[gfx]   shaders vs=%016llX ok=%d ps=%016llX ok=%d vte=%08X mode=%08X blend0=%08X cc=%08X psconst=%08X tf:", (unsigned long long)vs->hash, (int)vs->ok,
+                ps ? (unsigned long long)ps->hash : 0ull, ps ? (int)ps->ok : -1, g_regs[R_VTE_CNTL], g_regs[R_MODE_CNTL], g_regs[R_BLEND0], g_regs[R_COLORCONTROL], g_regs[0x2308]);
+        if (ps) for (auto& u : ps->tex) { const uint32_t* t = &g_regs[R_FETCH + u.slot * 6]; fprintf(stderr, " %u:fmt=%u,base=%08X,%ux%u,sw=%03X", u.slot, t[1] & 63, t[1] & 0xFFFFF000u, (t[2] & 0x1FFF) + 1, ((t[2] >> 13) & 0x1FFF) + 1, (t[3] >> 1) & 0xFFF); }
+        fprintf(stderr, " vsconst=%08X c0=%g,%g,%g,%g c4=%g,%g,%g,%g zs=%g zo=%g clip=%08X", g_regs[0x2307], reg_f(R_CONST), reg_f(R_CONST + 1), reg_f(R_CONST + 2), reg_f(R_CONST + 3),
+                reg_f(R_CONST + 16), reg_f(R_CONST + 17), reg_f(R_CONST + 18), reg_f(R_CONST + 19), reg_f(R_VPORT_XSCALE + 4), reg_f(R_VPORT_XSCALE + 5), g_regs[R_CLIP_CNTL]);
+        fprintf(stderr, " vf:");
+        for (auto& u : vs->vf) { uint32_t f0 = g_regs[R_FETCH + u.slot * 2], f1 = g_regs[R_FETCH + u.slot * 2 + 1]; fprintf(stderr, " %u:addr=%08X,words=%u,end=%u,stride=%u", u.slot, f0 & ~3u, (f1 >> 2) & 0xFFFFFF, f1 & 3, u.stride); }
+        fprintf(stderr, "\n");
+    }
     if (!vs->ok) return;
     if (ps && !ps->ok) ps = nullptr;
 
@@ -1225,13 +1376,22 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             if (((mask >> (4 * i)) & 0xF) == 0) continue;
             uint32_t ci = g_regs[regs[i]];
             Rt* r = get_color_rt(ci & 0xFFF, (ci >> 16) & 0xF, pitch);
-            rtvs[i] = r->rtv.Get(); rw = r->w; rh = r->h;
+            // Slots can share an EDRAM base. D3D11 rejects a view bound twice and silently keeps the previous targets,
+            // which sent such draws into whatever surface the last resolve had bound. Bind each target once.
+            bool dup = false;
+            for (int k = 0; k < i; k++) if (rtvs[k] == r->rtv.Get()) dup = true;
+            if (!dup) rtvs[i] = r->rtv.Get();
+            rw = r->w; rh = r->h;
+            r->seq = ++g_rtSeq;
         }
     }
     uint32_t dc = g_regs[R_DEPTHCONTROL];
     ID3D11DepthStencilView* dsv = nullptr;
     if (dc & 3) {
-        Rt* d = get_depth_rt(g_regs[R_DEPTH_INFO] & 0xFFF, pitch);
+        uint32_t depthBase = g_regs[R_DEPTH_INFO] & 0xFFF;
+        Rt* d = get_depth_rt(depthBase, pitch);
+        sync_depth_alias(d, depthBase, pitch);
+        if (dc & 4) d->seq = ++g_rtSeq;                                     // writes depth from here on
         dsv = d->dsv.Get(); rw = d->w; rh = d->h;
     }
     if (!rw) return;                                                        // nothing would be written
@@ -1363,7 +1523,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             }
         }
         if (sf && u.dim != 3) {
-            srvs[u.slot] = sf->srv.Get();
+            bool wantsRaw = sf->rawSrv && fmt != 22 && fmt != 23;           // depth read as bytes, not as a depth format
+            srvs[u.slot] = wantsRaw ? sf->rawSrv.Get() : sf->srv.Get();
             cb.tfp[u.slot * 4] = (float)w / sf->w; cb.tfp[u.slot * 4 + 1] = (float)h / sf->h;
             return;
         }
@@ -1409,7 +1570,9 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     cb.vpZ[0] = zs; cb.vpZ[1] = zo; cb.vpZ[2] = (float)((vte >> 8) & 1); cb.vpZ[3] = (float)((vte >> 9) & 1);
     cb.vpW[0] = (float)((vte >> 10) & 1); cb.vpW[1] = (float)indexOffset; cb.vpW[2] = 0; cb.vpW[3] = 0;
     uint32_t colorCtl = g_regs[R_COLORCONTROL];
-    cb.alpha[0] = (colorCtl & 8) ? (float)(colorCtl & 7) : 7.0f; cb.alpha[1] = reg_f(R_ALPHA_REF); cb.alpha[2] = 0; cb.alpha[3] = 0;
+    cb.alpha[0] = (colorCtl & 8) ? (float)(colorCtl & 7) : 7.0f; cb.alpha[1] = reg_f(R_ALPHA_REF); cb.alpha[3] = 0;
+    cb.alpha[2] = (!depthOnly && ((g_regs[R_COLOR_INFO] >> 16) & 0xF) == 1) ? 1.0f : 0.0f;
+    if (g_trace > 0 && cb.alpha[2] != 0) logf_once("gammart", "gamma colour target in use");
     memcpy(cb.bools, &g_regs[R_BOOL], 32);
     memcpy(cb.loops, &g_regs[R_LOOP], 128);
     upload_cb(g_cbState.Get(), &cb, sizeof(cb));
@@ -1440,6 +1603,41 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     D3D11_RECT sc{ sx0, sy0, std::min(sx1, (int)rw), std::min(sy1, (int)rh) };
     g_ctx->RSSetScissorRects(1, &sc);
 
+    struct ProbeAfter {                                                     // BCR2_PROBE="x,y": log draws that change this pixel in target 0
+        ID3D11Resource* res = nullptr; uint32_t px = 0, py = 0, rw_, rh_, before = 0; bool have = false;
+        bool read(uint32_t& v) {
+            D3D11_TEXTURE2D_DESC d; ((ID3D11Texture2D*)res)->GetDesc(&d);
+            if (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM) return false;
+            d.Width = 1; d.Height = 1; d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> st;
+            if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return false;
+            D3D11_BOX box{ px, py, 0, px + 1, py + 1, 1 };
+            g_ctx->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, res, 0, &box);
+            D3D11_MAPPED_SUBRESOURCE ms;
+            if (FAILED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) return false;
+            v = *(uint32_t*)ms.pData; g_ctx->Unmap(st.Get(), 0);
+            return true;
+        }
+        ProbeAfter(ID3D11RenderTargetView* rtv, uint32_t rw, uint32_t rh, uint32_t pr) : rw_(rw), rh_(rh) {
+            static const char* e = getenv("BCR2_PROBE");
+            static const char* ef = getenv("BCR2_PROBEF");                  // "u,v" in 0..1 of the draw's scissor, to follow a spot through a blur chain
+            if ((!e && !ef) || g_trace <= 1000 || !rtv) return;
+            if (ef) {
+                float u = 0, v = 0; sscanf(ef, "%f,%f", &u, &v);
+                int a, b, c, f; compute_scissor(a, b, c, f);
+                px = (uint32_t)(u * (c - a)); py = (uint32_t)(v * (f - b));
+            } else sscanf(e, "%u,%u", &px, &py);
+            if (px >= rw || py >= rh) return;
+            rtv->GetResource(&res);
+            have = read(before);
+        }
+        ~ProbeAfter() {
+            if (!res) return;
+            uint32_t v;
+            if (have && read(v) && v != before) fprintf(stderr, "[probe] rt=%p at %u,%u %08X -> %08X (above draw, %ux%u)\n", res, px, py, before, v, rw_, rh_);
+            res->Release();
+        }
+    } probe(rtvs[0], rw, rh, 0);
     if (useIdx) {
         uint32_t bytes = drawCount * 4;
         if (bytes > kIbRingSize) { logf_once("ibbig", "index data too large"); return; }
@@ -1459,7 +1657,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
 
 // ---- resolve ----
 static void blit(ID3D11ShaderResourceView* src, ID3D11PixelShader* ps, ID3D11RenderTargetView* dst, uint32_t dw, uint32_t dh,
-                 int dx0, int dy0, int dx1, int dy1, int sx, int sy, bool swaprb, float scaleX = 1, float scaleY = 1) {
+                 int dx0, int dy0, int dx1, int dy1, int sx, int sy, bool swaprb, float scaleX = 1, float scaleY = 1, ID3D11ShaderResourceView* src2 = nullptr) {
     ID3D11ShaderResourceView* nul[32] = {};
     g_ctx->PSSetShaderResources(0, 32, nul);
     g_ctx->OMSetRenderTargets(1, &dst, nullptr);
@@ -1481,8 +1679,63 @@ static void blit(ID3D11ShaderResourceView* src, ID3D11PixelShader* ps, ID3D11Ren
     D3D11_RECT sc{ dx0, dy0, dx1, dy1 };
     g_ctx->RSSetScissorRects(1, &sc);
     g_ctx->PSSetShaderResources(0, 1, &src);
+    if (src2) g_ctx->PSSetShaderResources(1, 1, &src2);
     g_ctx->Draw(3, 0);
-    g_ctx->PSSetShaderResources(0, 1, nul);
+    g_ctx->PSSetShaderResources(0, 2, nul);
+    static const char* probeEnv = getenv("BCR2_PROBE");                     // also report the probed pixel after each resolve blit
+    if (probeEnv && g_trace > 1000) {
+        uint32_t px = 0, py = 0; sscanf(probeEnv, "%u,%u", &px, &py);
+        ID3D11Resource* res = nullptr; dst->GetResource(&res);
+        D3D11_TEXTURE2D_DESC d; ((ID3D11Texture2D*)res)->GetDesc(&d);
+        if (px < d.Width && py < d.Height && d.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+            d.Width = 1; d.Height = 1; d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+            ComPtr<ID3D11Texture2D> st;
+            if (SUCCEEDED(g_dev->CreateTexture2D(&d, nullptr, &st))) {
+                D3D11_BOX box{ px, py, 0, px + 1, py + 1, 1 };
+                g_ctx->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, res, 0, &box);
+                D3D11_MAPPED_SUBRESOURCE ms;
+                if (SUCCEEDED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) {
+                    fprintf(stderr, "[probe-blit] dst=%p %ux%u rect=%d,%d-%d,%d src=%d,%d value=%08X\n", res, dw, dh, dx0, dy0, dx1, dy1, sx, sy, *(uint32_t*)ms.pData);
+                    g_ctx->Unmap(st.Get(), 0);
+                }
+            }
+        }
+        res->Release();
+    }
+}
+
+// The game restores depth by drawing depth bytes into a colour target at the depth buffer's EDRAM base. Host targets are
+// separate, so carry the newer colour contents over when that depth buffer is used next. Stencil restarts at zero.
+static void sync_depth_alias(Rt* depth, uint32_t base, uint32_t pitch) {
+    for (uint32_t fmt : { 0u, 1u }) {
+        uint64_t key = ((uint64_t)base << 32) | ((uint64_t)fmt << 16) | (pitch & 0xFFFF);
+        auto it = g_rts.find(key);
+        if (it == g_rts.end() || it->second->seq <= depth->seq) continue;
+        Rt* c = it->second;
+        ID3D11ShaderResourceView* nul[32] = {};
+        g_ctx->PSSetShaderResources(0, 32, nul);
+        g_ctx->OMSetRenderTargets(0, nullptr, depth->dsv.Get());
+        invalidate_binds();
+        g_ctx->ClearDepthStencilView(depth->dsv.Get(), D3D11_CLEAR_STENCIL, 1.0f, 0);
+        g_ctx->VSSetShader(g_vsBlit.Get(), nullptr, 0);
+        g_ctx->PSSetShader(g_psColorToDepth.Get(), nullptr, 0);
+        g_ctx->GSSetShader(nullptr, nullptr, 0);
+        g_ctx->IASetInputLayout(nullptr);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+        g_ctx->OMSetDepthStencilState(get_ds(0x76, 0, 0), 0);               // z on, z write, func always
+        g_ctx->RSSetState(get_rs(0, true, true, 0, 0));
+        D3D11_VIEWPORT vp{ 0, 0, (float)depth->w, (float)depth->h, 0, 1 };
+        g_ctx->RSSetViewports(1, &vp);
+        D3D11_RECT sc{ 0, 0, (LONG)depth->w, (LONG)depth->h };
+        g_ctx->RSSetScissorRects(1, &sc);
+        ID3D11ShaderResourceView* s = c->srv.Get();
+        g_ctx->PSSetShaderResources(0, 1, &s);
+        g_ctx->Draw(3, 0);
+        g_ctx->PSSetShaderResources(0, 1, nul);
+        depth->seq = ++g_rtSeq;
+        logf_once("alias", "colour target at EDRAM base %X carried into depth (aliasing)", base);
+    }
 }
 
 static void do_resolve() {
@@ -1529,8 +1782,8 @@ static void do_resolve() {
 
     static int nlog = 0;
     if (nlog++ < 60 || g_trace > 0)
-        fprintf(stderr, "[gfx] resolve src=%u cmd=%u rect=%d,%d-%d,%d dest=%X pitch=%u h=%u fmt=%u swap=%d clr=%d/%d win=%08X surf=%08X col=%08X\n",
-                srcSel, cmd, x0, y0, x1, y1, destBase, destPitch, destH, destFmt, (int)destSwap, (int)colorClear, (int)depthClear, g_regs[R_WINDOW_OFFSET], surf, ci);
+        fprintf(stderr, "[gfx] resolve src=%u cmd=%u rect=%d,%d-%d,%d dest=%X pitch=%u h=%u fmt=%u swap=%d clr=%d/%d win=%08X surf=%08X col=%08X dep=%08X cc=%08X dc=%08X\n",
+                srcSel, cmd, x0, y0, x1, y1, destBase, destPitch, destH, destFmt, (int)destSwap, (int)colorClear, (int)depthClear, g_regs[R_WINDOW_OFFSET], surf, ci, g_regs[R_DEPTH_INFO], g_regs[R_COLOR_CLEAR], g_regs[R_DEPTH_CLEAR]);
 
     if (cmd != 3 && destBase != 0 && destPitch != 0) {
         Rt* src = isDepth ? depthRt : colorSrc;
@@ -1558,6 +1811,8 @@ static void do_resolve() {
         if (sf) {
             int dx0 = x0 + ox, dy0 = y0 + oy, dx1 = x1 + ox, dy1 = y1 + oy;
             blit(src->srv.Get(), isDepth ? g_psBlitDepth.Get() : g_psBlit.Get(), sf->rtv.Get(), sf->w, sf->h, dx0, dy0, std::min(dx1, (int)sf->w), std::min(dy1, (int)sf->h), x0, y0, destSwap && !isDepth);
+            if (isDepth && sf->rawRtv)
+                blit(src->srv.Get(), g_psBlitRaw.Get(), sf->rawRtv.Get(), sf->w, sf->h, dx0, dy0, std::min(dx1, (int)sf->w), std::min(dy1, (int)sf->h), x0, y0, false, 1, 1, src->stencilSrv.Get());
             sf->guestHash = guest_sample_hash(sf->base, sf->end - sf->base);
             sf->swapped = destSwap && !isDepth;
         }
@@ -1575,6 +1830,7 @@ static void do_resolve() {
         g_ctx->OMSetRenderTargets(1, none, nullptr);
         invalidate_binds();
         g_ctx->ClearDepthStencilView(depthRt->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, (float)((dv >> 8) & 0xFFFFFF) / 16777215.0f, (UINT8)(dv & 0xFF));
+        depthRt->seq = ++g_rtSeq;
     }
 }
 
@@ -1607,11 +1863,53 @@ static void write_shot() {
     g_ctx->Unmap(st.Get(), 0);
 }
 
+// BCR2_DUMPFRAME=n with BCR2_SHOTDIR: log frame n's draws and resolves, then write each resolved surface as a BMP.
+static const int64_t g_dumpFrame = getenv("BCR2_DUMPFRAME") ? _atoi64(getenv("BCR2_DUMPFRAME")) : -1;
+static void dump_surfaces() {
+    const char* dir = getenv("BCR2_SHOTDIR");
+    if (!dir) return;
+    std::vector<std::pair<Surface*, bool>> all;
+    for (auto& kv : g_surfaces) { all.push_back({ kv.second, false }); if (kv.second->rawTex) all.push_back({ kv.second, true }); }
+    for (auto& ent : all) {
+        Surface* s = ent.first;
+        ID3D11Texture2D* from = ent.second ? s->rawTex.Get() : s->tex.Get();
+        D3D11_TEXTURE2D_DESC d; from->GetDesc(&d);
+        d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) continue;
+        g_ctx->CopyResource(st.Get(), from);
+        D3D11_MAPPED_SUBRESOURCE ms; if (FAILED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) continue;
+        std::string p = std::string(dir) + S("\\surf_%08X_f%d%s.bmp", s->base, (int)s->fmt, ent.second ? "_raw" : "");
+        if (FILE* f = fopen(p.c_str(), "wb")) {
+            BITMAPFILEHEADER fh{}; BITMAPINFOHEADER ih{};
+            uint32_t imgSize = d.Width * d.Height * 4;
+            fh.bfType = 0x4D42; fh.bfOffBits = sizeof(fh) + sizeof(ih); fh.bfSize = fh.bfOffBits + imgSize;
+            ih.biSize = sizeof(ih); ih.biWidth = d.Width; ih.biHeight = -(LONG)d.Height; ih.biPlanes = 1; ih.biBitCount = 32; ih.biCompression = BI_RGB;
+            fwrite(&fh, sizeof(fh), 1, f); fwrite(&ih, sizeof(ih), 1, f);
+            std::vector<uint8_t> row(d.Width * 4);
+            for (uint32_t y = 0; y < d.Height; y++) {
+                const uint8_t* src = (const uint8_t*)ms.pData + y * ms.RowPitch;
+                for (uint32_t x = 0; x < d.Width; x++) {
+                    uint8_t r, g, b;
+                    if (d.Format == DXGI_FORMAT_R32_FLOAT) { float v; memcpy(&v, src + x * 4, 4); r = g = b = (uint8_t)std::clamp(v * 255.0f, 0.0f, 255.0f); }
+                    else { r = src[x * 4]; g = src[x * 4 + 1]; b = src[x * 4 + 2]; }
+                    row[x * 4] = b; row[x * 4 + 1] = g; row[x * 4 + 2] = r; row[x * 4 + 3] = 255;
+                }
+                fwrite(row.data(), 1, row.size(), f);
+            }
+            fclose(f);
+        }
+        g_ctx->Unmap(st.Get(), 0);
+    }
+    fprintf(stderr, "[gfx] dumped %zu surfaces at frame %llu\n", g_surfaces.size(), (unsigned long long)g_frame);
+}
+
 static void do_swap(uint32_t front) {
+    if ((int64_t)g_frame == g_dumpFrame) { dump_surfaces(); g_trace = 0; }
+    if ((int64_t)g_frame + 1 == g_dumpFrame) g_trace = 100000;
     uint32_t fp = front & 0x1FFFFFFFu;
     Surface* s = surface_at(fp);
     static int nl = 0;
-    if (nl++ < 12) fprintf(stderr, "[gfx] swap front=%08X surface=%s draws=%llu resolves=%llu\n", front, s ? "yes" : "no", (unsigned long long)g_drawsFrame, (unsigned long long)g_resolves);
+    if (nl++ < 24) fprintf(stderr, "[gfx] swap front=%08X surface=%s draws=%llu resolves=%llu t=%lu\n", front, s ? "yes" : "no", (unsigned long long)g_drawsFrame, (unsigned long long)g_resolves, GetTickCount());
     if (s) {
         if (s->base != fp) logf_once("frontoff", "front buffer %X inside surface %X", fp, s->base);
         // A swapped resolve holds what guest memory would hold (B in the low byte); scanout undoes that.

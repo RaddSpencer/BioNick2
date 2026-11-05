@@ -294,7 +294,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[st3] intr issued=%u done=%u\n", dbg_intr_issued(), dbg_intr_done());
             { uint32_t t = gw(wo + 36);
               fprintf(stderr, "[st4] m36=%08X words(-4..+7):", t);
-              for (int k = -4; k < 8; k++) fprintf(stderr, " %08X", gw(t + k * 4));
+              if (t > 0x10000) for (int k = -4; k < 8; k++) fprintf(stderr, " %08X", gw(t + k * 4));   // 0 until the worker first runs: guest 0 is unmapped
               fprintf(stderr, "\n"); }
             { uint32_t ob = 0x40350200;
               fprintf(stderr, "[st5] obj+120..188:");

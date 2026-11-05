@@ -3,5 +3,6 @@
 #include <cstdint>
 
 bool gpu_enabled();                                                     // false when BCR2_NOGPU is set (null GPU behaviour)
+bool gpu_tracing();                                                     // true during the frame chosen by BCR2_DUMPFRAME
 void gpu_reg(uint32_t reg, uint32_t val);                               // type-0 / type-1 register write
 void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt);   // type-3 packet that passed its predicate

@@ -1323,7 +1323,11 @@ static ID3D11SamplerState* get_sampler(const uint32_t* tf, const TexUse& u) {
     else { if (maxL < minL) maxL = minL; if (maxL && !(tf[1] >> 12)) minL = std::max(minL, 1u); }
     if (mip == 2) maxL = minL;                                               // base map: never leave the top level
     int lodBias32 = sext((tf[4] >> 12) & 0x3FF, 10);                         // 5 fractional bits
-    uint32_t in[10] = { cx, cy, cz, mag, min, mip, border, minL, maxL, (uint32_t)lodBias32 };
+    // Anisotropy as the game asks for it: 1 = off, 2 = 2:1 ... 5 = 16:1. BCR2_ANISO=n replaces any request above off (0 ignores them all).
+    static const int kAnisoForce = getenv("BCR2_ANISO") ? atoi(getenv("BCR2_ANISO")) : -1;
+    uint32_t anisoField = (tf[3] >> 25) & 7, aniso = (anisoField >= 2 && anisoField <= 5) ? (1u << (anisoField - 1)) : 1;
+    if (kAnisoForce >= 0 && aniso > 1) aniso = kAnisoForce > 1 ? (uint32_t)std::min(kAnisoForce, 16) : 1;
+    uint32_t in[11] = { cx, cy, cz, mag, min, mip, border, minL, maxL, (uint32_t)lodBias32, aniso };
     uint64_t k = fnv64(in, sizeof(in));
     auto& e = g_samplers[k];
     if (e) return e.Get();
@@ -1339,8 +1343,9 @@ static ID3D11SamplerState* get_sampler(const uint32_t* tf, const TexUse& u) {
     D3D11_SAMPLER_DESC d{};
     bool lm = mag == 1, ln = min == 1, lp = mip == 1;
     d.Filter = (D3D11_FILTER)((lp ? 0x1 : 0) | (lm ? 0x4 : 0) | (ln ? 0x10 : 0));
+    if (aniso > 1 && lm && ln) d.Filter = D3D11_FILTER_ANISOTROPIC;
     d.AddressU = am(cx); d.AddressV = am(cy); d.AddressW = am(cz);
-    d.ComparisonFunc = D3D11_COMPARISON_NEVER; d.MinLOD = (float)minL; d.MaxLOD = (float)maxL; d.MipLODBias = lodBias32 / 32.0f; d.MaxAnisotropy = 1;
+    d.ComparisonFunc = D3D11_COMPARISON_NEVER; d.MinLOD = (float)minL; d.MaxLOD = (float)maxL; d.MipLODBias = lodBias32 / 32.0f; d.MaxAnisotropy = aniso;
     if (border == 1) d.BorderColor[0] = d.BorderColor[1] = d.BorderColor[2] = d.BorderColor[3] = 1.0f;
     g_dev->CreateSamplerState(&d, &e);
     return e.Get();
@@ -1769,6 +1774,13 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if ((u.dim == 3) != (dim == 3)) { logf_once("texdim", "texture dimension mismatch shader=%u fetch=%u", u.dim, dim); return; }
         HostTex* ht = get_texture(fi);
         if (!ht) return;
+        {   // one line per distinct fetch while tracing, to check the mip chain and filter a draw really gets
+            static std::set<uint64_t> seenFetch;
+            if (g_trace > 1000 && seenFetch.insert(((uint64_t)base << 8) | u.slot).second)
+                fprintf(stderr, "[texmip] slot=%u base=%08X %ux%u fmt=%u mipBase=%08X maxLevel=%u levels=%u packed=%d fetch mag=%u min=%u mip=%u aniso=%u arb=%u lodbias=%d minL=%u maxL=%u shader mag=%d min=%d mip=%d\n",
+                        u.slot, base, w, h, fmt, fi.mipBase, fi.maxLevel, ht->levels, (int)fi.packed, (tf[3] >> 19) & 3, (tf[3] >> 21) & 3, (tf[3] >> 23) & 3, (tf[3] >> 25) & 7, (tf[3] >> 28) & 7,
+                        sext((tf[4] >> 12) & 0x3FF, 10), (tf[4] >> 2) & 15, (tf[4] >> 6) & 15, u.magf, u.minf, u.mipf);
+        }
         srvs[u.dim == 3 ? 16 + u.slot : u.slot] = ht->srv.Get();
         TexFmt t; tex_fmt(fmt, t);
         if (t.block > 1) { cb.tfp[u.slot * 4] = (float)w / ht->hostW; cb.tfp[u.slot * 4 + 1] = (float)h / ht->hostH; }
@@ -2213,7 +2225,7 @@ static void dump_surfaces() {
         ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) continue;
         g_ctx->CopyResource(st.Get(), from);
         D3D11_MAPPED_SUBRESOURCE ms; if (FAILED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) continue;
-        std::string p = std::string(dir) + S("\\surf_%08X_f%d%s.bmp", s->base, (int)s->fmt, ent.second ? "_raw" : "");
+        std::string p = std::string(dir) + S("\\surf_%08X_f%d%s_n%llu.bmp", s->base, (int)s->fmt, ent.second ? "_raw" : "", (unsigned long long)g_frame);
         if (FILE* f = fopen(p.c_str(), "wb")) {
             BITMAPFILEHEADER fh{}; BITMAPINFOHEADER ih{};
             uint32_t imgSize = d.Width * d.Height * 4;
@@ -2290,7 +2302,11 @@ static void update_display() {
 
 static void do_swap(uint32_t front) {
     update_display();
-    if ((int64_t)g_frame == g_dumpFrame) { probeq_report(); dump_surfaces(); g_trace = 0; }
+    static const int64_t kDumpCount = getenv("BCR2_DUMPCOUNT") ? _atoi64(getenv("BCR2_DUMPCOUNT")) : 1;   // that many consecutive frames, to compare stages between frames
+    if (g_dumpFrame >= 0 && (int64_t)g_frame >= g_dumpFrame && (int64_t)g_frame < g_dumpFrame + kDumpCount) {
+        probeq_report(); dump_surfaces();
+        if ((int64_t)g_frame == g_dumpFrame + kDumpCount - 1) g_trace = 0;
+    }
     if ((int64_t)g_frame + 1 == g_dumpFrame) g_trace = 100000;
     uint32_t fp = front & 0x1FFFFFFFu;
     Surface* s = surface_at(fp);

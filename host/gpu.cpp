@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -1920,11 +1921,76 @@ static void do_resolve() {
 }
 
 // ---- present ----
+// BCR2_SHOTBURST=n with BCR2_SHOTDIR: dump the n frames after each simulated press, to count frames to the visible response.
+static std::atomic<int> g_shotBurstLeft{0};
+void gpu_note_press() {
+    static const int kBurst = getenv("BCR2_SHOTBURST") ? atoi(getenv("BCR2_SHOTBURST")) : 0;
+    fprintf(stderr, "[lat] press seen by guest at frame=%llu\n", (unsigned long long)g_frame);
+    if (kBurst > 0) g_shotBurstLeft = kBurst;
+}
+
+static std::atomic<bool> g_presentFollowsDisplay{false};
+void gpu_set_display_locked(bool locked) { g_presentFollowsDisplay = locked; }
+
+// The display the window is on, for the vblank thread. Refreshed when the window changes monitor.
+static std::mutex g_outputLock;
+static ComPtr<IDXGIOutput> g_output;
+static void track_output() {
+    static HMONITOR last = nullptr;
+    HMONITOR m = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+    if (m == last) return;
+    ComPtr<IDXGIOutput> o;
+    if (FAILED(g_swap->GetContainingOutput(&o))) return;
+    last = m;
+    std::lock_guard<std::mutex> lk(g_outputLock);
+    g_output = o;
+}
+bool gpu_wait_vblank() {
+    ComPtr<IDXGIOutput> o;
+    { std::lock_guard<std::mutex> lk(g_outputLock); o = g_output; }
+    return o && SUCCEEDED(o->WaitForVBlank());
+}
+
+// What reached the screen, as opposed to what was submitted: refresh rate, frames discarded before scanout, and Present-to-scanout time.
+static void note_display_stats(LARGE_INTEGER presented, uint64_t frame) {
+    static LARGE_INTEGER sent[64]{};
+    static UINT lastId = 0; static UINT64 lastRefresh = 0; static LONGLONG lastSync = 0;
+    static uint64_t nShown = 0, nSkipped = 0, nRefreshes = 0, nDisjoint = 0, lastLog = 0; static LONGLONG syncTicks = 0;
+    static double latSum = 0, latMax = 0;
+    UINT id = 0;
+    if (SUCCEEDED(g_swap->GetLastPresentCount(&id))) sent[id & 63] = presented;
+    DXGI_FRAME_STATISTICS fs{};
+    HRESULT hr = g_swap->GetFrameStatistics(&fs);
+    if (FAILED(hr)) nDisjoint++;
+    else if (fs.PresentCount != lastId) {
+        if (lastId) {
+            UINT adv = fs.PresentCount - lastId;
+            nShown++; nSkipped += adv - 1;
+            nRefreshes += (uint64_t)(fs.SyncRefreshCount - lastRefresh);
+            syncTicks += fs.SyncQPCTime.QuadPart - lastSync;
+            if (sent[fs.PresentCount & 63].QuadPart) {
+                double ms = (double)(fs.SyncQPCTime.QuadPart - sent[fs.PresentCount & 63].QuadPart) * g_perfTicksToMs;
+                latSum += ms; latMax = std::max(latMax, ms);
+            }
+        }
+        lastId = fs.PresentCount; lastRefresh = fs.SyncRefreshCount; lastSync = fs.SyncQPCTime.QuadPart;
+    }
+    if (frame - lastLog >= 300) {
+        double secs = (double)syncTicks * g_perfTicksToMs / 1000.0;
+        fprintf(stderr, "[disp] frame=%llu presents=%llu shown=%llu discarded=%llu refreshes=%llu hz=%.3f present_to_scan avg=%.1f max=%.1f failed=%llu\n",
+                (unsigned long long)frame, (unsigned long long)(frame - lastLog), (unsigned long long)nShown, (unsigned long long)nSkipped, (unsigned long long)nRefreshes,
+                secs > 0 ? nRefreshes / secs : 0.0, nShown ? latSum / nShown : 0.0, latMax, (unsigned long long)nDisjoint);
+        lastLog = frame; nShown = nSkipped = nRefreshes = nDisjoint = 0; syncTicks = 0; latSum = latMax = 0;
+    }
+}
+
 static void write_shot() {
     static const char* dir = getenv("BCR2_SHOTDIR");
     if (!dir) return;
     static const int every = getenv("BCR2_SHOTEVERY") ? std::max(atoi(getenv("BCR2_SHOTEVERY")), 1) : 60;
-    if ((g_frame % every) != 0) return;
+    bool burst = g_shotBurstLeft.load() > 0;
+    if (burst) g_shotBurstLeft--;
+    if (!burst && (g_frame % every) != 0) return;
     D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
     d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
     ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return;
@@ -2018,7 +2084,29 @@ static void do_swap(uint32_t front) {
     }
     write_shot();
     HRESULT hr;
-    { PerfScope perfPresent(g_tPresent); hr = g_swap->Present(0, 0); }
+    LARGE_INTEGER presented; QueryPerformanceCounter(&presented);
+    {   // A tick that follows the display can wait for its refresh: nothing piles up, and no frame is discarded when one arrives close to the deadline.
+        static const int kForce = getenv("BCR2_PRESENTINTERVAL") ? atoi(getenv("BCR2_PRESENTINTERVAL")) : -1;
+        UINT interval = kForce >= 0 ? (UINT)kForce : (g_presentFollowsDisplay.load() ? 1u : 0u);
+        // A stall such as a load can leave one extra frame queued, and at a steady 1:1 rate that adds a full refresh of latency forever.
+        // Every Present then blocks, so after 30 of those in a row, leave one frame out to empty the queue.
+        static int blocked = 0;
+        static const bool kNoDrain = getenv("BCR2_NODRAIN") != nullptr;
+        if (interval == 1 && blocked >= 30 && !kNoDrain) {
+            static uint64_t nDrain = 0;
+            if (nDrain++ < 40) fprintf(stderr, "[disp] frame=%llu queue backed up, left one frame out (#%llu)\n", (unsigned long long)g_frame, (unsigned long long)nDrain);
+            blocked = 0;
+            hr = S_OK;
+        } else {
+            PerfScope perfPresent(g_tPresent); hr = g_swap->Present(interval, 0);
+            LARGE_INTEGER done; QueryPerformanceCounter(&done);
+            blocked = (double)(done.QuadPart - presented.QuadPart) * g_perfTicksToMs > 1.0 ? blocked + 1 : 0;
+        }
+    }
+    {
+        track_output();
+        note_display_stats(presented, g_frame);
+    }
     {
         static LARGE_INTEGER last{}; static uint64_t lastFrame = 0, lastDraws = 0, lastRes = 0;
         LARGE_INTEGER now; QueryPerformanceCounter(&now);
@@ -2032,7 +2120,8 @@ static void do_swap(uint32_t front) {
                 static int nSpike = 0;
                 if (nSpike++ < 400)
                     fprintf(stderr, "[spike] frame=%llu ms=%.1f draw=%.1f tex=%.1f res=%.1f pres=%.1f ring=%.1f reg=%.1f intr=%.1f compiles=%llu uploads=%llu upKB=%llu\n",
-                            (unsigned long long)g_frame, ms, g_tDraw - pD, g_tTex - pT, g_tResolve - pR, g_tPresent - pP,
+                            (unsigned long long)g_frame, ms, g_tDraw >= pD ? g_tDraw - pD : g_tDraw, g_tTex >= pT ? g_tTex - pT : g_tTex,
+                            g_tResolve >= pR ? g_tResolve - pR : g_tResolve, g_tPresent >= pP ? g_tPresent - pP : g_tPresent,
                             (w0 >= pW0 ? w0 - pW0 : w0) * g_perfTicksToMs, (w1 >= pW1 ? w1 - pW1 : w1) * g_perfTicksToMs, (w2 >= pW2 ? w2 - pW2 : w2) * g_perfTicksToMs,
                             (unsigned long long)(g_nCompiles - pCompiles), (unsigned long long)(g_nUploads - pUploads), (unsigned long long)((g_upBytes - pUpBytes) / 1024));
             }

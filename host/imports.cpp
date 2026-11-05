@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <cstdio>
 #include <cstdlib>
@@ -634,6 +635,46 @@ static void gpu_exec(uint8_t* base, const uint32_t* p, uint32_t n, int depth) {
     }
 }
 
+// ---- display refresh: lets the vsync tick follow the real display instead of a free-running 60.000 Hz clock ----
+// A 59.94 Hz display and a 60 Hz clock drift apart, which discards a frame about every 17 s and moves the latency through a full frame.
+// Follows every Nth refresh when the rate is within 1 Hz of 60 x N; any other rate keeps the clock. BCR2_NOVBLANKSYNC turns this off.
+static std::atomic<int> g_vblankDiv{0};
+static HANDLE g_vblankEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+static void vblank_thread() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    LARGE_INTEGER f, prev{}; QueryPerformanceFrequency(&f);
+    double sum = 0, lastPeriodMs = 16.667; int cnt = 0; uint64_t nv = 0;
+    for (;;) {
+        if (!gpu_wait_vblank()) { g_vblankDiv = 0; prev.QuadPart = 0; cnt = 0; sum = 0; Sleep(50); continue; }
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        if (prev.QuadPart) { sum += (double)(now.QuadPart - prev.QuadPart) / (double)f.QuadPart; cnt++; }
+        prev = now;
+        if (cnt == 64) {                                      // re-measured about once a second, so moving the window between displays works
+            double hz = cnt / sum;
+            lastPeriodMs = 1000.0 / hz;
+            int div = (int)(hz / 60.0 + 0.5);
+            if (div < 1 || fabs(hz / div - 60.0) > 1.0) div = 0;
+            if (g_vblankDiv.exchange(div) != div) fprintf(stderr, "[vblank] display %.3f Hz: %s (every %d)\n", hz, div ? "following refresh" : "keeping 60 Hz clock", div);
+            gpu_set_display_locked(div != 0);
+            cnt = 0; sum = 0;
+        }
+        int d = g_vblankDiv.load();
+        if (d && (++nv % d) == 0) {
+            // Ticking right on the refresh lands Present on the display's deadline, and frames get discarded. Measured at 59.95 Hz, in level 2:
+            // +0 ms discards 23% of frames; +3 and +6 ms discard none, 38.7 ms Present to scanout; +9 ms 23.3 ms; +12 ms 20.2 ms.
+            // 60% of a refresh is close to the best latency and leaves room before the deadline. BCR2_VBLANKDELAY=ms overrides it.
+            static const double kDelayMs = getenv("BCR2_VBLANKDELAY") ? atof(getenv("BCR2_VBLANKDELAY")) : -1.0;
+            double delayMs = kDelayMs >= 0 ? kDelayMs : 0.6 * lastPeriodMs;
+            if (delayMs > 0) {
+                LONGLONG until = now.QuadPart + (LONGLONG)(delayMs * (double)f.QuadPart / 1000.0);
+                LARGE_INTEGER t;
+                while (QueryPerformanceCounter(&t), t.QuadPart < until) { if (until - t.QuadPart > f.QuadPart / 500) Sleep(1); else YieldProcessor(); }
+            }
+            SetEvent(g_vblankEv);
+        }
+    }
+}
+
 // ---- vsync: calls the game's graphics interrupt callback (source 0) 60 times a second ----
 static void vsync_thread(uint8_t* base) {
     const uint32_t PCR = 0x7E000000, TOBJ = 0x7E010000, STK = 0x7E100000, STKSZ = 0x40000;
@@ -647,9 +688,14 @@ static void vsync_thread(uint8_t* base) {
     PPCContext ctx{};
     uint64_t n = 0;
     auto next = std::chrono::steady_clock::now();
+    auto lastTick = next;
     for (;;) {
-        // Sleep until about 2 ms before the tick, then yield up to it. Sleeping the whole way adds up to 1 ms of jitter per frame.
-        {
+        bool synced = false;
+        if (g_vblankDiv.load()) {                             // the event times out, so a display that stops refreshing can't stall the game
+            synced = WaitForSingleObject(g_vblankEv, 22) == WAIT_OBJECT_0;
+            if (!synced) next = std::chrono::steady_clock::now();
+        } else {
+            // Sleep until about 2 ms before the tick, then yield up to it. Sleeping the whole way adds up to 1 ms of jitter per frame.
             auto left = next - std::chrono::steady_clock::now();
             if (left > std::chrono::milliseconds(2)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
             else if (left > std::chrono::steady_clock::duration::zero()) std::this_thread::yield();
@@ -658,8 +704,10 @@ static void vsync_thread(uint8_t* base) {
 
 
         auto now = std::chrono::steady_clock::now();
-        if (now >= next) {                                    // vsync, 60 Hz
-            next += std::chrono::microseconds(16667);
+        if (synced && now - lastTick < std::chrono::milliseconds(10)) continue;   // a stale signal, just after a late tick
+        if (synced || now >= next) {                          // vsync, 60 Hz
+            lastTick = now;
+            next = synced ? now + std::chrono::microseconds(16667) : next + std::chrono::microseconds(16667);
             if (next < now) next = now + std::chrono::microseconds(16667);
             ctx.r1.u32  = STK + STKSZ - 0x100;
             ctx.r13.u32 = PCR;
@@ -768,6 +816,7 @@ static void gpu_thread(uint8_t* base) {
             for (uint32_t k = 0; k < pend; k++) { uint32_t a = ringGa + ((rptr + k) & mask) * 4; v[k] = PPC_LOAD_U32(a); }
             if (!g_vsyncStarted.exchange(true)) {
                 std::thread(vsync_thread, base).detach();
+                if (!getenv("BCR2_NOVBLANKSYNC")) std::thread(vblank_thread).detach();
                 std::thread(cp_intr_thread, base).detach();
             }
             g_batchRptr = rptr; g_batchMask = mask; g_batchLast = 0xFFFFFFFFu;
@@ -1744,7 +1793,8 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t* base) {
         uint8_t rt = 0;
         uint32_t cycle = 0;
         if (el >= 15000) {
-            cycle = (uint32_t)((el - 15000) / 500);
+            static const uint32_t kStepMs = getenv("BCR2_AUTOINPUTMS") ? (uint32_t)atoi(getenv("BCR2_AUTOINPUTMS")) : 500;   // shorter steps test rapid presses
+            cycle = (uint32_t)((el - 15000) / kStepMs);
             char c = '.';
             if (cycle < kOnce.size()) c = kOnce[cycle];
             else if (!kLoop.empty()) c = kLoop[(cycle - kOnce.size()) % kLoop.size()];
@@ -1769,6 +1819,7 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t* base) {
         static std::atomic<uint32_t> lastCycle{0xFFFFFFFFu};
         uint32_t prev = lastCycle.exchange(cycle);
         if (prev != cycle && cycle < 24) fprintf(stderr, "[input] press step=%u buttons=%04X lx=%d ly=%d t=%lu\n", cycle, buttons, lx, ly, GetTickCount());
+        if (prev != cycle && (buttons || lx || ly || rt)) gpu_note_press();
         wr32(base, st, cycle + 1);                                  // packet number changes with the state
         *(uint16_t*)(base + st + 4) = _byteswap_ushort(buttons);
         base[st + 7] = rt;

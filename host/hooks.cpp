@@ -986,24 +986,10 @@ PPC_FUNC(sub_823706A0) {                                                     // 
 static inline long long rope_us() { LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f); return q.QuadPart * 1000000 / f.QuadPart; }
 extern "C" void __imp__sub_82377938(PPCContext& __restrict__ ctx, uint8_t* base);
 PPC_FUNC(sub_82377938) {                                                     // Rope: game logic rewrites the node list
-    // The list holds the rope's origin and one point per attachment, and the game erases a node closer to its neighbour than a small
-    // threshold. A retracted bionic arm wire has both ends about 0.0001 apart, so rounding noise crosses the threshold on some frames:
-    // the wire leaves the renderer's list for that frame, the game's sort orders equal items differently, and a palm mesh draws with
-    // another's material, so its alpha cut-out is lost and it drops a solid shadow for one frame. Keep the wire on the list. It stays
-    // an invisible zero-length mesh, as on every other frame. BCR2_NOROPEFIX restores the original.
-    static const bool kNoFix = getenv("BCR2_NOROPEFIX") != nullptr;
-    const uint32_t self = ctx.r3.u32, list = be32_at(base, ctx.r4.u32 + 52);
-    const int expected = 1 + (int)(be32_at(base, list + 4) - be32_at(base, list)) / 60;
-    const long long a = g_ropeLog ? rope_us() : 0;
+    if (!g_ropeLog) { __imp__sub_82377938(ctx, base); return; }
+    const long long a = rope_us();
     __imp__sub_82377938(ctx, base);
-    if (!kNoFix && expected == 2) {
-        const uint32_t def = be32_at(base, self + 708), b = be32_at(base, def + 8), e = be32_at(base, def + 12), cap = be32_at(base, def + 16);
-        if (e - b == 12 && e + 12 <= cap) {
-            memcpy(base + e, base + b, 12);
-            *(uint32_t*)(base + def + 12) = _byteswap_ulong(e + 12);
-        }
-    }
-    if (g_ropeLog) fprintf(stderr, "[rope] logic f=%llu tid=%lu t=%lld..%lld\n", (unsigned long long)gpu_frame_number(), GetCurrentThreadId(), a, rope_us());
+    fprintf(stderr, "[rope] logic f=%llu tid=%lu t=%lld..%lld\n", (unsigned long long)gpu_frame_number(), GetCurrentThreadId(), a, rope_us());
 }
 extern "C" void __imp__sub_8236F370(PPCContext& __restrict__ ctx, uint8_t* base);
 PPC_FUNC(sub_8236F370) {                                                     // Rope (at +84): frame sync callback, flag 8 copies the node list for rendering
@@ -1036,4 +1022,37 @@ PPC_FUNC(sub_825585E0) {
     static bool done = false;
     if (kAt && !done && gpu_frame_number() >= kAt) { done = true; fprintf(stderr, "[bucket] %08X\n", ctx.r3.u32); hw_watch_set(ctx.r3.u32 + 56); }
     __imp__sub_825585E0(ctx, base);
+}
+
+// BCR2_ATOMLOG=first,last game frames: each render bucket's order before and after its sort, and the state each atom selects.
+static bool atom_log_on() {
+    static uint64_t a = 0, b = 0; static const char* k = getenv("BCR2_ATOMLOG");
+    if (!k) return false;
+    static bool parsed = (sscanf(k, "%llu,%llu", (unsigned long long*)&a, (unsigned long long*)&b), true); (void)parsed;
+    const uint64_t f = gpu_frame_number(); return f >= a && f <= b;
+}
+static void atom_list(const char* tag, uint8_t* base, uint32_t bucket) {
+    uint32_t b = be32_at(base, bucket + 56), e = be32_at(base, bucket + 60);
+    std::string s;
+    for (uint32_t p = b; p < e; p += 4) {
+        uint32_t at = be32_at(base, p); uint32_t d = be32_at(base, at + 8);
+        char t[64]; snprintf(t, sizeof t, " %08X/%08X/%08X/%u", at, d, be32_at(base, at + 16), be32_at(base, at + 44)); s += t;
+    }
+    fprintf(stderr, "[atoms] %s f=%llu bucket=%08X mode=%d n=%u:%s\n", tag, (unsigned long long)gpu_frame_number(), bucket, (int)be32_at(base, bucket + 8), (e - b) / 4, s.c_str());
+}
+extern "C" void __imp__sub_825672E8(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_825672E8) {                                                     // sort one render bucket
+    if (!atom_log_on()) { __imp__sub_825672E8(ctx, base); return; }
+    uint32_t bucket = ctx.r3.u32;
+    atom_list("in", base, bucket);
+    __imp__sub_825672E8(ctx, base);
+    atom_list("out", base, bucket);
+}
+extern "C" void __imp__sub_82662708(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82662708) {                                                     // set the state for one atom
+    if (!atom_log_on()) { __imp__sub_82662708(ctx, base); return; }
+    uint32_t q = ctx.r3.u32, at = ctx.r4.u32, mat = ctx.r5.u32, pass = ctx.r6.u32, bk = ctx.r7.u32;
+    uint32_t c0 = be32_at(base, q + 0x10000 - 32408), c1 = be32_at(base, q + 0x10000 - 32412);
+    __imp__sub_82662708(ctx, base);
+    fprintf(stderr, "[atomstate] f=%llu bucket#%u atom=%08X n=%u mat=%08X pass=%u tech %08X->%08X shader %08X->%08X\n", (unsigned long long)gpu_frame_number(), bk, at, be32_at(base, at + 44), mat, pass, c0, be32_at(base, q + 0x10000 - 32408), c1, be32_at(base, q + 0x10000 - 32412));
 }

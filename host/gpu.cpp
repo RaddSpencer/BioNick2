@@ -1560,7 +1560,12 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     uint32_t misc = g_regs[R_CONTEXT_MISC], pcntl = g_regs[R_PROGRAM_CNTL];
     uint32_t paramGen = ((pcntl >> 18) & 1) ? ((misc >> 8) & 0xFF) : 0xFFFFFFFFu;
     bool depthOnly = edram == 5;
-    XShader* ps = g_psCode.empty() ? nullptr : build_shader(g_psCode, false, paramGen);
+    // Depth-only mode runs no pixel shader, as on the console. The game sets none for such a draw and just leaves the old one loaded, so running
+    // that one here gives the mesh the previous draw's texture and alpha cut-out, and its shadow then depends on the draw order. BCR2_DEPTHKEEPPS restores that.
+    static const bool kDepthKeepPs = getenv("BCR2_DEPTHKEEPPS") != nullptr;
+    static const char* kDepthSolid = getenv("BCR2_DEPTHSOLID");              // comma-separated vertex shader hashes: only these depth-only draws skip the pixel shader
+    const bool skipPs = depthOnly && !kDepthKeepPs && (!kDepthSolid || strstr(kDepthSolid, S("%016llX", (unsigned long long)vs->hash).substr(0, 8).c_str()));
+    XShader* ps = (g_psCode.empty() || skipPs) ? nullptr : build_shader(g_psCode, false, paramGen);
     if (g_trace > 0) {
         fprintf(stderr, "[gfx]   shaders vs=%016llX ok=%d ps=%016llX ok=%d vte=%08X mode=%08X blend0=%08X cc=%08X psconst=%08X tf:", (unsigned long long)vs->hash, (int)vs->ok,
                 ps ? (unsigned long long)ps->hash : 0ull, ps ? (int)ps->ok : -1, g_regs[R_VTE_CNTL], g_regs[R_MODE_CNTL], g_regs[R_BLEND0], g_regs[R_COLORCONTROL], g_regs[0x2308]);
@@ -1904,7 +1909,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     }
     g_ctx->OMSetDepthStencilState(get_ds(dcEff, sr, srbf), sr & 0xFF);
     float polyScale = 0, polyOff = 0;
-    if ((mode >> 11) & 3) { polyScale = reg_f(R_OFFSET_FRONT_SCALE) / 16.0f; polyOff = reg_f(R_OFFSET_FRONT_SCALE + 1); }
+    // The slope is per pixel, so at a higher render scale the same surface changes less per pixel and the bias has to grow with the scale.
+    if ((mode >> 11) & 3) { polyScale = reg_f(R_OFFSET_FRONT_SCALE) / 16.0f * g_resScale; polyOff = reg_f(R_OFFSET_FRONT_SCALE + 1); }
     bool clipOff = (g_regs[R_CLIP_CNTL] >> 16) & 1;
     g_ctx->RSSetState(get_rs(mode, rect, clipOff, polyScale, polyOff));
     D3D11_VIEWPORT vp{ 0, 0, (float)(rw * g_resScale), (float)(rh * g_resScale), 0, 1 };

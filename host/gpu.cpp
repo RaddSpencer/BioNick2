@@ -376,7 +376,8 @@ struct Translator {
               case 19: B += " v=max(max(s1.x,s1.y),max(s1.z,s1.w)).xxxx;\n"; break;
               case 20: case 21: case 22: case 23: {
                 const char* o = vop == 20 ? "==" : vop == 21 ? "!=" : vop == 22 ? ">" : ">=";
-                B += S(" p=(s1.w%s0.0)&&(s2.w==0.0);\n v=((s1.x%s0.0)&&(s2.x==0.0))?0.0:(s1.x+1.0).xxxx;\n", o, o);
+                // src0 is the outer nesting counter (0 = active), src1 is the value tested
+                B += S(" p=(s1.w==0.0)&&(s2.w%s0.0);\n v=((s1.x==0.0)&&(s2.x%s0.0))?0.0:(s1.x+1.0).xxxx;\n", o, o);
                 break; }
               case 24: case 25: case 26: case 27: {
                 const char* o = vop == 24 ? "==" : vop == 25 ? ">" : vop == 26 ? ">=" : "!=";
@@ -1016,6 +1017,18 @@ static HostTex* get_texture(const FetchInfo& fi) {
     auto& slot = g_texCache[key];
     if (!slot) slot = new HostTex();
     HostTex* ht = slot;
+    if (g_trace > 1000) {
+        static std::set<uint64_t> seen;
+        if (seen.insert(key).second && fi.w <= 32 && fi.h <= 32) {                // small textures: show their layout and raw blocks
+            fprintf(stderr, "[texdbg] base=%08X fmt=%u %ux%u pitch=%u tiled=%d packed=%d endian=%u off=%u,%u raw@off:", fi.base, fi.fmt, fi.w, fi.h, fi.pitch, (int)fi.tiled, (int)fi.packed, fi.endian, offX, offY);
+            uint32_t a0 = fi.tiled ? tiled2d(offX, offY, pitchAligned, bl2) : offY * rowBytes + offX * tf.bpb;
+            for (uint32_t k = 0; k < 2; k++) fprintf(stderr, " %08X", *(const uint32_t*)phys(fi.base + a0 + k * 4));
+            fprintf(stderr, " raw@0:");
+            for (uint32_t k = 0; k < 2; k++) fprintf(stderr, " %08X", *(const uint32_t*)phys(fi.base + k * 4));
+            uint32_t nz = 0; for (uint32_t k = 0; k < total; k += 4) if (*(const uint32_t*)phys(fi.base + k)) nz++;
+            fprintf(stderr, " nonzero dwords=%u of %u\n", nz, total / 4);
+        }
+    }
     if (ht->lastFrame == g_frame && ht->srv) return ht;
     ht->lastFrame = g_frame;
     uint64_t h = range_hash(fi.base, total);
@@ -1354,7 +1367,16 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     if (g_trace > 0) {
         fprintf(stderr, "[gfx]   shaders vs=%016llX ok=%d ps=%016llX ok=%d vte=%08X mode=%08X blend0=%08X cc=%08X psconst=%08X tf:", (unsigned long long)vs->hash, (int)vs->ok,
                 ps ? (unsigned long long)ps->hash : 0ull, ps ? (int)ps->ok : -1, g_regs[R_VTE_CNTL], g_regs[R_MODE_CNTL], g_regs[R_BLEND0], g_regs[R_COLORCONTROL], g_regs[0x2308]);
-        if (ps) for (auto& u : ps->tex) { const uint32_t* t = &g_regs[R_FETCH + u.slot * 6]; fprintf(stderr, " %u:fmt=%u,base=%08X,%ux%u,sw=%03X", u.slot, t[1] & 63, t[1] & 0xFFFFF000u, (t[2] & 0x1FFF) + 1, ((t[2] >> 13) & 0x1FFF) + 1, (t[3] >> 1) & 0xFFF); }
+        if (ps) for (auto& u : ps->tex) { const uint32_t* t = &g_regs[R_FETCH + u.slot * 6]; fprintf(stderr, " %u:fmt=%u,base=%08X,%ux%u,sw=%03X,sg=%02X", u.slot, t[1] & 63, t[1] & 0xFFFFF000u, (t[2] & 0x1FFF) + 1, ((t[2] >> 13) & 0x1FFF) + 1, (t[3] >> 1) & 0xFFF, (t[0] >> 2) & 0xFF); }
+        fprintf(stderr, " c509=%g,%g,%g,%g c256=%g,%g,%g,%g c267=%g,%g,%g,%g colfmt=%u", reg_f(R_CONST + 509 * 4), reg_f(R_CONST + 509 * 4 + 1), reg_f(R_CONST + 509 * 4 + 2), reg_f(R_CONST + 509 * 4 + 3),
+                reg_f(R_CONST + 256 * 4), reg_f(R_CONST + 256 * 4 + 1), reg_f(R_CONST + 256 * 4 + 2), reg_f(R_CONST + 256 * 4 + 3),
+                reg_f(R_CONST + 267 * 4), reg_f(R_CONST + 267 * 4 + 1), reg_f(R_CONST + 267 * 4 + 2), reg_f(R_CONST + 267 * 4 + 3), (g_regs[R_COLOR_INFO] >> 16) & 0xF);
+        static const char* traceC = getenv("BCR2_TRACEC");                  // hash of a pixel shader: also print its constants
+        if (traceC && ps && S("%016llX", (unsigned long long)ps->hash) == traceC) {
+            fprintf(stderr, " PC:");
+            for (int k = 256; k < 276; k++) fprintf(stderr, " c%d=%g,%g,%g,%g", k, reg_f(R_CONST + k * 4), reg_f(R_CONST + k * 4 + 1), reg_f(R_CONST + k * 4 + 2), reg_f(R_CONST + k * 4 + 3));
+            for (int k = 508; k < 512; k++) fprintf(stderr, " c%d=%g,%g,%g,%g", k, reg_f(R_CONST + k * 4), reg_f(R_CONST + k * 4 + 1), reg_f(R_CONST + k * 4 + 2), reg_f(R_CONST + k * 4 + 3));
+        }
         fprintf(stderr, " vsconst=%08X c0=%g,%g,%g,%g c4=%g,%g,%g,%g zs=%g zo=%g clip=%08X", g_regs[0x2307], reg_f(R_CONST), reg_f(R_CONST + 1), reg_f(R_CONST + 2), reg_f(R_CONST + 3),
                 reg_f(R_CONST + 16), reg_f(R_CONST + 17), reg_f(R_CONST + 18), reg_f(R_CONST + 19), reg_f(R_VPORT_XSCALE + 4), reg_f(R_VPORT_XSCALE + 5), g_regs[R_CLIP_CNTL]);
         fprintf(stderr, " vf:");

@@ -1970,11 +1970,19 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     {   // BCR2_DRAWPRINT=<surface info hex>, with BCR2_PROBEQLIGHT: a fingerprint of each draw to that target, to compare a frame's draws against another frame's
         static const char* kPrint = getenv("BCR2_DRAWPRINT");
         static const uint32_t kPrintSurf = kPrint ? (uint32_t)strtoul(kPrint, nullptr, 16) : 0;
-        if (kPrint && g_probeQLight && g_regs[R_SURFACE_INFO] == kPrintSurf) {
+        if (kPrint && g_probeQLight && (kPrint[0] == '*' || g_regs[R_SURFACE_INFO] == kPrintSurf)) {
             uint64_t ch = fnv64(&g_regs[R_CONST], 8192), rh = fnv64(&g_regs[0x2000], 0x400 * 4), fh = fnv64(&g_regs[R_FETCH], 0xC0 * 4);
             uint64_t ih = useIdx ? fnv64(useIdx->data(), useIdx->size() * 4) : 0;
             uint32_t vf0 = g_regs[R_FETCH + 95 * 2] & ~3u, vfw = (g_regs[R_FETCH + 95 * 2 + 1] >> 2) & 0xFFFFFF;
             uint64_t vh = vf0 ? fnv64(phys(vf0), vfw * 4) : 0;
+            static const char* kVerts = getenv("BCR2_DRAWVERTS");           // vertex shader hash: also print the vertex stream of its draws, as floats
+            if (kVerts && vf0 && S("%016llX", (unsigned long long)vs->hash) == kVerts) {
+                std::string v = S("[dpverts] f=%llu vf=%08X/%u:", (unsigned long long)g_frame, vf0, vfw);
+                for (uint32_t k = 0; k < vfw && k < 128; k++) { uint32_t w = _byteswap_ulong(*(const uint32_t*)phys(vf0 + k * 4)); v += S(" %08X", w); }
+                v += " C:";
+                for (int k = 0; k < 16; k++) v += S(" %.6g", reg_f(R_CONST + k));
+                fprintf(stderr, "%s\n", v.c_str());
+            }
             static const char* kFull = getenv("BCR2_DRAWPRINTFULL");        // vertex shader hash: also print every register and shader constant at its draws
             if (kFull && (kFull[0] == '*' || S("%016llX", (unsigned long long)vs->hash) == kFull)) {
                 fprintf(stderr, "[dpfull] f=%llu", (unsigned long long)g_frame);
@@ -1983,7 +1991,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
                 for (uint32_t r = 0; r < 8; r++) fprintf(stderr, " b%u=%08X", r, g_regs[R_BOOL + r]);
                 fprintf(stderr, "\n");
             }
-            fprintf(stderr, "[dp] f=%llu vs=%016llX ps=%016llX num=%u vf=%08X/%u idx=%016llX vb=%016llX const=%016llX regs=%016llX fetch=%016llX c204=%08X,%08X,%08X,%08X\n", (unsigned long long)g_frame, (unsigned long long)vs->hash, ps ? (unsigned long long)ps->hash : 0ull, drawCount, vf0, vfw, (unsigned long long)ih, (unsigned long long)vh, (unsigned long long)ch, (unsigned long long)rh, (unsigned long long)fh, g_regs[R_CONST + 204 * 4], g_regs[R_CONST + 204 * 4 + 1], g_regs[R_CONST + 204 * 4 + 2], g_regs[R_CONST + 204 * 4 + 3]);
+            fprintf(stderr, "[dp] f=%llu vs=%016llX ps=%016llX num=%u vf=%08X/%u idx=%016llX vb=%016llX const=%016llX regs=%016llX fetch=%016llX c204=%08X,%08X,%08X,%08X view=%016llX pos=%.7g,%.7g,%.7g sc=%08X,%08X c212=%g surf=%08X\n", (unsigned long long)g_frame, (unsigned long long)vs->hash, ps ? (unsigned long long)ps->hash : 0ull, drawCount, vf0, vfw, (unsigned long long)ih, (unsigned long long)vh, (unsigned long long)ch, (unsigned long long)rh, (unsigned long long)fh, g_regs[R_CONST + 204 * 4], g_regs[R_CONST + 204 * 4 + 1], g_regs[R_CONST + 204 * 4 + 2], g_regs[R_CONST + 204 * 4 + 3],
+                    (unsigned long long)fnv64(&g_regs[R_CONST], 16 * 4), reg_f(R_CONST + 4 * 4 + 3), reg_f(R_CONST + 5 * 4 + 3), reg_f(R_CONST + 6 * 4 + 3), g_regs[0x2081], g_regs[0x2082], reg_f(R_CONST + 212 * 4), g_regs[R_SURFACE_INFO]);
         }
     }
     // BCR2_PROBEQ="x,y": like BCR2_PROBE, but only queues a pixel copy after each draw and reads them at the end of the frame, so nothing forces a sync.
@@ -2384,7 +2393,48 @@ static void update_display() {
     g_dev->CreateRenderTargetView(g_backTex.Get(), nullptr, &g_backRtv);
 }
 
+// BCR2_MEMFIND="frame:HEX,HEX,...": at that frame, list every guest address holding one of these big-endian words, with the words around it.
+// Use it to walk from a value seen in a draw back to the game object that holds it, and from there to whatever points at that object.
+static void mem_find() {
+    static const char* kFind = getenv("BCR2_MEMFIND");
+    if (!kFind) return;
+    static const uint64_t kFrame = _strtoui64(kFind, nullptr, 10);
+    if (g_frame != kFrame) return;
+    std::vector<uint32_t> want;
+    if (const char* p = strchr(kFind, ':')) {
+        while (*p == ':' || *p == ',') { char* e; want.push_back(_byteswap_ulong((uint32_t)strtoul(p + 1, &e, 16))); p = e; }
+    }
+    uint64_t hits = 0;
+    for (uint64_t off = 0; off < 0x100000000ull; ) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(g_base + off, &mi, sizeof mi)) break;
+        const uint64_t size = mi.RegionSize - (uint64_t)((g_base + off) - (uint8_t*)mi.BaseAddress);
+        if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            const uint32_t* w = (const uint32_t*)(g_base + off);
+            const uint64_t n = size / 4;
+            for (uint64_t i = 0; i < n; i++) {
+                for (uint32_t v : want) if (w[i] == v) {
+                    if (++hits > 4000) break;
+                    std::string s = S("[memfind] f=%llu %08X = %08X :", (unsigned long long)g_frame, (uint32_t)(off + i * 4), _byteswap_ulong(v));
+                    for (int64_t k = -12; k <= 12; k++) if ((int64_t)i + k >= 0 && (uint64_t)((int64_t)i + k) < n) s += S(k == 0 ? " [%08X]" : " %08X", _byteswap_ulong(w[i + k]));
+                    fprintf(stderr, "%s\n", s.c_str());
+                }
+            }
+        }
+        off += size;
+    }
+    fprintf(stderr, "[memfind] f=%llu done, %llu hits\n", (unsigned long long)g_frame, (unsigned long long)hits);
+}
+
+void hw_watch_set(uint32_t phys);
+uint64_t gpu_frame_number() { return g_frame; }
+
 static void do_swap(uint32_t front) {
+    mem_find();
+    {   // BCR2_HWWATCH="frame:physical hex": name the game code that writes this word
+        static const char* kHw = getenv("BCR2_HWWATCH");
+        if (kHw && g_frame == _strtoui64(kHw, nullptr, 10)) if (const char* p = strchr(kHw, ':')) hw_watch_set((uint32_t)strtoul(p + 1, nullptr, 16));
+    }
     update_display();
     static const int64_t kDumpCount = getenv("BCR2_DUMPCOUNT") ? _atoi64(getenv("BCR2_DUMPCOUNT")) : 1;   // that many consecutive frames, to compare stages between frames
     static const bool kProbeLight = getenv("BCR2_PROBEQLIGHT") != nullptr;
@@ -2519,6 +2569,22 @@ void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
         g_devOk = device_init();
     }
     if (!g_devOk) return;
+    {   // BCR2_PM4TRACE=<surface info hex>, with BCR2_PROBEQLIGHT: every packet while that target is bound, with where it was read from
+        static const char* kTrace = getenv("BCR2_PM4TRACE");
+        static const uint32_t kTraceSurf = kTrace ? (uint32_t)strtoul(kTrace, nullptr, 16) : 0;
+        if (kTrace && g_probeQLight && g_regs[R_SURFACE_INFO] == kTraceSurf) {
+            std::string s = S("[pm4] f=%llu at=%08X op=%02X n=%u", (unsigned long long)g_frame, (uint32_t)((const uint8_t*)b - base), op, cnt);
+            for (uint32_t k = 0; k < cnt && k < 8; k++) s += S(" %08X", b[k]);
+            fprintf(stderr, "%s\n", s.c_str());
+            static const uint32_t* last = nullptr;                          // the raw words since the previous packet, which carry the type 0 register writes
+            if (last && b > last && b - last < 512) {
+                s = "[pm4raw]";
+                for (const uint32_t* w = last; w < b; w++) s += S(" %08X", *w);
+                fprintf(stderr, "%s\n", s.c_str());
+            }
+            last = b + cnt;
+        }
+    }
     auto load_shader = [&](uint32_t type, const uint32_t* data, uint32_t n, bool fromMem, uint32_t addr) {
         auto& code = type == 0 ? g_vsCode : g_psCode;
         code.resize(n);

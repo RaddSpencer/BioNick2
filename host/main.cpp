@@ -4,6 +4,8 @@
 #include "ppc_recomp_shared.h"
 #include <string>
 #include <windows.h>
+#include <tlhelp32.h>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -186,8 +188,62 @@ void watch_arm_if_in(uint32_t addr, uint32_t size) {
     }
 }
 
+// BCR2_HWWATCH: a hardware data breakpoint on one physical word, in all three of its windows, on every thread running now.
+// Each write logs the host code address and the guest call stack, to name the game code behind a value seen in a draw.
+static DWORD WINAPI hw_watch_thread(LPVOID arg) {
+    const uint32_t phys = (uint32_t)(uintptr_t)arg;
+    const uint64_t views[3] = { 0xA0000000ull, 0xC0000000ull, 0xE0000000ull };
+    const bool direct = phys >= 0x20000000u;                    // a full guest address, not a physical one: watch just that
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te{}; te.dwSize = sizeof te;
+    int n = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        SuspendThread(t);
+        CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(t, &c)) {
+            if (direct) {
+                c.Dr0 = (DWORD64)(g_base + phys);
+                c.Dr7 = 0x1 | (0xDull << 16);
+            } else {
+                c.Dr0 = (DWORD64)(g_base + views[0] + phys); c.Dr1 = (DWORD64)(g_base + views[1] + phys); c.Dr2 = (DWORD64)(g_base + views[2] + phys);
+                c.Dr7 = 0x1 | (0x4ull) | (0x10ull) | (0xDull << 16) | (0xDull << 20) | (0xDull << 24);   // local enable 0-2, write, 4 bytes
+            }
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (SetThreadContext(t, &c)) n++;
+        }
+        ResumeThread(t);
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    fprintf(stderr, "[hwwatch] physical %08X armed on %d threads\n", phys, n);
+    return 0;
+}
+void hw_watch_set(uint32_t phys) {   // from a helper thread, since a running thread cannot set its own debug registers
+    HANDLE h = CreateThread(nullptr, 0, hw_watch_thread, (LPVOID)(uintptr_t)phys, 0, nullptr);
+    if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); }
+}
+
 static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 7)) {
+        static std::atomic<int> logged{0};
+        ep->ContextRecord->Dr6 = 0;
+        if (logged++ < 60) {
+            uint32_t lr = g_ctx ? (uint32_t)g_ctx->lr : 0, sp = g_ctx ? g_ctx->r1.u32 : 0;
+            fprintf(stderr, "[hwwatch] thread=%lu rip+%llX lr=%08X r1=%08X r3=%08X r4=%08X r5=%08X bt:", GetCurrentThreadId(), (unsigned long long)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)GetModuleHandleW(nullptr)), lr, sp, g_ctx ? g_ctx->r3.u32 : 0, g_ctx ? g_ctx->r4.u32 : 0, g_ctx ? g_ctx->r5.u32 : 0);
+            for (int k = 0; k < 10 && sp >= 0x40000000u && sp < 0x80000000u; k++) {
+                uint32_t cs = _byteswap_ulong(*(uint32_t*)(g_base + sp));
+                if (cs <= sp || cs - sp > 0x100000 || cs >= 0x80000000u) break;
+                fprintf(stderr, " %08X", _byteswap_ulong(*(uint32_t*)(g_base + cs - 8)));
+                sp = cs;
+            }
+            fprintf(stderr, "\n");
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (code >= 0xC000008Du && code <= 0xC0000093u) {      // STATUS_FLOAT_*
         ep->ContextRecord->MxCsr = (ep->ContextRecord->MxCsr | 0x1F80u) & ~0x3Fu;
         ep->ContextRecord->FltSave.MxCsr = ep->ContextRecord->MxCsr;

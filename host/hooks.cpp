@@ -965,3 +965,66 @@ PPC_FUNC(sub_82252508) {
         fprintf(stderr, "[spin] SLOW %ld ms tid=%lu obj=%08X lr=%08X bt=%08X %08X %08X %08X *152=%08X[%08X]\n",
                 ms, GetCurrentThreadId(), obj, callerLr, bt[0], bt[1], bt[2], bt[3], p, p > 0x10000 ? PPC_LOAD_U32(p) : 0u);
 }
+// BCR2_ROPELOG: the state of the bionic arm wire each time it is rebuilt and each time it is submitted to the renderer.
+// The rope object holds its node list through +712, its index list at +892..+896; submit and rebuild run on the render side.
+uint64_t gpu_frame_number();
+void hw_watch_set(uint32_t phys);
+static const bool g_ropeLog = getenv("BCR2_ROPELOG") != nullptr;
+static inline uint32_t be32_at(uint8_t* base, uint32_t a) { return _byteswap_ulong(*(uint32_t*)(base + a)); }
+extern "C" void __imp__sub_823706A0(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_823706A0) {                                                     // Rope: rebuild geometry from the node list
+    if (!g_ropeLog) { __imp__sub_823706A0(ctx, base); return; }
+    uint32_t self = ctx.r3.u32, def = be32_at(base, self + 712);
+    uint32_t b = def ? be32_at(base, def + 8) : 0, e = def ? be32_at(base, def + 12) : 0;
+    static const uint64_t kWatchAt = getenv("BCR2_ROPEWATCH") ? _atoi64(getenv("BCR2_ROPEWATCH")) : 0;
+    static bool watched = false;
+    if (kWatchAt && !watched && gpu_frame_number() >= kWatchAt) { watched = true; hw_watch_set(be32_at(base, self + 708) + 12); }   // who changes the node count, on the game logic's copy (+712 is the render copy)
+    __imp__sub_823706A0(ctx, base);
+    uint32_t ib = be32_at(base, self + 892), ie = be32_at(base, self + 896);
+    fprintf(stderr, "[rope] build f=%llu tid=%lu this=%08X def=%08X nodes=%d indices=%d\n", (unsigned long long)gpu_frame_number(), GetCurrentThreadId(), self, def, (int)(e - b) / 12, (int)(ie - ib) / 2);
+}
+static inline long long rope_us() { LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f); return q.QuadPart * 1000000 / f.QuadPart; }
+extern "C" void __imp__sub_82377938(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82377938) {                                                     // Rope: game logic rewrites the node list
+    // The list holds the rope's origin and one point per attachment, and the game erases a node closer to its neighbour than a small
+    // threshold. A retracted bionic arm wire has both ends about 0.0001 apart, so rounding noise crosses the threshold on some frames:
+    // the wire leaves the renderer's list for that frame, the game's sort orders equal items differently, and a palm mesh draws with
+    // another's material, so its alpha cut-out is lost and it drops a solid shadow for one frame. Keep the wire on the list. It stays
+    // an invisible zero-length mesh, as on every other frame. BCR2_NOROPEFIX restores the original.
+    static const bool kNoFix = getenv("BCR2_NOROPEFIX") != nullptr;
+    const uint32_t self = ctx.r3.u32, list = be32_at(base, ctx.r4.u32 + 52);
+    const int expected = 1 + (int)(be32_at(base, list + 4) - be32_at(base, list)) / 60;
+    const long long a = g_ropeLog ? rope_us() : 0;
+    __imp__sub_82377938(ctx, base);
+    if (!kNoFix && expected == 2) {
+        const uint32_t def = be32_at(base, self + 708), b = be32_at(base, def + 8), e = be32_at(base, def + 12), cap = be32_at(base, def + 16);
+        if (e - b == 12 && e + 12 <= cap) {
+            memcpy(base + e, base + b, 12);
+            *(uint32_t*)(base + def + 12) = _byteswap_ulong(e + 12);
+        }
+    }
+    if (g_ropeLog) fprintf(stderr, "[rope] logic f=%llu tid=%lu t=%lld..%lld\n", (unsigned long long)gpu_frame_number(), GetCurrentThreadId(), a, rope_us());
+}
+extern "C" void __imp__sub_8236F370(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_8236F370) {                                                     // Rope (at +84): frame sync callback, flag 8 copies the node list for rendering
+    if (!g_ropeLog) { __imp__sub_8236F370(ctx, base); return; }
+    uint32_t self = ctx.r3.u32 - 84, flags = ctx.r4.u32, src = be32_at(base, self + 708);
+    long long a = rope_us();
+    int n = src ? (int)(be32_at(base, src + 12) - be32_at(base, src + 8)) / 12 : -1;
+    __imp__sub_8236F370(ctx, base);
+    fprintf(stderr, "[rope] sync f=%llu tid=%lu t=%lld..%lld flags=%X srcnodes=%d\n", (unsigned long long)gpu_frame_number(), GetCurrentThreadId(), a, rope_us(), flags, n);
+}
+extern "C" void __imp__sub_82371260(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82371260) {                                                     // Rope (at +384): submit to the renderer
+    if (!g_ropeLog) { __imp__sub_82371260(ctx, base); return; }
+    uint32_t self = ctx.r3.u32 - 384;
+    {   // once: the render queue this rope submits itself to
+        static bool once = false;
+        if (!once) { once = true; uint32_t q = ctx.r4.u32, vt = be32_at(base, q); fprintf(stderr, "[rope] queue=%08X vtable=%08X add=%08X atom=%08X\n", q, vt, be32_at(base, vt + 196), self + 384 + 684); }
+    }
+    uint32_t dirty = *(base + self + 780);
+    uint32_t ib0 = be32_at(base, self + 892), ie0 = be32_at(base, self + 896);
+    __imp__sub_82371260(ctx, base);
+    uint32_t ib = be32_at(base, self + 892), ie = be32_at(base, self + 896);
+    fprintf(stderr, "[rope] submit f=%llu tid=%lu this=%08X dirty=%u indices %d -> %d\n", (unsigned long long)gpu_frame_number(), GetCurrentThreadId(), self, dirty, (int)(ie0 - ib0) / 2, (int)(ie - ib) / 2);
+}

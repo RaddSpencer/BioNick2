@@ -16,6 +16,7 @@
 #include "gpu.h"
 #include <windows.h>
 #include <d3d11_1.h>
+#include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -215,6 +216,22 @@ static ComPtr<ID3DBlob> compile_cached(const std::string& src, const char* entry
 
 static const char* kVOut = "struct VOut { float4 pos : SV_Position; float4 o[16] : TEXCOORD; };\n";
 
+// BCR2_VRR: for a G-Sync or FreeSync display. The game clock runs at exactly 60 Hz and each frame is presented at a fixed time after its tick,
+// with no wait for a refresh, so the panel follows the game. On a display without variable refresh this tears, so it is opt-in.
+static bool g_tearing = false; static UINT g_swapFlags = 0;
+static std::atomic<long long> g_lastTickQpc{0};
+void gpu_note_tick() { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_lastTickQpc = q.QuadPart; }
+static bool tearing_supported() {
+    typedef HRESULT (WINAPI *PFN)(REFIID, void**);
+    HMODULE m = LoadLibraryW(L"dxgi.dll");
+    PFN create = m ? (PFN)GetProcAddress(m, "CreateDXGIFactory1") : nullptr;
+    ComPtr<IDXGIFactory5> f; BOOL ok = FALSE;
+    if (!create || FAILED(create(__uuidof(IDXGIFactory5), (void**)f.GetAddressOf()))) return false;
+    return SUCCEEDED(f->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &ok, sizeof ok)) && ok;
+}
+
+bool gpu_vrr() { static const bool on = getenv("BCR2_VRR") != nullptr && tearing_supported(); return on; }   // no tearing support: keep the display lock
+
 static bool device_init() {
     if (g_trace == 0) if (const char* t = getenv("BCR2_GPUTRACE")) g_trace = atoi(t);
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -224,6 +241,8 @@ static bool device_init() {
     sd.BufferCount = 2; sd.BufferDesc.Width = 1280; sd.BufferDesc.Height = 720; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow = g_hwnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    if (gpu_vrr()) { sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; g_swapFlags = sd.Flags; g_tearing = true; }
+    fprintf(stderr, "[vrr] %s, present with tearing allowed: %s\n", gpu_vrr() ? "variable refresh pacing" : "fixed refresh pacing", g_tearing ? "yes" : "no");
     D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 }, got;
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want, 2, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
     if (FAILED(hr)) hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want + 1, 1, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
@@ -2392,7 +2411,7 @@ static void update_display() {
     invalidate_binds();
     g_backRtv.Reset(); g_backTex.Reset();
     g_ctx->Flush();
-    HRESULT hr = g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    HRESULT hr = g_swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, g_swapFlags);
     if (FAILED(hr)) fprintf(stderr, "[display] ResizeBuffers %ux%u failed: %08lX\n", w, h, hr);
     else { g_backW = w; g_backH = h; fprintf(stderr, "[display] back buffer %ux%u\n", w, h); }
     g_swap->GetBuffer(0, IID_PPV_ARGS(&g_backTex));
@@ -2496,6 +2515,24 @@ static void do_swap(uint32_t front) {
     HRESULT hr;
     LARGE_INTEGER presented; QueryPerformanceCounter(&presented);
     {   // A tick that follows the display can wait for its refresh: nothing piles up, and no frame is discarded when one arrives close to the deadline.
+        if (gpu_vrr()) {
+            // Hold the frame until a fixed time after its tick, so differences in render time don't reach the screen as uneven frame times.
+            static const double kPhaseMs = getenv("BCR2_VRRPHASE") ? atof(getenv("BCR2_VRRPHASE")) : 14.0;
+            static uint64_t nLate = 0, nShown = 0; static double phaseSum = 0, phaseMax = 0;
+            LARGE_INTEGER ready; QueryPerformanceCounter(&ready);
+            const long long tick = g_lastTickQpc.load();
+            const double phase = tick ? (double)(ready.QuadPart - tick) * g_perfTicksToMs : 0;
+            phaseSum += phase; phaseMax = std::max(phaseMax, phase); nShown++;
+            if (phase > kPhaseMs) nLate++;
+            else if (tick) {
+                const double left = kPhaseMs - phase;
+                if (left > 2.0) Sleep((DWORD)(left - 1.5));
+                for (;;) { LARGE_INTEGER q; QueryPerformanceCounter(&q); if ((double)(q.QuadPart - tick) * g_perfTicksToMs >= kPhaseMs) break; YieldProcessor(); }
+            }
+            QueryPerformanceCounter(&presented);
+            { PerfScope perfPresent(g_tPresent); hr = g_swap->Present(0, (g_tearing && g_modeNow != kExclusive) ? DXGI_PRESENT_ALLOW_TEARING : 0); }
+            if (nShown >= 300) { fprintf(stderr, "[vrr] frame ready after its tick: avg=%.1f max=%.1f ms, past the %.1f ms target: %llu of %llu\n", phaseSum / nShown, phaseMax, kPhaseMs, (unsigned long long)nLate, (unsigned long long)nShown); nShown = nLate = 0; phaseSum = phaseMax = 0; }
+        } else {
         static const int kForce = getenv("BCR2_PRESENTINTERVAL") ? atoi(getenv("BCR2_PRESENTINTERVAL")) : -1;
         UINT interval = kForce >= 0 ? (UINT)kForce : (g_presentFollowsDisplay.load() ? 1u : 0u);
         // A stall such as a load can leave one extra frame queued, and at a steady 1:1 rate that adds a full refresh of latency forever.
@@ -2511,6 +2548,7 @@ static void do_swap(uint32_t front) {
             PerfScope perfPresent(g_tPresent); hr = g_swap->Present(interval, 0);
             LARGE_INTEGER done; QueryPerformanceCounter(&done);
             blocked = (double)(done.QuadPart - presented.QuadPart) * g_perfTicksToMs > 1.0 ? blocked + 1 : 0;
+        }
         }
     }
     {

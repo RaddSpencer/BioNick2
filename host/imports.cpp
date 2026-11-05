@@ -682,6 +682,7 @@ static void vblank_thread() {
 }
 
 // ---- vsync: calls the game's graphics interrupt callback (source 0) 60 times a second ----
+bool gpu_vrr(); void gpu_note_tick();
 static void vsync_thread(uint8_t* base) {
     const uint32_t PCR = 0x7E000000, TOBJ = 0x7E010000, STK = 0x7E100000, STKSZ = 0x40000;
     VirtualAlloc(base + PCR, 0x20000, MEM_COMMIT, PAGE_READWRITE);
@@ -715,6 +716,12 @@ static void vsync_thread(uint8_t* base) {
             static const auto kTick = std::chrono::microseconds(getenv("BCR2_TICKHZ") ? 1000000 / atoi(getenv("BCR2_TICKHZ")) : 16667);
             lastTick = now;
             next = synced ? now + kTick : next + kTick;
+            if (gpu_vrr()) {                                  // exactly 1/60 s: whole ticks from a start time, so the rounding in kTick cannot accumulate
+                static auto start = now; static long long k = 0;
+                next = start + std::chrono::nanoseconds(++k * 1000000000ll / 60);
+                if (next < now) { start = now; k = 1; next = start + std::chrono::nanoseconds(1000000000ll / 60); }   // after a stall, start over
+                gpu_note_tick();
+            }
             if (next < now) next = now + kTick;
             ctx.r1.u32  = STK + STKSZ - 0x100;
             ctx.r13.u32 = PCR;
@@ -823,7 +830,7 @@ static void gpu_thread(uint8_t* base) {
             for (uint32_t k = 0; k < pend; k++) { uint32_t a = ringGa + ((rptr + k) & mask) * 4; v[k] = PPC_LOAD_U32(a); }
             if (!g_vsyncStarted.exchange(true)) {
                 std::thread(vsync_thread, base).detach();
-                if (!getenv("BCR2_NOVBLANKSYNC") && !getenv("BCR2_TICKHZ")) std::thread(vblank_thread).detach();
+                if (!getenv("BCR2_NOVBLANKSYNC") && !getenv("BCR2_TICKHZ") && !gpu_vrr()) std::thread(vblank_thread).detach();
                 std::thread(cp_intr_thread, base).detach();
             }
             g_batchRptr = rptr; g_batchMask = mask; g_batchLast = 0xFFFFFFFFu;

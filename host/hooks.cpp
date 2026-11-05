@@ -860,7 +860,8 @@ extern "C" void __imp__sub_826C6488(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_826C6488) {
     uint32_t lr = (uint32_t)ctx.lr;
     __imp__sub_826C6488(ctx, base);
-    fprintf(stderr, "[err] GetLastError -> %u (caller lr=%08X)\n", ctx.r3.u32, lr);
+    static const bool kVerbose = getenv("BCR2_VERBOSE") != nullptr;         // hundreds per second, each an unbuffered write
+    if (kVerbose) fprintf(stderr, "[err] GetLastError -> %u (caller lr=%08X)\n", ctx.r3.u32, lr);
 }
 
 extern "C" void __imp__sub_82252508(PPCContext& __restrict__ ctx, uint8_t* base);

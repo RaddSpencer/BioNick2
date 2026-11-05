@@ -274,6 +274,12 @@ unsigned dbg_intr_done();
 void dbg_dump_waits(unsigned minMs);
 int main(int argc, char** argv) {
     timeBeginPeriod(1);
+    // stderr is written from every thread, and unbuffered each call is a file write that can stall the frame.
+    // Buffer it and flush from a background thread. The crash handler flushes too. BCR2_LOGUNBUFFERED restores the old behaviour.
+    if (!getenv("BCR2_LOGUNBUFFERED")) {
+        setvbuf(stderr, nullptr, _IOFBF, 1 << 20);
+        CreateThread(nullptr, 0, [](LPVOID) -> DWORD { for (;;) { Sleep(500); fflush(stderr); } return 0; }, nullptr, 0, nullptr);
+    }
     if (argc < 2) { fprintf(stderr, "usage: bcr2 <basefile.bin>\n"); return 1; }
 
     // 4 GB reserve: guest pointers are plain 32-bit offsets from base

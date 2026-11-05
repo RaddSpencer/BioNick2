@@ -519,6 +519,7 @@ static void gpu_exec(uint8_t* base, const uint32_t* p, uint32_t n, int depth) {
             uint32_t cur = PPC_LOAD_U32(ga);
             if (wl < 12) { wl++; fprintf(stderr, "[wrm] fn=%u mem=%u ga=%08X ref=%X mask=%X cur=%X\n", fn, (unsigned)mem, ga, ref, msk, cur); }
             auto t0 = std::chrono::steady_clock::now();
+            LARGE_INTEGER waitA; QueryPerformanceCounter(&waitA);
             int w = 0;
             while (!ok(PPC_LOAD_U32(ga))) {
                 if (w++ < 2000) std::this_thread::yield();
@@ -529,6 +530,7 @@ static void gpu_exec(uint8_t* base, const uint32_t* p, uint32_t n, int depth) {
                     break;
                 }
             }
+            { LARGE_INTEGER waitB; QueryPerformanceCounter(&waitB); gpu_note_wait(1, waitB.QuadPart - waitA.QuadPart); }
             break; }
           case 0x54: {                                    // INTERRUPT: block until the guest ISR has run
             static int logged = 0; if (logged++ < 8) fprintf(stderr, "[gpu] INTERRUPT packet cpumask=%08X\n", b[0]);
@@ -559,10 +561,12 @@ static void gpu_exec(uint8_t* base, const uint32_t* p, uint32_t n, int depth) {
             }
             if (g_gpu.intrCb) {
                 uint32_t t = g_cpIntrIssued.fetch_add(1) + 1;
-                for (int w = 0; w < 20000 && g_cpIntrDone.load() < t; w++) {
-                    if (w < 2000) std::this_thread::yield();
+                LARGE_INTEGER waitA; QueryPerformanceCounter(&waitA);
+                for (int w = 0; w < 200000 && g_cpIntrDone.load() < t; w++) {    // the ISR is short: sleeping here costs a millisecond or more each time
+                    if (w < 180000) std::this_thread::yield();
                     else std::this_thread::sleep_for(std::chrono::microseconds(100));
                 }
+                { LARGE_INTEGER waitB; QueryPerformanceCounter(&waitB); gpu_note_wait(2, waitB.QuadPart - waitA.QuadPart); }
                 if (g_cpIntrDone.load() < t) fprintf(stderr, "[gpu] INTERRUPT: ISR did not complete in time\n");
                 if (intrN == 20000 || intrN == 20002) {
                     fprintf(stderr, "[ibhead] n=%u:", intrN);
@@ -598,7 +602,12 @@ static void vsync_thread(uint8_t* base) {
     uint64_t n = 0;
     auto next = std::chrono::steady_clock::now();
     for (;;) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // Sleep until about 2 ms before the tick, then yield up to it. Sleeping the whole way adds up to 1 ms of jitter per frame.
+        {
+            auto left = next - std::chrono::steady_clock::now();
+            if (left > std::chrono::milliseconds(2)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            else if (left > std::chrono::steady_clock::duration::zero()) std::this_thread::yield();
+        }
         if (!g_gpu.intrCb) continue;
 
 
@@ -722,7 +731,18 @@ static void gpu_thread(uint8_t* base) {
             if (g_gpu.wbAddr) PPC_STORE_U32(wb, rptr);
             uint32_t rr = 0x7FC80710; PPC_STORE_U32(rr, rptr);   // CP_RB_RPTR register too
         }
-        Sleep(1);
+        // Ring empty: yield for about 2 ms so new work starts promptly, then fall back to sleeping when the game is idle.
+        LARGE_INTEGER waitA, waitB; QueryPerformanceCounter(&waitA);
+        static const bool kRingSleep = getenv("BCR2_RINGSLEEP") != nullptr;  // restores the old Sleep(1) polling, for comparison
+        if (kRingSleep) Sleep(1);
+        else {
+            static int idlePolls = 0;
+            uint32_t rw = 0x7FC80714;
+            if ((PPC_LOAD_U32(rw) & mask) != rptr) idlePolls = 0;
+            else if (idlePolls < 2000) { idlePolls++; std::this_thread::yield(); }
+            else Sleep(1);
+        }
+        QueryPerformanceCounter(&waitB); gpu_note_wait(0, waitB.QuadPart - waitA.QuadPart);
     }
 }
 static std::atomic<bool> g_gpuWatchStarted{false};
@@ -1387,7 +1407,8 @@ static void NtSetEvent_(PPCContext& ctx, uint8_t* base) {
               if (s2 > 0x10000 && s2 < 0xE0000000u) bt2 = PPC_LOAD_U32(s2 - 8);
           }
       }
-      fprintf(stderr, "[evt] set tid=%lu handle=%08X lr=%08X bt=%08X %08X\n",
+      static const bool kVerbose = getenv("BCR2_VERBOSE") != nullptr;       // per-frame noise, off unless asked for
+      if (kVerbose) fprintf(stderr, "[evt] set tid=%lu handle=%08X lr=%08X bt=%08X %08X\n",
               GetCurrentThreadId(), ctx.r3.u32, (uint32_t)ctx.lr, bt1, bt2); }
     if (ctx.r4.u32) wr32(base, ctx.r4.u32, 0);
     ctx.r3.u64 = STATUS_SUCCESS_;
@@ -1409,7 +1430,8 @@ static void NtWaitForSingleObjectEx_(PPCContext& ctx, uint8_t* base) {
         int64_t v = (int64_t)_byteswap_uint64(*(uint64_t*)(base + tp));
         ms = (v < 0) ? (DWORD)std::min<uint64_t>((uint64_t)(-v) / 10000, 0xFFFFFFFEull) : 0;
     }
-	if (ms == INFINITE) fprintf(stderr, "[evt] wait-inf handle=%08X lr=%08X\n", ctx.r3.u32, (uint32_t)ctx.lr);
+	static const bool kVerboseWait = getenv("BCR2_VERBOSE") != nullptr;
+	if (kVerboseWait && ms == INFINITE) fprintf(stderr, "[evt] wait-inf handle=%08X lr=%08X\n", ctx.r3.u32, (uint32_t)ctx.lr);
     DWORD r = WaitForSingleObject(h, ms);
     ctx.r3.u64 = (r == WAIT_OBJECT_0) ? STATUS_SUCCESS_ : (r == WAIT_TIMEOUT ? 0x102 : 0xC0000001);
 }

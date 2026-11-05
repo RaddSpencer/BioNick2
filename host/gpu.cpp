@@ -56,6 +56,18 @@ static int g_trace = 0;
 bool gpu_enabled() { static const bool on = getenv("BCR2_NOGPU") == nullptr; return on; }
 bool gpu_tracing() { return g_trace > 1000; }
 
+// ---- frame timing: printed as [perf] every 300 swaps ----
+static double g_perfTicksToMs = 0;
+static double g_tDraw = 0, g_tResolve = 0, g_tTex = 0, g_tPresent = 0;
+static std::atomic<uint64_t> g_waitTicks[3];                                // ring empty, WAIT_REG_MEM, interrupt
+static uint64_t g_nCompiles = 0, g_nUploads = 0, g_upBytes = 0;
+void gpu_note_wait(int kind, uint64_t qpcTicks) { g_waitTicks[kind] += qpcTicks; }
+struct PerfScope {
+    double& acc; LARGE_INTEGER a;
+    explicit PerfScope(double& t) : acc(t) { QueryPerformanceCounter(&a); }
+    ~PerfScope() { LARGE_INTEGER b; QueryPerformanceCounter(&b); acc += (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs; }
+};
+
 void gpu_reg(uint32_t r, uint32_t v) {
     if (r >= 0x10000) return;
     g_regs[r] = v;
@@ -134,6 +146,7 @@ static ComPtr<ID3DBlob> compile_cached(const std::string& src, const char* entry
         if (blob) return blob;
     }
     ComPtr<ID3DBlob> err;
+    g_nCompiles++;
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, target,
                             D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_ENABLE_STRICTNESS * 0, 0, &blob, &err);
     if (FAILED(hr)) {
@@ -165,6 +178,10 @@ static bool device_init() {
     if (FAILED(hr)) hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want + 1, 1, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
     if (FAILED(hr)) { fprintf(stderr, "[gfx] D3D11 device creation failed: %08lX; running without rendering\n", hr); return false; }
     g_ctx.As(&g_ctx1);
+    {   // Queue at most one finished frame ahead of the display. The default of three adds visible input lag.
+        ComPtr<IDXGIDevice1> dxgi;
+        if (SUCCEEDED(g_dev.As(&dxgi))) dxgi->SetMaximumFrameLatency(1);
+    }
     D3D11_FEATURE_DATA_D3D11_OPTIONS opt{};
     if (SUCCEEDED(g_dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opt, sizeof(opt)))) g_noOverwriteSrv = opt.MapNoOverwriteOnDynamicBufferSRV;
     g_swap->GetBuffer(0, IID_PPV_ARGS(&g_backTex));
@@ -207,7 +224,7 @@ static bool device_init() {
     if (auto b = compile_cached(blitDs, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psBlitDepth);
     const char* blitRaw =
         "Texture2D<float> src:register(t0); Texture2D<uint2> sten:register(t1); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
-        "float4 main(float4 p:SV_Position):SV_Target { int3 c=int3(int2(p.xy*scale+ofs),0); uint d=min((uint)(src.Load(c)*16777215.0+0.5),0xFFFFFFu); uint s=sten.Load(c).g;\n"
+        "float4 main(float4 p:SV_Position):SV_Target { int3 c=int3(int2(p.xy*scale+ofs),0); float x=src.Load(c); uint d=(x>=0.5)?((uint)round(x*16777216.0)-1u):(uint)round(x*16777215.0); d=min(d,0xFFFFFFu); uint s=sten.Load(c).g;\n"
         "  uint w=(d<<8)|(s&255); return float4(w&255,(w>>8)&255,(w>>16)&255,(w>>24)&255)/255.0; }\n";
     if (auto b = compile_cached(blitRaw, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psBlitRaw);
     // EDRAM aliasing: as 8_8_8_8 the sample is A<<24|B<<16|G<<8|R, as D24S8 the same dword is D24<<8|S8. Depth tiles
@@ -216,7 +233,9 @@ static bool device_init() {
         "Texture2D src:register(t0);\n"
         "float main(float4 p:SV_Position):SV_Depth { int x=(int)p.x; x+=((x%80)<40)?40:-40; float4 c=src.Load(int3(x,(int)p.y,0));\n"
         "  uint a=(uint)(c.a*255.0+0.5), b=(uint)(c.b*255.0+0.5), g=(uint)(c.g*255.0+0.5);\n"
-        "  return (float)((a<<16)|(b<<8)|g)/16777215.0; }\n";
+        // Lossless: the game redraws meshes with depth EQUAL, so this must round to exactly the same D24 value.
+        // Above 0.5 a float can only hold multiples of 2^-24, and (d+1)*2^-24 is the one that rounds back to d.
+        "  uint d=(a<<16)|(b<<8)|g; return (d>=0x800000u)?(float)(d+1u)*5.9604644775390625e-8:(float)d/16777215.0; }\n";
     if (auto b = compile_cached(c2d, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psColorToDepth);
     fprintf(stderr, "[gfx] D3D11 ready, feature level %X, noOverwriteSrv=%d\n", (unsigned)got, (int)g_noOverwriteSrv);
     return true;
@@ -757,7 +776,8 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
                " float w=oPos.w; if(vpW.x==0.0) w=1.0/w;\n"
                " float2 xy=oPos.xy; if(vpZ.z!=0.0) xy*=w;\n"
                " float z=oPos.z; if(vpZ.w!=0.0) z*=w;\n"
-               " o.pos=float4(xy*vpNdc.xy+w*vpNdc.zw, z*vpZ.x+w*vpZ.y, w);\n"
+               // precise: separate shaders drawing the same mesh must produce identical z for depth EQUAL passes
+               " precise float4 finalPos=float4(xy*vpNdc.xy+w*vpNdc.zw, z*vpZ.x+w*vpZ.y, w);\n o.pos=finalPos;\n"
                " return o; }\n";
     } else {
         src += "struct POut { float4 c0:SV_Target0; float4 c1:SV_Target1; float4 c2:SV_Target2; float4 c3:SV_Target3;";
@@ -1031,9 +1051,11 @@ static HostTex* get_texture(const FetchInfo& fi) {
     }
     if (ht->lastFrame == g_frame && ht->srv) return ht;
     ht->lastFrame = g_frame;
+    PerfScope perfTex(g_tTex);
     uint64_t h = range_hash(fi.base, total);
     if (ht->srv && h == ht->hash) return ht;
     ht->hash = h;
+    g_nUploads++; g_upBytes += total;
     uint32_t hw = blocksW * tf.block, hh = blocksH * tf.block;
     uint32_t outBpb = tf.conv ? 4 : tf.bpb;
     std::vector<uint8_t> out((size_t)blocksW * blocksH * outBpb * fi.faces);
@@ -1332,7 +1354,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
                 g_regs[R_COLOR_MASK], g_regs[R_DEPTHCONTROL], g_regs[R_VTE_CNTL], (unsigned long long)g_vsHash, (unsigned long long)g_psHash);
     }
     watch_surface("before draw/resolve");
-    if (edram == 6) { do_resolve(); watch_surface("after resolve"); return; }
+    if (edram == 6) { PerfScope perfRes(g_tResolve); do_resolve(); watch_surface("after resolve"); return; }
+    PerfScope perfDraw(g_tDraw);
     if (edram == 0 || num == 0 || prim == 0) return;
     if (prim >= 0x10) { logf_once(S("prim%u", prim).c_str(), "unsupported primitive type %u", prim); return; }
     if (prim == 1) logf_once("points", "point list drawn as 1-pixel points (no sprite expansion yet)");
@@ -1612,8 +1635,21 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     // ---- fixed-function ----
     float blendF[4] = { reg_f(R_BLEND_RED), reg_f(R_BLEND_RED + 1), reg_f(R_BLEND_RED + 2), reg_f(R_BLEND_RED + 3) };
     g_ctx->OMSetBlendState(get_blend(mask), blendF, 0xFFFFFFFFu);
+    {   // BCR2_DBGADDITIVE: paint additive scene draws solid magenta, to see where they land
+        static const bool kDbg = getenv("BCR2_DBGADDITIVE") != nullptr;
+        if (kDbg && prim != 6 && ((g_regs[R_BLEND0] >> 8) & 31) == 1) {
+            static ComPtr<ID3D11PixelShader> magenta;
+            if (!magenta) if (auto b = compile_cached("float4 main(float4 p:SV_Position):SV_Target0 { return float4(1,0,1,1); }\n", "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &magenta);
+            g_ctx->PSSetShader(magenta.Get(), nullptr, 0);
+            g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+        }
+    }
     uint32_t sr = g_regs[R_STENCIL], srbf = g_regs[R_STENCIL_BF];
     uint32_t dcEff = dsv ? dc : 0;
+    {   // BCR2_DBGNOZ: no depth test on blended scene draws, to see whether depth is rejecting them
+        static const bool kNoZ = getenv("BCR2_DBGNOZ") != nullptr;
+        if (kNoZ && prim != 6 && g_regs[R_BLEND0] != 0x00010001u) dcEff &= ~2u;
+    }
     g_ctx->OMSetDepthStencilState(get_ds(dcEff, sr, srbf), sr & 0xFF);
     float polyScale = 0, polyOff = 0;
     if ((mode >> 11) & 3) { polyScale = reg_f(R_OFFSET_FRONT_SCALE) / 16.0f; polyOff = reg_f(R_OFFSET_FRONT_SCALE + 1); }
@@ -1941,7 +1977,48 @@ static void do_swap(uint32_t front) {
         g_ctx->ClearRenderTargetView(g_backRtv.Get(), c);
     }
     write_shot();
-    HRESULT hr = g_swap->Present(0, 0);
+    HRESULT hr;
+    { PerfScope perfPresent(g_tPresent); hr = g_swap->Present(0, 0); }
+    {
+        static LARGE_INTEGER last{}; static uint64_t lastFrame = 0, lastDraws = 0, lastRes = 0;
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        static LARGE_INTEGER prevSwap{}; static std::vector<float> intervals;
+        if (prevSwap.QuadPart) intervals.push_back((float)((double)(now.QuadPart - prevSwap.QuadPart) * g_perfTicksToMs));
+        {   // one line per late frame, saying where the time went
+            static double pD = 0, pT = 0, pR = 0, pP = 0; static uint64_t pW0 = 0, pW1 = 0, pW2 = 0, pCompiles = 0, pUploads = 0, pUpBytes = 0;
+            uint64_t w0 = g_waitTicks[0].load(), w1 = g_waitTicks[1].load(), w2 = g_waitTicks[2].load();
+            double ms = prevSwap.QuadPart ? (double)(now.QuadPart - prevSwap.QuadPart) * g_perfTicksToMs : 0;
+            if (ms > 20.0 && g_frame > 300) {
+                static int nSpike = 0;
+                if (nSpike++ < 400)
+                    fprintf(stderr, "[spike] frame=%llu ms=%.1f draw=%.1f tex=%.1f res=%.1f pres=%.1f ring=%.1f reg=%.1f intr=%.1f compiles=%llu uploads=%llu upKB=%llu\n",
+                            (unsigned long long)g_frame, ms, g_tDraw - pD, g_tTex - pT, g_tResolve - pR, g_tPresent - pP,
+                            (w0 >= pW0 ? w0 - pW0 : w0) * g_perfTicksToMs, (w1 >= pW1 ? w1 - pW1 : w1) * g_perfTicksToMs, (w2 >= pW2 ? w2 - pW2 : w2) * g_perfTicksToMs,
+                            (unsigned long long)(g_nCompiles - pCompiles), (unsigned long long)(g_nUploads - pUploads), (unsigned long long)((g_upBytes - pUpBytes) / 1024));
+            }
+            pD = g_tDraw; pT = g_tTex; pR = g_tResolve; pP = g_tPresent; pW0 = w0; pW1 = w1; pW2 = w2; pCompiles = g_nCompiles; pUploads = g_nUploads; pUpBytes = g_upBytes;
+        }
+        prevSwap = now;
+        if (g_frame + 1 - lastFrame >= 300) {
+            uint64_t n = g_frame + 1 - lastFrame;
+            if (!intervals.empty()) {                                        // pacing matters as much as the average
+                std::sort(intervals.begin(), intervals.end());
+                size_t c = intervals.size(), late = 0;
+                for (float v : intervals) if (v > 20.0f) late++;
+                fprintf(stderr, "[pace] frame=%llu p1=%.1f p50=%.1f p99=%.1f max=%.1f over20ms=%zu\n", (unsigned long long)g_frame, intervals[c / 100], intervals[c / 2], intervals[c * 99 / 100], intervals[c - 1], late);
+                intervals.clear();
+            }
+            if (last.QuadPart) {
+                double ms = (double)(now.QuadPart - last.QuadPart) * g_perfTicksToMs;
+                double w0 = g_waitTicks[0].exchange(0) * g_perfTicksToMs, w1 = g_waitTicks[1].exchange(0) * g_perfTicksToMs, w2 = g_waitTicks[2].exchange(0) * g_perfTicksToMs;
+                fprintf(stderr, "[perf] frame=%llu fps=%.1f ms/frame=%.2f draws=%.0f res=%.0f | draw=%.2f (tex=%.2f) resolve=%.2f present=%.2f | wait ring=%.2f reg=%.2f intr=%.2f\n",
+                        (unsigned long long)g_frame, n * 1000.0 / ms, ms / n, (double)(g_draws - lastDraws) / n, (double)(g_resolves - lastRes) / n,
+                        g_tDraw / n, g_tTex / n, g_tResolve / n, g_tPresent / n, w0 / n, w1 / n, w2 / n);
+            }
+            last = now; lastFrame = g_frame + 1; lastDraws = g_draws; lastRes = g_resolves;
+            g_tDraw = g_tTex = g_tResolve = g_tPresent = 0;
+        }
+    }
     if (FAILED(hr)) logf_once("present", "Present failed: %08lX", hr);
     // Flip model unbinds the back buffer; keep our view tracking honest.
     invalidate_binds();
@@ -1953,7 +2030,11 @@ static void do_swap(uint32_t front) {
 // ---- packets ----
 void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
     static bool inited = false;
-    if (!inited) { inited = true; g_base = base; g_devOk = device_init(); }
+    if (!inited) {
+        inited = true; g_base = base;
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_perfTicksToMs = 1000.0 / (double)f.QuadPart;
+        g_devOk = device_init();
+    }
     if (!g_devOk) return;
     auto load_shader = [&](uint32_t type, const uint32_t* data, uint32_t n, bool fromMem, uint32_t addr) {
         auto& code = type == 0 ? g_vsCode : g_psCode;
@@ -2009,6 +2090,20 @@ void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
         break; }
       case 0x27: load_shader(b[0] & 3, nullptr, b[1] & 0xFFFF, true, b[0] & ~3u); break;   // IM_LOAD
       case 0x2B: load_shader(b[0] & 3, b + 2, b[1] & 0xFFFF, false, 0); break;             // IM_LOAD_IMMEDIATE
+      case 0x5B: {                                                          // EVENT_WRITE_ZPD: occlusion query report
+        // The game draws glows and light halos only if its query reports visible samples. Answer as Xenia does by default: a
+        // finished query (marked 0xFFFFFEED) gets a fixed count, so everything counts as visible. Fields are stored little-endian.
+        static const bool kNoFake = getenv("BCR2_NOOCCLUSIONFAKE") != nullptr;
+        uint32_t addr = g_regs[0x2325];                                     // RB_SAMPLE_COUNT_ADDR
+        if (kNoFake || !addr) break;
+        uint32_t* c = (uint32_t*)phys(addr & ~3u);                          // Total_A/B, ZFail_A/B, ZPass_A/B, StencilFail_A/B
+        const uint32_t kDone = _byteswap_ulong(0xFFFFFEEDu);
+        bool endZPass = c[4] == kDone && c[5] == kDone, endZFail = c[2] == kDone && c[3] == kDone;
+        memset(c, 0, 32);
+        if (endZPass || endZFail) { c[4] = 1000; c[0] = 1000; }
+        static int nl = 0;
+        if (nl++ < 4) fprintf(stderr, "[gfx] occlusion query report at %08X finished=%d\n", addr, (int)(endZPass || endZFail));
+        break; }
       case 0x64: do_swap(b[1]); break;                                      // XE_SWAP
       default: break;
     }

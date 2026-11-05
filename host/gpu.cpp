@@ -1761,6 +1761,19 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             cb.tfp[u.slot * 4] = (float)w / sf->w; cb.tfp[u.slot * 4 + 1] = (float)h / sf->h;
             return;
         }
+        {   // The console fills the channels a format doesn't store: one channel reads as RRRR, two channels as RGGG. D3D gives (R,0,0,1) and (R,G,0,1).
+            // Normal maps depend on it: the game reads DXN as x and w, so without this one axis of every normal is a constant 1. BCR2_NOCHANFILL shows the old result.
+            static const bool kNoFill = getenv("BCR2_NOCHANFILL") != nullptr;
+            int fill = 0;
+            switch (fmt) {
+              case 2: case 8: case 9: case 24: case 30: case 39: case 59: fill = 1; break;
+              case 10: case 13: case 25: case 31: case 40: case 49: fill = 2; break;
+            }
+            if (fill && !kNoFill) for (int i = 0; i < 4; i++) {
+                int32_t& sel = cb.tfsw[u.slot * 4 + i];
+                if (sel >= 0 && sel < 4) sel = fill == 1 ? 0 : (sel == 0 ? 0 : 1);
+            }
+        }
         FetchInfo fi{};
         fi.base = base; fi.fmt = fmt; fi.w = w; fi.h = h; fi.pitch = ((tf[0] >> 22) & 0x1FF) << 5; fi.endian = (tf[1] >> 6) & 3;
         fi.dim = dim; fi.faces = dim == 3 ? 6 : 1; fi.tiled = tf[0] >> 31; fi.packed = (tf[5] >> 11) & 1;

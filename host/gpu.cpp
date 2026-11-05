@@ -1850,7 +1850,21 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     memcpy(cb.bools, &g_regs[R_BOOL], 32);
     memcpy(cb.loops, &g_regs[R_LOOP], 128);
     upload_cb(g_cbState.Get(), &cb, sizeof(cb));
-    if (g_constDirty) { upload_cb(g_cbFloat.Get(), &g_regs[R_CONST], 8192); g_constDirty = false; }
+    // experiment: BCR2_FREEZEWIND holds c1.x at the given value for vertex shaders that use it as a wind clock, and only those: other shaders use c1 for other things.
+    // BCR2_FREEZEVS is the comma-separated list of those shaders' hashes.
+    static const char* kFreeze = getenv("BCR2_FREEZEWIND");
+    static const std::string kFreezeVs = getenv("BCR2_FREEZEVS") ? getenv("BCR2_FREEZEVS") : "C5B81BC723BA821F";
+    const bool freezeThis = kFreeze && kFreezeVs.find(S("%016llX", (unsigned long long)vs->hash)) != std::string::npos;
+    {
+        if (freezeThis) {
+            uint32_t saved = g_regs[R_CONST + 4]; float f = (float)atof(kFreeze);
+            memcpy(&g_regs[R_CONST + 4], &f, 4);
+            upload_cb(g_cbFloat.Get(), &g_regs[R_CONST], 8192);
+            g_regs[R_CONST + 4] = saved;
+            g_constDirty = true;                                            // the next draw gets the real value back
+        }
+    }
+    if (g_constDirty && !freezeThis) { upload_cb(g_cbFloat.Get(), &g_regs[R_CONST], 8192); g_constDirty = false; }
     ID3D11Buffer* cbs[2] = { g_cbFloat.Get(), g_cbState.Get() };
     g_ctx->VSSetConstantBuffers(0, 2, cbs);
     g_ctx->PSSetConstantBuffers(0, 2, cbs);

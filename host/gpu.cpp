@@ -1559,6 +1559,16 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         fprintf(stderr, " c509=%g,%g,%g,%g c256=%g,%g,%g,%g c267=%g,%g,%g,%g colfmt=%u", reg_f(R_CONST + 509 * 4), reg_f(R_CONST + 509 * 4 + 1), reg_f(R_CONST + 509 * 4 + 2), reg_f(R_CONST + 509 * 4 + 3),
                 reg_f(R_CONST + 256 * 4), reg_f(R_CONST + 256 * 4 + 1), reg_f(R_CONST + 256 * 4 + 2), reg_f(R_CONST + 256 * 4 + 3),
                 reg_f(R_CONST + 267 * 4), reg_f(R_CONST + 267 * 4 + 1), reg_f(R_CONST + 267 * 4 + 2), reg_f(R_CONST + 267 * 4 + 3), (g_regs[R_COLOR_INFO] >> 16) & 0xF);
+        static const char* traceVC = getenv("BCR2_TRACEVC");                // hash of a vertex shader: print its transform constants, once per frame
+        if (traceVC && S("%016llX", (unsigned long long)vs->hash) == traceVC) {
+            static uint64_t lastF = ~0ull;
+            if (lastF != g_frame) {
+                lastF = g_frame;
+                fprintf(stderr, "\n[vconst] frame=%llu", (unsigned long long)g_frame);
+                for (int k : { 0, 1, 2, 3, 4, 5, 6, 7, 8, 201, 202, 203, 204, 205, 209, 210, 211, 212, 213, 253, 254, 255 }) fprintf(stderr, " c%d=%.7g,%.7g,%.7g,%.7g", k, reg_f(R_CONST + k * 4), reg_f(R_CONST + k * 4 + 1), reg_f(R_CONST + k * 4 + 2), reg_f(R_CONST + k * 4 + 3));
+                fprintf(stderr, "\n");
+            }
+        }
         static const char* traceC = getenv("BCR2_TRACEC");                  // hash of a pixel shader: also print its constants
         if (traceC && ps && S("%016llX", (unsigned long long)ps->hash) == traceC) {
             fprintf(stderr, " PC:");
@@ -1715,6 +1725,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         uint8_t* ptr = nullptr;
         uint32_t off = vb_alloc(size, ptr);
         const uint8_t* src = phys(addr + (uint32_t)first);
+        {   // BCR2_VBHASH with a traced frame: one line per vertex stream, to see which streams the game rewrites between frames
+            static const bool kVbHash = getenv("BCR2_VBHASH") != nullptr;
+            if (kVbHash && g_trace > 1000) fprintf(stderr, "[vbhash] f=%llu d=%llu vs=%016llX slot=%u addr=%08X size=%u hash=%016llX\n", (unsigned long long)g_frame, (unsigned long long)g_drawsFrame, (unsigned long long)vs->hash, u.slot, addr, size, (unsigned long long)fnv64(src, size));
+        }
         if (endian == 2) {
             uint32_t n = size / 4;
             const uint32_t* s = (const uint32_t*)src; uint32_t* d = (uint32_t*)ptr;

@@ -655,6 +655,10 @@ static void vblank_thread() {
             lastPeriodMs = 1000.0 / hz;
             int div = (int)(hz / 60.0 + 0.5);
             if (div < 1 || fabs(hz / div - 60.0) > 1.0) div = 0;
+            // One bad measurement usually means this thread ran late, not that the display changed. Give up the lock only after three in a row.
+            static int missed = 0;
+            if (div == 0 && g_vblankDiv.load() != 0 && ++missed < 3) div = g_vblankDiv.load();
+            else if (div != 0) missed = 0;
             if (g_vblankDiv.exchange(div) != div) fprintf(stderr, "[vblank] display %.3f Hz: %s (every %d)\n", hz, div ? "following refresh" : "keeping 60 Hz clock", div);
             gpu_set_display_locked(div != 0);
             cnt = 0; sum = 0;

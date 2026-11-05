@@ -274,6 +274,14 @@ unsigned dbg_intr_done();
 
 void dbg_dump_waits(unsigned minMs);
 int main(int argc, char** argv) {
+    {   // Windows 11 throttles a process whose window is covered or unfocused: it may ignore the 1 ms timer below, so Sleep(1) can take about 15 ms, and it may
+        // move threads to slower cores. The game's threads are timed in milliseconds, so opt out. BCR2_ALLOWTHROTTLE keeps the Windows default, for comparison.
+        if (!getenv("BCR2_ALLOWTHROTTLE")) {
+            struct { ULONG version, control, state; } pt{ 1, 0x1 | 0x4, 0 };   // PROCESS_POWER_THROTTLING_CURRENT_VERSION; EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION; opted out of both
+            if (!SetProcessInformation(GetCurrentProcess(), (PROCESS_INFORMATION_CLASS)4 /* ProcessPowerThrottling */, &pt, sizeof(pt)))
+                fprintf(stderr, "[main] could not opt out of power throttling: %lu\n", GetLastError());
+        }
+    }
     timeBeginPeriod(1);
     // stderr is written from every thread, and unbuffered each call is a file write that can stall the frame.
     // Buffer it and flush from a background thread. The crash handler flushes too. BCR2_LOGUNBUFFERED restores the old behaviour.

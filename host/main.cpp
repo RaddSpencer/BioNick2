@@ -1,5 +1,6 @@
 #include "ppc_config.h"
 #include "ppc_context.h"
+#include "guestfp.h"
 #include "ppc_recomp_shared.h"
 #include <string>
 #include <windows.h>
@@ -258,12 +259,11 @@ static void UnresolvedIndirect(PPCContext& ctx, uint8_t* base) {
     ExitProcess(3);
 }
 static DWORD WINAPI GuestMain(LPVOID) {
-    PPCContext ctx{};
+    PPCContext ctx{}; guest_fp_init(ctx);
     g_ctx = &ctx;
     AddVectoredExceptionHandler(1, CrashHandler);
     ctx.r1.u64  = kStackBase + kStackSize - 0x100;
     ctx.r13.u64 = kPcrBase;                      // PCR pointer; contents TBD
-    // TODO: initialise ctx.fpscr (host MXCSR) once we check ppc_context.h
     _xstart(ctx, g_base);                        // XEX entry point (CRT startup)
     fprintf(stderr, "guest entry returned, r3=%08X\n", ctx.r3.u32);
     return 0;

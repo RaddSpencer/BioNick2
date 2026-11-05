@@ -1,5 +1,6 @@
 #include "ppc_config.h"
 #include "ppc_context.h"
+#include "guestfp.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -690,7 +691,7 @@ static void vsync_thread(uint8_t* base) {
     wr32(base, TOBJ + 0x14C, 0x99);           // thread id
     wr32(base, PCR + 0x70, STK + STKSZ);      // stack base
     wr32(base, PCR + 0x74, STK);              // stack limit
-    PPCContext ctx{};
+    PPCContext ctx{}; guest_fp_init(ctx);
     uint64_t n = 0;
     auto next = std::chrono::steady_clock::now();
     auto lastTick = next;
@@ -738,7 +739,7 @@ static void cp_intr_thread(uint8_t* base) {
     wr32(base, PCR + 0x70, STK + STKSZ);
     wr32(base, PCR + 0x74, STK);
     *(volatile uint8_t*)(base + PCR + 268) = 2;   // processor number: INTERRUPT cpumask 4 = CPU 2
-    PPCContext ctx{};
+    PPCContext ctx{}; guest_fp_init(ctx);
     int idleSpins = 0;
     for (;;) {
 		{
@@ -1590,7 +1591,7 @@ static uint32_t vm_alloc(uint8_t* base, uint32_t size) {
 struct ThreadStart { uint8_t* base; uint32_t entry, arg0, arg1, pcr, stackTop; };
 static DWORD WINAPI GuestThreadProc(LPVOID p) {
     std::unique_ptr<ThreadStart> ts((ThreadStart*)p);
-    PPCContext ctx{};
+    PPCContext ctx{}; guest_fp_init(ctx);
     g_ctx = &ctx;
     ctx.r1.u64 = ts->stackTop - 0x100;
     ctx.r13.u64 = ts->pcr;
@@ -1874,7 +1875,7 @@ static void audio_thread(uint8_t* base) {
     wr32(base, TOBJ + 0x14C, 0x9B);           // thread id
     wr32(base, PCR + 0x70, STK + STKSZ);      // stack base
     wr32(base, PCR + 0x74, STK);              // stack limit
-    PPCContext ctx{};
+    PPCContext ctx{}; guest_fp_init(ctx);
     const auto kFrame = std::chrono::microseconds(5333);
     auto next = std::chrono::steady_clock::now();
     for (;;) {

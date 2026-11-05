@@ -388,8 +388,83 @@ static void lua_trace_call(uint8_t* base, uint32_t func) {
         fprintf(stderr, "\n");
     }
 }
+// The state that last made a Lua call on this thread, so a thrown LuaError can report the script's message and stack.
+// lua_State: +8 top, +12 base, +20 ci, +24 savedpc, +32 stack, +40 base_ci. CallInfo (24 bytes): +0 base, +4 func, +12 savedpc.
+// Proto: +12 code, +20 lineinfo, +32 source, +48 sizelineinfo. Value tags: 0 nil, 1 bool, 3 number, 4 string, 5 table, 6 function.
+static thread_local uint32_t t_lastLuaState = 0;
+void lua_dump_error(uint8_t* base, uint32_t state) {
+    uint32_t L = state ? state : t_lastLuaState;
+    if (!L || IsBadReadPtr(base + L, 64)) { fprintf(stderr, "[lua-err] no lua state\n"); return; }
+    uint32_t top = PPC_LOAD_U32(L + 8), stack = PPC_LOAD_U32(L + 32), ci = PPC_LOAD_U32(L + 20), baseCi = PPC_LOAD_U32(L + 40);
+    fprintf(stderr, "[lua-err] L=%08X top=%08X stack=%08X\n", L, top, stack);
+    for (int i = 1; i <= 8 && top - i * 8 >= stack; i++) {
+        uint32_t v = top - i * 8, tag = PPC_LOAD_U32(v + 4), val = PPC_LOAD_U32(v);
+        fprintf(stderr, "[lua-err]  stack[-%d] tag=%u val=%08X", i, tag, val);
+        if (tag == 4 && !IsBadReadPtr(base + val, 16)) fprintf(stderr, " \"%.400s\"", (const char*)(base + val + 16));
+        fputc('\n', stderr);
+    }
+    uint32_t pc = PPC_LOAD_U32(L + 24);
+    for (int depth = 0; depth < 30 && ci >= baseCi && ci; depth++, ci -= 24) {
+        uint32_t func = PPC_LOAD_U32(ci + 4);
+        if (depth) pc = PPC_LOAD_U32(ci + 12);
+        if (PPC_LOAD_U32(func + 4) != 6) { fprintf(stderr, "[lua-err]  #%d not a function\n", depth); continue; }
+        uint32_t cl = PPC_LOAD_U32(func);
+        if (PPC_LOAD_U8(cl + 6) != 0) { fprintf(stderr, "[lua-err]  #%d [C] %08X\n", depth, PPC_LOAD_U32(cl + 16)); continue; }
+        uint32_t p = PPC_LOAD_U32(cl + 16), ts = PPC_LOAD_U32(p + 32), code = PPC_LOAD_U32(p + 12), li = PPC_LOAD_U32(p + 20);
+        int idx = (int)(pc - code) / 4 - 1, line = -1;
+        if (li && idx >= 0 && idx < (int)PPC_LOAD_U32(p + 48)) line = (int)PPC_LOAD_U32(li + idx * 4);
+        fprintf(stderr, "[lua-err]  #%d %s:%d\n", depth, ts ? (const char*)(base + ts + 16) : "?", line);
+    }
+}
+// ---- Lua protected calls ----
+// Recompiled guest setjmp/longjmp cannot move the host's call stack: longjmp just returned into luaD_throw, which then
+// ran its panic path, so any Lua error ended the game even inside pcall. These replace the only setjmp caller and the
+// Lua longjmp caller with a host exception, keeping the guest layout: lua_longjmp at sp+80, status at lj+1360, L+92 errorJmp.
+struct GuestLuaThrow { uint32_t lj; };
+// sub_8262B5D8 is luaD_rawrunprotected(L, f, ud)
+PPC_FUNC(sub_8262B5D8) {
+    const uint32_t L = ctx.r3.u32, f = ctx.r4.u32, ud = ctx.r5.u32, oldSp = ctx.r1.u32;
+    const uint32_t sp = oldSp - 1472, lj = sp + 80;
+    PPC_STORE_U32(oldSp - 8, (uint32_t)ctx.lr);
+    PPC_STORE_U32(sp, oldSp);
+    PPC_STORE_U32(lj + 1360, 0);
+    PPC_STORE_U32(lj, PPC_LOAD_U32(L + 92));
+    PPC_STORE_U32(L + 92, lj);
+    const PPCContext saved = ctx;
+    try {
+        ctx.r1.u64 = sp;
+        ctx.r3.u64 = L;
+        ctx.r4.u64 = ud;
+        ctx.lr = 0x8262B638;
+        PPC_CALL_INDIRECT_FUNC(f);
+    } catch (const GuestLuaThrow& t) {
+        if (t.lj != lj) throw;
+        auto fpscr = ctx.fpscr;    // keeps the cached copy of the live MXCSR correct
+        ctx = saved;
+        ctx.fpscr = fpscr;
+    }
+    PPC_STORE_U32(L + 92, PPC_LOAD_U32(lj));
+    ctx.r1.u64 = oldSp;
+    ctx.r3.u64 = PPC_LOAD_U32(lj + 1360);
+}
+// sub_82638FA0 is luaD_throw(L, status). With no protected call active the original runs the game's panic handler.
+extern "C" void __imp__sub_82638FA0(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82638FA0) {
+    const uint32_t L = ctx.r3.u32, status = ctx.r4.u32, lj = PPC_LOAD_U32(L + 92);
+    static std::atomic<uint32_t> nThrows{0};
+    uint32_t n = ++nThrows;
+    if (n <= 16 || (n % 1000) == 0) {
+        fprintf(stderr, "[lua-throw] #%u status=%u protected=%d\n", n, status, lj != 0);
+        lua_dump_error(base, L);
+    }
+    if (!lj) { __imp__sub_82638FA0(ctx, base); return; }
+    PPC_STORE_U32(lj + 1360, status);
+    throw GuestLuaThrow{ lj };
+}
+
 extern "C" void __imp__sub_82634458(PPCContext& __restrict__ ctx, uint8_t* base);
 PPC_FUNC(sub_82634458) {
+    t_lastLuaState = ctx.r3.u32;
     static const bool kTrace = getenv("BCR2_LUATRACE") != nullptr;
     if (kTrace) lua_trace_call(base, ctx.r4.u32);
     __imp__sub_82634458(ctx, base);

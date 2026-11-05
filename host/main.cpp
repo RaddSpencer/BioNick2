@@ -228,6 +228,7 @@ static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (code == DBG_PRINTEXCEPTION_C || code == 0x406D1388 || code == DBG_PRINTEXCEPTION_WIDE_C) return EXCEPTION_CONTINUE_SEARCH;
+    if (code == 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH;   // host C++ throw: GuestLuaThrow is how Lua errors unwind to their pcall
 
     fprintf(stderr, "\n*** EXCEPTION %08lX at host rip=%p\n", code, ep->ExceptionRecord->ExceptionAddress);
     fprintf(stderr, "    rip offset=%llX\n",

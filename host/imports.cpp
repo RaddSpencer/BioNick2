@@ -107,6 +107,52 @@ void ppc_import_dispatch(PPCContext& ctx, uint8_t* base, int lib, int ordinal) {
             "  r3=%08X r4=%08X r5=%08X r6=%08X\n",
             import_name(lib, ordinal), lib == 0 ? "xboxkrnl" : "xam", ordinal,
             (uint32_t)ctx.lr, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+    if (lib == 0 && ordinal == 310) {
+        // RtlRaiseException(EXCEPTION_RECORD*): say what the game raised and who raised it (all big-endian).
+        auto be32 = [&](uint32_t a) { return _byteswap_ulong(*(uint32_t*)(base + a)); };
+        uint32_t rec = ctx.r3.u32, np = be32(rec + 16);
+        fprintf(stderr, "[raise] code=%08X flags=%08X addr=%08X nparams=%u\n", be32(rec), be32(rec + 4), be32(rec + 12), np);
+        for (uint32_t i = 0; i < np && i < 15; i++) {
+            uint32_t v = be32(rec + 20 + i * 4);
+            fprintf(stderr, "[raise]  param%u=%08X", i, v);
+            if (v >= 0x10000 && v < 0xF0000000 && !IsBadReadPtr(base + v, 192)) {
+                fprintf(stderr, " ->");
+                for (int j = 0; j < 8; j++) fprintf(stderr, " %08X", be32(v + j * 4));
+                fprintf(stderr, " \"");
+                for (int j = 0; j < 160 && base[v + j]; j++) fputc(base[v + j] >= 32 && base[v + j] < 127 ? base[v + j] : '.', stderr);
+                fprintf(stderr, "\"");
+            }
+            fputc('\n', stderr);
+        }
+        if (be32(rec) == 0xE06D7363 && np >= 3) {
+            // C++ throw: param2 is the MSVC ThrowInfo, which leads to the type names.
+            uint32_t ti = be32(rec + 28);
+            uint32_t cta = !IsBadReadPtr(base + ti, 16) ? be32(ti + 12) : 0;
+            if (cta && !IsBadReadPtr(base + cta, 8)) {
+                uint32_t n = be32(cta);
+                for (uint32_t i = 0; i < n && i < 8; i++) {
+                    uint32_t ct = be32(cta + 4 + i * 4);
+                    uint32_t td = !IsBadReadPtr(base + ct, 8) ? be32(ct + 4) : 0;
+                    if (td && !IsBadReadPtr(base + td + 8, 64)) fprintf(stderr, "[raise]  type %s\n", (char*)(base + td + 8));
+                }
+            }
+            uint32_t obj = be32(rec + 24);
+            if (!IsBadReadPtr(base + obj, 16)) for (int i = 0; i < 4; i++) {
+                uint32_t p = be32(obj + i * 4);
+                if (p >= 0x10000 && p < 0xF0000000 && !IsBadReadPtr(base + p, 200) && base[p] >= 32 && base[p] < 127)
+                    fprintf(stderr, "[raise]  obj[%d] text \"%.200s\"\n", i, (char*)(base + p));
+            }
+        }
+        extern void lua_dump_error(uint8_t*, uint32_t);
+        lua_dump_error(base, 0);
+        uint32_t sp = ctx.r1.u32;
+        for (int i = 0; i < 40 && sp >= 0x10000 && sp < 0xF0000000; i++) {
+            uint32_t next = be32(sp);
+            if (next <= sp) break;
+            fprintf(stderr, "[raise]  frame sp=%08X lr=%08X\n", next, be32(next - 8));
+            sp = next;
+        }
+    }
     fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 2);
 }

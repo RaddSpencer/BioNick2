@@ -199,7 +199,7 @@ static bool device_init() {
         if (SUCCEEDED(g_dev.As(&dxgi))) dxgi->SetMaximumFrameLatency(1);
     }
     D3D11_FEATURE_DATA_D3D11_OPTIONS opt{};
-    if (SUCCEEDED(g_dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opt, sizeof(opt)))) g_noOverwriteSrv = opt.MapNoOverwriteOnDynamicBufferSRV;
+    if (SUCCEEDED(g_dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opt, sizeof(opt)))) g_noOverwriteSrv = opt.MapNoOverwriteOnDynamicBufferSRV && !getenv("BCR2_NONOOVERWRITE");
     g_swap->GetBuffer(0, IID_PPV_ARGS(&g_backTex));
     g_dev->CreateRenderTargetView(g_backTex.Get(), nullptr, &g_backRtv);
 
@@ -1033,7 +1033,7 @@ static void unpack_rgba8(int conv, const uint8_t* s, uint8_t* d) {
 
 struct HostTex {
     ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11ShaderResourceView> srv;
-    uint64_t hash = 0, lastFrame = ~0ull; uint32_t hostW = 0, hostH = 0;
+    uint64_t hash = 0, lastFrame = ~0ull; uint32_t hostW = 0, hostH = 0, levels = 0;
 };
 static std::unordered_map<uint64_t, HostTex*> g_texCache;
 
@@ -1043,7 +1043,28 @@ static uint64_t range_hash(uint32_t addr, uint32_t size) {
     return h;
 }
 
-struct FetchInfo { uint32_t base, fmt, w, h, pitch, endian, dim, faces; bool tiled, packed; };
+struct FetchInfo { uint32_t base, fmt, w, h, pitch, endian, dim, faces, mipBase, maxLevel; bool tiled, packed; };
+
+// ---- mip chain layout, as the console stores it (same rules as Xenia's texture_util.cc) ----
+// Levels 1 and up live at the fetch constant's mip address. Each stores a power-of-two-based pitch and height, tile-aligned, on a 4 KB boundary.
+// Once the short side reaches 16 texels, every smaller level shares one tile (the packed tail), each at its own offset.
+struct MipStore { uint32_t offset = 0, pitchBlocks = 0, rowBytes = 0, stride = 0; };
+static uint32_t next_pow2(uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; }
+static uint32_t packed_mip_level(uint32_t w, uint32_t h) {
+    uint32_t l = log2_ceil(std::min(w, h));
+    return l <= 4 ? 0 : l - 4;
+}
+static void packed_mip_offset(uint32_t w, uint32_t h, uint32_t level, uint32_t block, uint32_t& x, uint32_t& y) {
+    uint32_t lw = log2_ceil(w), lh = log2_ceil(h), ls = std::min(lw, lh);
+    uint32_t base = ls > 4 ? ls - 4 : 0, m = level - base;
+    x = y = 0;
+    if (m < 3) {
+        if (lw > lh) y = 16 >> m; else x = 16 >> m;
+    } else {
+        if (lw > lh) x = (1u << (lw - base)) >> (m - 2); else y = (1u << (lh - base)) >> (m - 2);
+    }
+    x /= block; y /= block;
+}
 
 static HostTex* get_texture(const FetchInfo& fi) {
     TexFmt tf;
@@ -1080,10 +1101,23 @@ static HostTex* get_texture(const FetchInfo& fi) {
     if (ht->lastFrame == g_frame && ht->srv) return ht;
     ht->lastFrame = g_frame;
     PerfScope perfTex(g_tTex);
+    static const bool kNoMips = getenv("BCR2_NOMIPS") != nullptr;           // for comparison: draw every texture from its full-size image only
+    const uint32_t maxLevel = kNoMips ? 0 : fi.maxLevel, packedLevel = fi.packed ? packed_mip_level(fi.w, fi.h) : ~0u;
+    MipStore store[16];
+    uint32_t mipBytes = 0;
+    for (uint32_t s = packedLevel == 0 ? 0 : 1; maxLevel && s <= std::min(maxLevel, packedLevel) && s < 16; s++) {
+        uint32_t pb = align_up(align_up(std::max(next_pow2(fi.w) >> s, 1u), tf.block) / tf.block, 32);
+        uint32_t rb = pb * tf.bpb;
+        if (!fi.tiled) rb = align_up(rb, 256);
+        uint32_t mrows = align_up(align_up(std::max(next_pow2(fi.h) >> s, 1u), tf.block) / tf.block, 32);
+        store[s].offset = mipBytes; store[s].pitchBlocks = pb; store[s].rowBytes = rb; store[s].stride = align_up(rb * mrows, 4096);
+        mipBytes += store[s].stride * fi.faces;
+    }
     uint64_t h = range_hash(fi.base, total);
+    if (mipBytes) h ^= range_hash(fi.mipBase, mipBytes) * 0x9E3779B97F4A7C15ull;
     if (ht->srv && h == ht->hash) return ht;
     ht->hash = h;
-    g_nUploads++; g_upBytes += total;
+    g_nUploads++; g_upBytes += total + mipBytes;
     uint32_t hw = blocksW * tf.block, hh = blocksH * tf.block;
     uint32_t outBpb = tf.conv ? 4 : tf.bpb;
     std::vector<uint8_t> out((size_t)blocksW * blocksH * outBpb * fi.faces);
@@ -1101,20 +1135,44 @@ static HostTex* get_texture(const FetchInfo& fi) {
             }
         }
     }
-    bool same = ht->tex && ht->hostW == hw && ht->hostH == hh;
+    const uint32_t levels = maxLevel + 1;
+    bool same = ht->tex && ht->hostW == hw && ht->hostH == hh && ht->levels == levels;
     if (!same) {
         ht->tex.Reset(); ht->srv.Reset();
-        D3D11_TEXTURE2D_DESC d{}; d.Width = hw; d.Height = hh; d.MipLevels = 1; d.ArraySize = fi.faces; d.Format = tf.dxgi; d.SampleDesc.Count = 1;
+        D3D11_TEXTURE2D_DESC d{}; d.Width = hw; d.Height = hh; d.MipLevels = levels; d.ArraySize = fi.faces; d.Format = tf.dxgi; d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (fi.faces == 6) d.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
         HRESULT hr = g_dev->CreateTexture2D(&d, nullptr, &ht->tex);
         if (FAILED(hr)) { logf_once(S("texc%u", fi.fmt).c_str(), "texture creation failed fmt=%u %ux%u hr=%08lX", fi.fmt, hw, hh, hr); return nullptr; }
         g_dev->CreateShaderResourceView(ht->tex.Get(), nullptr, &ht->srv);
-        ht->hostW = hw; ht->hostH = hh;
+        ht->hostW = hw; ht->hostH = hh; ht->levels = levels;
     }
     for (uint32_t f = 0; f < fi.faces; f++)
-        g_ctx->UpdateSubresource(ht->tex.Get(), D3D11CalcSubresource(0, f, 1), nullptr, out.data() + (size_t)f * blocksW * blocksH * outBpb,
+        g_ctx->UpdateSubresource(ht->tex.Get(), D3D11CalcSubresource(0, f, levels), nullptr, out.data() + (size_t)f * blocksW * blocksH * outBpb,
                                  blocksW * outBpb, blocksW * blocksH * outBpb);
+    for (uint32_t l = 1; l <= maxLevel; l++) {
+        const uint32_t s = std::min(l, packedLevel);
+        const MipStore& ms = store[s];
+        uint32_t ox = 0, oy = 0;
+        if (l >= packedLevel) packed_mip_offset(fi.w, fi.h, l, tf.block, ox, oy);
+        // what the host level holds, and what the guest stores; they differ only when the base size isn't a whole number of blocks
+        uint32_t hbw = align_up(std::max(hw >> l, 1u), tf.block) / tf.block, hbh = align_up(std::max(hh >> l, 1u), tf.block) / tf.block;
+        uint32_t gbw = std::min(hbw, align_up(std::max(fi.w >> l, 1u), tf.block) / tf.block), gbh = std::min(hbh, align_up(std::max(fi.h >> l, 1u), tf.block) / tf.block);
+        std::vector<uint8_t> lvl((size_t)hbw * hbh * outBpb);
+        for (uint32_t f = 0; f < fi.faces; f++) {
+            uint32_t faceBase = fi.mipBase + ms.offset + ms.stride * f;
+            for (uint32_t y = 0; y < gbh; y++) {
+                uint8_t* dst = lvl.data() + (size_t)y * hbw * outBpb;
+                for (uint32_t x = 0; x < gbw; x++, dst += outBpb) {
+                    uint32_t a = fi.tiled ? tiled2d(x + ox, y + oy, ms.pitchBlocks, bl2) : (y + oy) * ms.rowBytes + (x + ox) * tf.bpb;
+                    memcpy(tmp, phys(faceBase + a), tf.bpb);
+                    swap_block(tmp, tf.bpb, fi.endian);
+                    if (tf.conv) unpack_rgba8(tf.conv, tmp, dst); else memcpy(dst, tmp, tf.bpb);
+                }
+            }
+            g_ctx->UpdateSubresource(ht->tex.Get(), D3D11CalcSubresource(l, f, levels), nullptr, lvl.data(), hbw * outBpb, hbw * hbh * outBpb);
+        }
+    }
     return ht;
 }
 
@@ -1209,7 +1267,13 @@ static ID3D11SamplerState* get_sampler(const uint32_t* tf, const TexUse& u) {
     uint32_t cx = (tf[0] >> 10) & 7, cy = (tf[0] >> 13) & 7, cz = (tf[0] >> 16) & 7;
     uint32_t mag = u.magf >= 0 ? u.magf : (tf[3] >> 19) & 3, min = u.minf >= 0 ? u.minf : (tf[3] >> 21) & 3, mip = u.mipf >= 0 ? u.mipf : (tf[3] >> 23) & 3;
     uint32_t border = tf[5] & 3;
-    uint32_t in[7] = { cx, cy, cz, mag, min, mip, border };
+    // LOD range and bias from the fetch constant. Level 0 is skipped when there's no base image.
+    uint32_t minL = (tf[4] >> 2) & 15, maxL = (tf[4] >> 6) & 15;
+    if (!(tf[5] >> 12)) minL = maxL = 0;
+    else { if (maxL < minL) maxL = minL; if (maxL && !(tf[1] >> 12)) minL = std::max(minL, 1u); }
+    if (mip == 2) maxL = minL;                                               // base map: never leave the top level
+    int lodBias32 = sext((tf[4] >> 12) & 0x3FF, 10);                         // 5 fractional bits
+    uint32_t in[10] = { cx, cy, cz, mag, min, mip, border, minL, maxL, (uint32_t)lodBias32 };
     uint64_t k = fnv64(in, sizeof(in));
     auto& e = g_samplers[k];
     if (e) return e.Get();
@@ -1226,13 +1290,31 @@ static ID3D11SamplerState* get_sampler(const uint32_t* tf, const TexUse& u) {
     bool lm = mag == 1, ln = min == 1, lp = mip == 1;
     d.Filter = (D3D11_FILTER)((lp ? 0x1 : 0) | (lm ? 0x4 : 0) | (ln ? 0x10 : 0));
     d.AddressU = am(cx); d.AddressV = am(cy); d.AddressW = am(cz);
-    d.ComparisonFunc = D3D11_COMPARISON_NEVER; d.MinLOD = 0; d.MaxLOD = D3D11_FLOAT32_MAX; d.MaxAnisotropy = 1;
+    d.ComparisonFunc = D3D11_COMPARISON_NEVER; d.MinLOD = (float)minL; d.MaxLOD = (float)maxL; d.MipLODBias = lodBias32 / 32.0f; d.MaxAnisotropy = 1;
     if (border == 1) d.BorderColor[0] = d.BorderColor[1] = d.BorderColor[2] = d.BorderColor[3] = 1.0f;
     g_dev->CreateSamplerState(&d, &e);
     return e.Get();
 }
 
 // ---- draw ----
+struct ProbeQ { ComPtr<ID3D11Texture2D> st; ID3D11Resource* res = nullptr; std::string text; };
+static std::vector<ProbeQ> g_probeQ;
+static void probeq_report() {
+    std::map<ID3D11Resource*, uint32_t> last;
+    size_t n = 0;
+    for (auto& q : g_probeQ) {
+        n++;
+        D3D11_MAPPED_SUBRESOURCE ms;
+        if (FAILED(g_ctx->Map(q.st.Get(), 0, D3D11_MAP_READ, 0, &ms))) continue;
+        uint32_t v = *(uint32_t*)ms.pData; g_ctx->Unmap(q.st.Get(), 0);
+        auto it = last.find(q.res);
+        if (it == last.end() || it->second != v)
+            fprintf(stderr, "[probeq] draw#%zu rt=%p %08X -> %08X %s\n", n, q.res, it == last.end() ? 0u : it->second, v, q.text.c_str());
+        last[q.res] = v;
+    }
+    fprintf(stderr, "[probeq] %zu draws read\n", g_probeQ.size());
+    g_probeQ.clear();
+}
 static std::vector<uint32_t> g_vsCode, g_psCode;
 static uint32_t g_vsHash = 0, g_psHash = 0;
 static XShader* g_vsCur = nullptr; static XShader* g_psCur = nullptr; static uint32_t g_psParamGen = 0xFFFFFFFFu;
@@ -1534,6 +1616,23 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     uint32_t drawCount = useIdx ? (uint32_t)useIdx->size() : num;
     if (drawCount == 0) return;
 
+    {   // experiment: BCR2_DRAWDELAYUS=n waits n microseconds before each draw reads guest data
+        static const int kDelayUs = getenv("BCR2_DRAWDELAYUS") ? atoi(getenv("BCR2_DRAWDELAYUS")) : 0;
+        if (kDelayUs > 0) {
+            LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a); QueryPerformanceFrequency(&f);
+            do { YieldProcessor(); QueryPerformanceCounter(&b); } while ((b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart < kDelayUs);
+        }
+        // experiment: BCR2_DRAWSYNC=1 flushes before each draw, =2 also waits for the host GPU to finish everything so far
+        static const int kSync = getenv("BCR2_DRAWSYNC") ? atoi(getenv("BCR2_DRAWSYNC")) : 0;
+        if (kSync == 1) g_ctx->Flush();
+        if (kSync == 2) {
+            static ComPtr<ID3D11Query> q;
+            if (!q) { D3D11_QUERY_DESC qd{}; qd.Query = D3D11_QUERY_EVENT; g_dev->CreateQuery(&qd, &q); }
+            g_ctx->End(q.Get());
+            BOOL done = FALSE;
+            while (g_ctx->GetData(q.Get(), &done, sizeof(done), 0) != S_OK || !done) YieldProcessor();
+        }
+    }
     // ---- vertex data ----
     int32_t indexOffset = (int32_t)(g_regs[R_INDX_OFFSET] & 0xFFFFFF);
     indexOffset = sext(indexOffset, 24);
@@ -1549,6 +1648,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         uint64_t avail = (uint64_t)words * 4;
         if (last > avail) last = avail;
         if (first >= last) { first = 0; last = std::min<uint64_t>(avail, 4096); }
+        // Upload the whole stream. Some draws read vertices outside the range their indices cover (why isn't known yet), and those landed on whatever
+        // sat next in the ring: stray black geometry and heavy flicker, even with a still camera. BCR2_VBRANGE restores the narrow upload, for comparison.
+        static const bool kVbRange = getenv("BCR2_VBRANGE") != nullptr;
+        if (!kVbRange) { first = 0; last = avail; }
         uint32_t size = (uint32_t)std::min<uint64_t>(last - first + 64, kVbRingSize / 2);
         if ((first + size) > avail) size = (uint32_t)(avail - first);
         if (size == 0) continue;
@@ -1604,6 +1707,12 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         FetchInfo fi{};
         fi.base = base; fi.fmt = fmt; fi.w = w; fi.h = h; fi.pitch = ((tf[0] >> 22) & 0x1FF) << 5; fi.endian = (tf[1] >> 6) & 3;
         fi.dim = dim; fi.faces = dim == 3 ? 6 : 1; fi.tiled = tf[0] >> 31; fi.packed = (tf[5] >> 11) & 1;
+        if (uint32_t mipPage = tf[5] >> 12) {                               // no mip address means the base image is all there is
+            uint32_t sizeMax = 0; while ((2u << sizeMax) <= std::max(w, h)) sizeMax++;
+            uint32_t mipMin = std::min((tf[4] >> 2) & 15, sizeMax);
+            fi.maxLevel = std::max(std::min((tf[4] >> 6) & 15, sizeMax), mipMin);
+            if (fi.maxLevel) fi.mipBase = (mipPage & 0x1FFFF) << 12;
+        }
         if (dim == 2) { logf_once("tex3d", "3D texture not implemented"); return; }
         if ((u.dim == 3) != (dim == 3)) { logf_once("texdim", "texture dimension mismatch shader=%u fetch=%u", u.dim, dim); return; }
         HostTex* ht = get_texture(fi);
@@ -1738,6 +1847,26 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         g_ctx->DrawIndexed(drawCount, 0, 0);
     } else {
         g_ctx->Draw(drawCount, 0);
+    }
+    // BCR2_PROBEQ="x,y": like BCR2_PROBE, but only queues a pixel copy after each draw and reads them at the end of the frame, so nothing forces a sync.
+    static const char* kProbeQ = getenv("BCR2_PROBEQ");
+    if (kProbeQ && g_trace > 1000 && rtvs[0]) {
+        uint32_t qx = 0, qy = 0; sscanf(kProbeQ, "%u,%u", &qx, &qy);
+        ComPtr<ID3D11Resource> res; rtvs[0]->GetResource(&res);
+        D3D11_TEXTURE2D_DESC d; ((ID3D11Texture2D*)res.Get())->GetDesc(&d);
+        if (qx < d.Width && qy < d.Height && d.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+            d.Width = 1; d.Height = 1; d.MipLevels = 1; d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+            ProbeQ q; q.res = res.Get();
+            if (SUCCEEDED(g_dev->CreateTexture2D(&d, nullptr, &q.st))) {
+                D3D11_BOX box{ qx, qy, 0, qx + 1, qy + 1, 1 };
+                g_ctx->CopySubresourceRegion(q.st.Get(), 0, 0, 0, 0, res.Get(), 0, &box);
+                const uint32_t* t0 = &g_regs[R_FETCH];
+                q.text = S("num=%u prim=%u idx=%d vs=%016llX ps=%016llX blend0=%08X dc=%08X mask=%08X col=%08X surf=%08X vf95=%08X/%08X c0=%g,%g,%g,%g tf0=%08X",
+                           drawCount, prim, useIdx ? 1 : 0, (unsigned long long)vs->hash, ps ? (unsigned long long)ps->hash : 0ull, g_regs[R_BLEND0], g_regs[R_DEPTHCONTROL], g_regs[R_COLOR_MASK], g_regs[R_COLOR_INFO], g_regs[R_SURFACE_INFO],
+                           g_regs[R_FETCH + 95 * 2], g_regs[R_FETCH + 95 * 2 + 1], reg_f(R_CONST), reg_f(R_CONST + 1), reg_f(R_CONST + 2), reg_f(R_CONST + 3), t0[1]);
+                g_probeQ.push_back(std::move(q));
+            }
+        }
     }
 }
 
@@ -2055,7 +2184,7 @@ static void dump_surfaces() {
 }
 
 static void do_swap(uint32_t front) {
-    if ((int64_t)g_frame == g_dumpFrame) { dump_surfaces(); g_trace = 0; }
+    if ((int64_t)g_frame == g_dumpFrame) { probeq_report(); dump_surfaces(); g_trace = 0; }
     if ((int64_t)g_frame + 1 == g_dumpFrame) g_trace = 100000;
     uint32_t fp = front & 0x1FFFFFFFu;
     Surface* s = surface_at(fp);

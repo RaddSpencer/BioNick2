@@ -117,6 +117,21 @@ static ComPtr<ID3D11Texture2D> g_backTex;
 static ComPtr<ID3D11SamplerState> g_presentSampler;
 static ComPtr<ID3D11PixelShader> g_psPresentPlain;
 static uint32_t g_backW = 1280, g_backH = 720;
+// Renders at a whole multiple of the game's 1280x720: by default the smallest one that covers the display (2 at 1440p, 3 at 4K), or BCR2_RESSCALE=n.
+// Every size kept in the renderer (Rt::w, Surface::w, resolve rectangles) stays in guest pixels, and only what reaches D3D is multiplied: texture sizes,
+// viewports, scissors, clears and resolve copies. Chosen once at launch.
+static const int g_resScale = [] {
+    int s = 0;
+    if (const char* e = getenv("BCR2_RESSCALE")) s = atoi(e);
+    if (s < 1) {
+        DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+        s = 1;
+        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) s = (int)std::max((dm.dmPelsWidth + 1279) / 1280, (dm.dmPelsHeight + 719) / 720);
+    }
+    s = s < 1 ? 1 : s > 4 ? 4 : s;
+    fprintf(stderr, "[display] render scale %dx (%dx%d)\n", s, 1280 * s, 720 * s);
+    return s;
+}();
 static bool g_devOk = false, g_noOverwriteSrv = false;
 static ComPtr<ID3D11Buffer> g_cbFloat, g_cbState, g_cbBlit, g_vbRing, g_ibRing;
 static ComPtr<ID3D11ShaderResourceView> g_vbSrv;
@@ -294,12 +309,12 @@ static bool device_init() {
     // also have their 40-pixel left and right halves swapped relative to colour (the game's restore shader assumes this).
     const char* c2d =
         "Texture2D src:register(t0);\n"
-        "float main(float4 p:SV_Position):SV_Depth { int x=(int)p.x; x+=((x%80)<40)?40:-40; float4 c=src.Load(int3(x,(int)p.y,0));\n"
+        "float main(float4 p:SV_Position):SV_Depth { int x=(int)p.x; x+=((x%(80*RS))<40*RS)?40*RS:-40*RS; float4 c=src.Load(int3(x,(int)p.y,0));\n"
         "  uint a=(uint)(c.a*255.0+0.5), b=(uint)(c.b*255.0+0.5), g=(uint)(c.g*255.0+0.5);\n"
         // Lossless: the game redraws meshes with depth EQUAL, so this must round to exactly the same D24 value.
         // Above 0.5 a float can only hold multiples of 2^-24, and (d+1)*2^-24 is the one that rounds back to d.
         "  uint d=(a<<16)|(b<<8)|g; return (d>=0x800000u)?(float)(d+1u)*5.9604644775390625e-8:(float)d/16777215.0; }\n";
-    if (auto b = compile_cached(c2d, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psColorToDepth);
+    if (auto b = compile_cached(S("#define RS %d\n", g_resScale) + c2d, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psColorToDepth);
     fprintf(stderr, "[gfx] D3D11 ready, feature level %X, noOverwriteSrv=%d\n", (unsigned)got, (int)g_noOverwriteSrv);
     return true;
 }
@@ -854,8 +869,8 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
             else if (T.usedRegs.count(i)) src += S(" r%d=In.o[%d];\n", i, i);
         }
         if (paramGen < 16) {
-            if (T.useArray) src += S(" r[%u]=float4(In.pos.xy,0,0);\n", paramGen);
-            else if (T.usedRegs.count(paramGen)) src += S(" r%u=float4(In.pos.xy,0,0);\n", paramGen);
+            if (T.useArray) src += S(" r[%u]=float4(In.pos.xy/%d.0,0,0);\n", paramGen, g_resScale);       // the game expects guest pixels
+            else if (T.usedRegs.count(paramGen)) src += S(" r%u=float4(In.pos.xy/%d.0,0,0);\n", paramGen, g_resScale);
         }
         src += T.body;
         src += " uint af=(uint)alpha.x; if(af!=7){ float aa=oC[0].a, rf=alpha.y; bool atok=true;\n"
@@ -927,7 +942,7 @@ static Rt* get_color_rt(uint32_t base, uint32_t fmt, uint32_t pitch) {
     auto it = g_rts.find(key);
     if (it != g_rts.end()) return it->second;
     Rt* r = new Rt(); rt_size(pitch, r->w, r->h); r->fmt = rt_dxgi(fmt);
-    D3D11_TEXTURE2D_DESC d{}; d.Width = r->w; d.Height = r->h; d.MipLevels = 1; d.ArraySize = 1; d.Format = r->fmt; d.SampleDesc.Count = 1;
+    D3D11_TEXTURE2D_DESC d{}; d.Width = r->w * g_resScale; d.Height = std::min(r->h * g_resScale, 16384u); d.MipLevels = 1; d.ArraySize = 1; d.Format = r->fmt; d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     g_dev->CreateTexture2D(&d, nullptr, &r->tex);
     g_dev->CreateRenderTargetView(r->tex.Get(), nullptr, &r->rtv);
@@ -941,7 +956,7 @@ static Rt* get_depth_rt(uint32_t base, uint32_t pitch) {
     auto it = g_rts.find(key);
     if (it != g_rts.end()) return it->second;
     Rt* r = new Rt(); rt_size(pitch, r->w, r->h); r->fmt = DXGI_FORMAT_R24G8_TYPELESS;
-    D3D11_TEXTURE2D_DESC d{}; d.Width = r->w; d.Height = r->h; d.MipLevels = 1; d.ArraySize = 1; d.Format = r->fmt; d.SampleDesc.Count = 1;
+    D3D11_TEXTURE2D_DESC d{}; d.Width = r->w * g_resScale; d.Height = std::min(r->h * g_resScale, 16384u); d.MipLevels = 1; d.ArraySize = 1; d.Format = r->fmt; d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     g_dev->CreateTexture2D(&d, nullptr, &r->tex);
     D3D11_DEPTH_STENCIL_VIEW_DESC dv{}; dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
@@ -979,7 +994,7 @@ static Surface* make_surface(uint32_t base, uint32_t pitch, uint32_t height, uin
     auto it = g_surfaces.find(base);
     if (it != g_surfaces.end()) { delete it->second; g_surfaces.erase(it); }
     Surface* s = new Surface(); s->base = base; s->end = base + bytes; s->w = pitch; s->h = height; s->pitch = pitch; s->fmt = fmt;
-    D3D11_TEXTURE2D_DESC d{}; d.Width = pitch; d.Height = height; d.MipLevels = 1; d.ArraySize = 1; d.Format = fmt; d.SampleDesc.Count = 1;
+    D3D11_TEXTURE2D_DESC d{}; d.Width = pitch * g_resScale; d.Height = height * g_resScale; d.MipLevels = 1; d.ArraySize = 1; d.Format = fmt; d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     g_dev->CreateTexture2D(&d, nullptr, &s->tex);
     if (!s->tex) { delete s; return nullptr; }
@@ -1784,7 +1799,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         uint32_t wo = g_regs[R_WINDOW_OFFSET];
         xo += sext(wo & 0x7FFF, 15); yo += sext((wo >> 16) & 0x7FFF, 15);
     }
-    if (!(g_regs[R_VTX_CNTL] & 1)) { xo += 0.5f; yo += 0.5f; }
+    // Half a host pixel, not half a guest pixel: at a higher scale the larger shift would leave the first row and column of fullscreen passes unwritten.
+    if (!(g_regs[R_VTX_CNTL] & 1)) { xo += 0.5f / g_resScale; yo += 0.5f / g_resScale; }
     cb.vpNdc[0] = xs * 2.0f / rw; cb.vpNdc[1] = -ys * 2.0f / rh; cb.vpNdc[2] = xo * 2.0f / rw - 1.0f; cb.vpNdc[3] = 1.0f - yo * 2.0f / rh;
     cb.vpZ[0] = zs; cb.vpZ[1] = zo; cb.vpZ[2] = (float)((vte >> 8) & 1); cb.vpZ[3] = (float)((vte >> 9) & 1);
     cb.vpW[0] = (float)((vte >> 10) & 1); cb.vpW[1] = (float)indexOffset; cb.vpW[2] = 0; cb.vpW[3] = 0;
@@ -1829,10 +1845,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     if ((mode >> 11) & 3) { polyScale = reg_f(R_OFFSET_FRONT_SCALE) / 16.0f; polyOff = reg_f(R_OFFSET_FRONT_SCALE + 1); }
     bool clipOff = (g_regs[R_CLIP_CNTL] >> 16) & 1;
     g_ctx->RSSetState(get_rs(mode, rect, clipOff, polyScale, polyOff));
-    D3D11_VIEWPORT vp{ 0, 0, (float)rw, (float)rh, 0, 1 };
+    D3D11_VIEWPORT vp{ 0, 0, (float)(rw * g_resScale), (float)(rh * g_resScale), 0, 1 };
     g_ctx->RSSetViewports(1, &vp);
     int sx0, sy0, sx1, sy1; compute_scissor(sx0, sy0, sx1, sy1);
-    D3D11_RECT sc{ sx0, sy0, std::min(sx1, (int)rw), std::min(sy1, (int)rh) };
+    D3D11_RECT sc{ sx0 * g_resScale, sy0 * g_resScale, std::min(sx1, (int)rw) * g_resScale, std::min(sy1, (int)rh) * g_resScale };
     g_ctx->RSSetScissorRects(1, &sc);
 
     struct ProbeAfter {                                                     // BCR2_PROBE="x,y": log draws that change this pixel in target 0
@@ -1978,9 +1994,9 @@ static void sync_depth_alias(Rt* depth, uint32_t base, uint32_t pitch) {
         g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
         g_ctx->OMSetDepthStencilState(get_ds(0x76, 0, 0), 0);               // z on, z write, func always
         g_ctx->RSSetState(get_rs(0, true, true, 0, 0));
-        D3D11_VIEWPORT vp{ 0, 0, (float)depth->w, (float)depth->h, 0, 1 };
+        D3D11_VIEWPORT vp{ 0, 0, (float)(depth->w * g_resScale), (float)(depth->h * g_resScale), 0, 1 };
         g_ctx->RSSetViewports(1, &vp);
-        D3D11_RECT sc{ 0, 0, (LONG)depth->w, (LONG)depth->h };
+        D3D11_RECT sc{ 0, 0, (LONG)(depth->w * g_resScale), (LONG)(depth->h * g_resScale) };
         g_ctx->RSSetScissorRects(1, &sc);
         ID3D11ShaderResourceView* s = c->srv.Get();
         g_ctx->PSSetShaderResources(0, 1, &s);
@@ -2062,10 +2078,11 @@ static void do_resolve() {
         }
         if (!sf) sf = make_surface(destBase, destPitch, std::max(destH ? destH : (uint32_t)y1, 1u), bytes, fmt);
         if (sf) {
+            const int rs = g_resScale;
             int dx0 = x0 + ox, dy0 = y0 + oy, dx1 = x1 + ox, dy1 = y1 + oy;
-            blit(src->srv.Get(), isDepth ? g_psBlitDepth.Get() : g_psBlit.Get(), sf->rtv.Get(), sf->w, sf->h, dx0, dy0, std::min(dx1, (int)sf->w), std::min(dy1, (int)sf->h), x0, y0, destSwap && !isDepth);
+            blit(src->srv.Get(), isDepth ? g_psBlitDepth.Get() : g_psBlit.Get(), sf->rtv.Get(), sf->w * rs, sf->h * rs, dx0 * rs, dy0 * rs, std::min(dx1, (int)sf->w) * rs, std::min(dy1, (int)sf->h) * rs, x0 * rs, y0 * rs, destSwap && !isDepth);
             if (isDepth && sf->rawRtv)
-                blit(src->srv.Get(), g_psBlitRaw.Get(), sf->rawRtv.Get(), sf->w, sf->h, dx0, dy0, std::min(dx1, (int)sf->w), std::min(dy1, (int)sf->h), x0, y0, false, 1, 1, src->stencilSrv.Get());
+                blit(src->srv.Get(), g_psBlitRaw.Get(), sf->rawRtv.Get(), sf->w * rs, sf->h * rs, dx0 * rs, dy0 * rs, std::min(dx1, (int)sf->w) * rs, std::min(dy1, (int)sf->h) * rs, x0 * rs, y0 * rs, false, 1, 1, src->stencilSrv.Get());
             sf->guestHash = guest_sample_hash(sf->base, sf->end - sf->base);
             sf->swapped = destSwap && !isDepth;
         }
@@ -2073,7 +2090,7 @@ static void do_resolve() {
     if (colorClear && colorSrc) {
         uint32_t cv = g_regs[R_COLOR_CLEAR];
         float col[4] = { ((cv >> 16) & 255) / 255.0f, ((cv >> 8) & 255) / 255.0f, (cv & 255) / 255.0f, (cv >> 24) / 255.0f };
-        D3D11_RECT r{ x0, y0, x1, y1 };
+        D3D11_RECT r{ x0 * g_resScale, y0 * g_resScale, x1 * g_resScale, y1 * g_resScale };
         if (g_ctx1) g_ctx1->ClearView(colorSrc->rtv.Get(), col, &r, 1);
         else g_ctx->ClearRenderTargetView(colorSrc->rtv.Get(), col);
     }
@@ -2301,7 +2318,7 @@ static void do_swap(uint32_t front) {
         const int px = ((int)g_backW - pw) / 2, py = ((int)g_backH - ph) / 2;
         const float black[4] = { 0, 0, 0, 1 };
         if (pw != (int)g_backW || ph != (int)g_backH) g_ctx->ClearRenderTargetView(g_backRtv.Get(), black);
-        const float sxs = (float)s->w / pw, sys = (float)s->h / ph, ofs[2] = { -px * sxs, -py * sys };
+        const float sxs = (float)(s->w * g_resScale) / pw, sys = (float)(s->h * g_resScale) / ph, ofs[2] = { -px * sxs, -py * sys };
         ID3D11SamplerState* presentSamp = g_presentSampler.Get();
         g_ctx->PSSetSamplers(0, 1, &presentSamp);
         blit(s->srv.Get(), useRamp ? g_psPresentLut.Get() : g_psPresentPlain.Get(), g_backRtv.Get(), g_backW, g_backH, px, py, px + pw, py + ph, 0, 0, s->swapped, sxs, sys, useRamp ? g_lutSrv.Get() : nullptr, ofs);

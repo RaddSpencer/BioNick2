@@ -1028,3 +1028,12 @@ PPC_FUNC(sub_82371260) {                                                     // 
     uint32_t ib = be32_at(base, self + 892), ie = be32_at(base, self + 896);
     fprintf(stderr, "[rope] submit f=%llu tid=%lu this=%08X dirty=%u indices %d -> %d\n", (unsigned long long)gpu_frame_number(), GetCurrentThreadId(), self, dirty, (int)(ie0 - ib0) / 2, (int)(ie - ib) / 2);
 }
+
+// BCR2_BUCKETWATCH=frame: from that frame, a data breakpoint on the atom list of a render bucket, to name the code that sorts and draws it
+extern "C" void __imp__sub_825585E0(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_825585E0) {
+    static const uint64_t kAt = getenv("BCR2_BUCKETWATCH") ? _atoi64(getenv("BCR2_BUCKETWATCH")) : 0;
+    static bool done = false;
+    if (kAt && !done && gpu_frame_number() >= kAt) { done = true; fprintf(stderr, "[bucket] %08X\n", ctx.r3.u32); hw_watch_set(ctx.r3.u32 + 56); }
+    __imp__sub_825585E0(ctx, base);
+}

@@ -206,7 +206,7 @@ static DWORD WINAPI hw_watch_thread(LPVOID arg) {
         if (GetThreadContext(t, &c)) {
             if (direct) {
                 c.Dr0 = (DWORD64)(g_base + phys);
-                c.Dr7 = 0x1 | (0xDull << 16);
+                c.Dr7 = 0x1 | ((getenv("BCR2_HWWATCHRW") ? 0xFull : 0xDull) << 16);          // BCR2_HWWATCHRW: reads too
             } else {
                 c.Dr0 = (DWORD64)(g_base + views[0] + phys); c.Dr1 = (DWORD64)(g_base + views[1] + phys); c.Dr2 = (DWORD64)(g_base + views[2] + phys);
                 c.Dr7 = 0x1 | (0x4ull) | (0x10ull) | (0xDull << 16) | (0xDull << 20) | (0xDull << 24);   // local enable 0-2, write, 4 bytes
@@ -231,7 +231,9 @@ static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
     if (code == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 7)) {
         static std::atomic<int> logged{0};
         ep->ContextRecord->Dr6 = 0;
-        if (logged++ < 60) {
+        static const uint32_t kSkipLr = getenv("BCR2_HWSKIPLR") ? (uint32_t)strtoul(getenv("BCR2_HWSKIPLR"), nullptr, 16) : 0;   // leave out hits from this return address
+        const bool skip = kSkipLr && g_ctx && (uint32_t)g_ctx->lr == kSkipLr;
+        if (!skip && logged++ < 60) {
             uint32_t lr = g_ctx ? (uint32_t)g_ctx->lr : 0, sp = g_ctx ? g_ctx->r1.u32 : 0;
             fprintf(stderr, "[hwwatch] thread=%lu rip+%llX lr=%08X r1=%08X r3=%08X r4=%08X r5=%08X bt:", GetCurrentThreadId(), (unsigned long long)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)GetModuleHandleW(nullptr)), lr, sp, g_ctx ? g_ctx->r3.u32 : 0, g_ctx ? g_ctx->r4.u32 : 0, g_ctx ? g_ctx->r5.u32 : 0);
             for (int k = 0; k < 10 && sp >= 0x40000000u && sp < 0x80000000u; k++) {

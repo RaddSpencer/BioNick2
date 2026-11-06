@@ -480,6 +480,7 @@ cbuffer CS : register(b1) {
   float4 vpZ;       // z scale, z offset, xy_fmt, z_fmt
   float4 vpW;       // w0_fmt, index offset
   float4 alpha;     // func, ref
+  float4 vpSnap;    // target width and height (0 = off), rest of the half pixel, half host pixel already applied
   uint4 vfo[24];
   int4 tfsw[32];
   float4 tfp[32];   // uv scale x/y, exp scale, cube/unused
@@ -1001,7 +1002,11 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
                " float2 xy=oPos.xy; if(vpZ.z!=0.0) xy*=w;\n"
                " float z=oPos.z; if(vpZ.w!=0.0) z*=w;\n"
                // precise: separate shaders drawing the same mesh must produce identical z for depth EQUAL passes
-               " precise float4 finalPos=float4(xy*vpNdc.xy+w*vpNdc.zw, z*vpZ.x+w*vpZ.y, w);\n o.pos=finalPos;\n"
+               " precise float4 finalPos=float4(xy*vpNdc.xy+w*vpNdc.zw, z*vpZ.x+w*vpZ.y, w);\n"
+               // 2D art is authored half a pixel off (-0.5 to 719.5). Above render scale 1 the half host pixel falls short of the edge and loses the last row and column.
+               " if(vpSnap.x>0.0 && w==1.0){ float2 g=(finalPos.xy*float2(0.5,-0.5)+0.5)*vpSnap.xy-vpSnap.w; float2 f=abs(frac(g)-0.5);\n"
+               "  finalPos.xy+=float2(f.x<0.016?vpSnap.z*2.0/vpSnap.x:0.0, f.y<0.016?-vpSnap.z*2.0/vpSnap.y:0.0); }\n"
+               " o.pos=finalPos;\n"
                " return o; }\n";
     } else {
         src += "struct POut { float4 c0:SV_Target0; float4 c1:SV_Target1; float4 c2:SV_Target2; float4 c3:SV_Target3;";
@@ -1637,7 +1642,7 @@ static XShader* g_vsCur = nullptr; static XShader* g_psCur = nullptr; static uin
 
 struct alignas(16) StateCb {
     uint32_t bools[8]; uint32_t loops[32];
-    float vpNdc[4]; float vpZ[4]; float vpW[4]; float alpha[4];
+    float vpNdc[4]; float vpZ[4]; float vpW[4]; float alpha[4]; float vpSnap[4];
     uint32_t vfo[96];
     int32_t tfsw[32 * 4];
     float tfp[32 * 4];
@@ -2137,6 +2142,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     if (!(g_regs[R_VTX_CNTL] & 1)) { xo += 0.5f / g_resScale; yo += 0.5f / g_resScale; }
     cb.vpNdc[0] = xs * 2.0f / rw; cb.vpNdc[1] = -ys * 2.0f / rh; cb.vpNdc[2] = xo * 2.0f / rw - 1.0f; cb.vpNdc[3] = 1.0f - yo * 2.0f / rh;
     cb.vpZ[0] = zs; cb.vpZ[1] = zo; cb.vpZ[2] = (float)((vte >> 8) & 1); cb.vpZ[3] = (float)((vte >> 9) & 1);
+    {   // Finishes the half pixel for vertices on half a guest pixel, in the vertex shader. Render scale 1 has nothing left to finish.
+        const bool snap = g_resScale > 1 && !(g_regs[R_VTX_CNTL] & 1);
+        cb.vpSnap[0] = snap ? (float)rw : 0.0f; cb.vpSnap[1] = (float)rh; cb.vpSnap[2] = 0.5f - 0.5f / g_resScale; cb.vpSnap[3] = 0.5f / g_resScale;
+    }
     cb.vpW[0] = (float)((vte >> 10) & 1); cb.vpW[1] = (float)indexOffset; cb.vpW[2] = 0; cb.vpW[3] = 0;
     uint32_t colorCtl = g_regs[R_COLORCONTROL];
     cb.alpha[0] = (colorCtl & 8) ? (float)(colorCtl & 7) : 7.0f; cb.alpha[1] = reg_f(R_ALPHA_REF); cb.alpha[3] = 0;

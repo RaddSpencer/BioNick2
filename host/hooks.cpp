@@ -500,7 +500,8 @@ PPC_FUNC(sub_82634458) {
     if (kTrace) lua_trace_call(base, ctx.r4.u32);
     static const bool kGod = getenv("BCR2_GODMODE") != nullptr;
     static const char* const kRun = getenv("BCR2_LUARUN");
-    if (kGod || kRun) {
+    static const bool kGunFix = getenv("BCR2_NOGUNFIX") == nullptr;
+    if (kGod || kRun || kGunFix) {
         // About once a second, while this thread is already inside Lua. New players and levels are picked up the next time around.
         static const uint64_t kEvery = getenv("BCR2_LUAEVERY") ? _atoi64(getenv("BCR2_LUAEVERY")) : 60;   // frames between runs, for tests that need finer timing
         static std::atomic<uint64_t> nextFrame{ 300 };
@@ -522,6 +523,13 @@ PPC_FUNC(sub_82634458) {
                   "local l = managers.game._game_data.player_lives for k, v in pairs(l) do if v < 3 then l[k] = 3 end end "
                 "end "
                 "if managers and managers.player then for _, p in pairs(managers.player:get_players()) do p:bcr_damage()._god_mode = true end end";
+            // Mounted machine guns: _next_shot_time starts at 0 and only advances per shot, so here the gun fired one shot per frame (60 a second) until it
+            // caught up with game time, and again after every pause. Xenia and the console fire steadily at 20 a second, and the cause of that difference
+            // is not known yet. This starts the gun's clock when firing starts. BCR2_NOGUNFIX turns it off.
+            static const char* const kGunLua =
+                "if MachinegunTurret and not MachinegunTurret.bcr_fix then MachinegunTurret.bcr_fix = true local fire = MachinegunTurret.fire "
+                "MachinegunTurret.fire = function(self, t) if not self._firing and self._next_shot_time < t then self._next_shot_time = t end return fire(self, t) end end";
+            if (kGunFix) lua_run_chunk(ctx, base, L, kGunLua, nullptr);
             if (kGod) lua_run_chunk(ctx, base, L, kGodLua, nullptr);
             if (kRun) lua_run_chunk(ctx, base, L, kRun, "test");
             auto fpscr = ctx.fpscr;                                          // keeps the cached copy of the live MXCSR correct

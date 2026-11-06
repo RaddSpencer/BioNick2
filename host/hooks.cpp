@@ -509,8 +509,17 @@ PPC_FUNC(sub_82634458) {
             inside = true;
             const PPCContext saved = ctx;
             const uint32_t L = saved.r3.u32, funcOff = saved.r4.u32 - PPC_LOAD_U32(L + 32);
+            // Player:die with _god_mode set disables the controller and moves the player back, then the death area ragdolls the player anyway: a softlock.
+            // So the flag steps aside for that one call, and a fall is an ordinary death and respawn. Lives are topped up so the counter can't go below zero.
             static const char* const kGodLua =
                 "if Global then Global.unlimited_lives = true end "
+                "if Player and not Player.bcr_god_die then "
+                  "local die = Player.die Player.bcr_god_die = true "
+                  "Player.die = function(self, killer, is_water) local d = self._unit:bcr_damage() local g = d._god_mode d._god_mode = false die(self, killer, is_water) d._god_mode = g end "
+                "end "
+                "if managers and managers.game and managers.game._game_data and managers.game._game_data.player_lives then "
+                  "local l = managers.game._game_data.player_lives for k, v in pairs(l) do if v < 3 then l[k] = 3 end end "
+                "end "
                 "if managers and managers.player then for _, p in pairs(managers.player:get_players()) do p:bcr_damage()._god_mode = true end end";
             if (kGod) lua_run_chunk(ctx, base, L, kGodLua, nullptr);
             if (kRun) lua_run_chunk(ctx, base, L, kRun, "test");

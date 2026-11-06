@@ -487,7 +487,7 @@ static void lua_run_chunk(PPCContext& ctx, uint8_t* base, uint32_t L, const char
     const uint32_t top = PPC_LOAD_U32(L + 8);
     if (top >= 8 && PPC_LOAD_U32(top - 8 + 4) == 4 && (status != 0 || tag)) {
         static int nl = 0;
-        if (nl++ < 2000) fprintf(stderr, "[lua-run] %s f=%llu status=%u: %s\n", tag ? tag : "god mode", (unsigned long long)gpu_frame_number(), status, (const char*)(base + PPC_LOAD_U32(top - 8) + 16));
+        if (nl++ < 200000) fprintf(stderr, "[lua-run] %s f=%llu status=%u: %s\n", tag ? tag : "god mode", (unsigned long long)gpu_frame_number(), status, (const char*)(base + PPC_LOAD_U32(top - 8) + 16));
     }
     PPC_STORE_U32(L + 8, PPC_LOAD_U32(L + 32) + topOff);
     ctx.r1.u64 = oldSp;
@@ -501,7 +501,10 @@ PPC_FUNC(sub_82634458) {
     static const bool kGod = getenv("BCR2_GODMODE") != nullptr;
     static const char* const kRun = getenv("BCR2_LUARUN");
     static const bool kGunFix = getenv("BCR2_NOGUNFIX") == nullptr;
-    if (kGod || kRun || kGunFix) {
+    static const bool kDfaLimit = getenv("BCR2_NODFALIMIT") == nullptr;
+    static const bool kNoMusic = getenv("BCR2_NOMUSIC") != nullptr;
+    static const bool kSoundLog = getenv("BCR2_SOUNDLOG") != nullptr;
+    if (kGod || kRun || kGunFix || kNoMusic || kSoundLog || kDfaLimit) {
         // About once a second, while this thread is already inside Lua. New players and levels are picked up the next time around.
         static const uint64_t kEvery = getenv("BCR2_LUAEVERY") ? _atoi64(getenv("BCR2_LUAEVERY")) : 60;   // frames between runs, for tests that need finer timing
         static std::atomic<uint64_t> nextFrame{ 300 };
@@ -529,6 +532,47 @@ PPC_FUNC(sub_82634458) {
             static const char* const kGunLua =
                 "if MachinegunTurret and not MachinegunTurret.bcr_fix then MachinegunTurret.bcr_fix = true local fire = MachinegunTurret.fire "
                 "MachinegunTurret.fire = function(self, t) if not self._firing and self._next_shot_time < t then self._next_shot_time = t end return fire(self, t) end end";
+            // BCR2_NOMUSIC holds the game's music volume at 0. It sets the sound engine's parameter directly, so the saved settings don't change.
+            static const char* const kNoMusicLua = "if SoundDevice then SoundDevice:set_rtpc('global_music_volume', 0) end";
+            // BCR2_SOUNDLOG logs every sound event posted from Lua with game time and the posting script line, plus the player's state changes. Each run hands
+            // back what has collected since the last one, so BCR2_LUAEVERY sets how finely the log's frame numbers follow the events.
+            static const char* const kSoundLogLua =
+                "local src = Global and Global.music_manager and Global.music_manager.source "
+                "local mt = src and getmetatable(src) local idx = mt and mt.__index "
+                "if type(idx) ~= 'table' then return nil end "
+                "if not rawget(idx, 'bcr_log') then "
+                  "local buf = {} local post = idx.post_event "
+                  "local now = function() return Application and string.format('%.2f', Application:time()) or '?' end "
+                  "local where = function() local d = rawget(_G, 'debug') local g = d and d.getinfo if not g then return '?' end local i = g(3, 'Sl') return i and (tostring(i.short_src) .. ':' .. tostring(i.currentline)) or '?' end "
+                  "idx.bcr_log = function(m) buf[#buf + 1] = m end "
+                  "idx.bcr_time = now "
+                  "idx.bcr_flush = function() if #buf == 0 then return nil end local s = table.concat(buf, ' | ') buf = {} return s end "
+                  "idx.post_event = function(self, e, ...) buf[#buf + 1] = now() .. ' ' .. tostring(e) .. ' @' .. where() return post(self, e, ...) end "
+                "end "
+                "if Player and not Player.bcr_snd then Player.bcr_snd = true local cs = Player.change_state local log, now = idx.bcr_log, idx.bcr_time "
+                  "Player.change_state = function(self, name, ...) log(now() .. ' STATE ' .. tostring(name)) return cs(self, name, ...) end end "
+                "return idx.bcr_flush()";
+            // Death From Above's in-air sound is a loop that only an end event stops, and the console can get stuck playing it forever. The player posts the end when
+            // leaving the state, only if it kept a handle to the loop, and one path posts the loop without keeping one. So this watches the events themselves and
+            // moves to the end event once a loop has run 5 seconds. BCR2_NODFALIMIT turns it off.
+            static const char* const kDfaLimitLua =
+                "local src = Global and Global.music_manager and Global.music_manager.source "
+                "local mt = src and getmetatable(src) local idx = mt and mt.__index "
+                "if type(idx) ~= 'table' or not Application then return nil end "
+                "if not rawget(idx, 'bcr_dfa') then local post = idx.post_event local d = {} idx.bcr_dfa = d "
+                  "idx.post_event = function(self, e, ...) "
+                    "if e == 'spencer_dfa_in_air_loop' then d.t = Application:time() elseif e == 'spencer_dfa_in_air_end' then d.t = nil end "
+                    "return post(self, e, ...) end "
+                "end "
+                "local d = idx.bcr_dfa "
+                "if d.t and Application:time() - d.t >= 5 and managers and managers.player then d.t = nil "
+                  "for _, p in pairs(managers.player:get_players()) do p:sound_source():post_event('spencer_dfa_in_air_end') "
+                    "local b = p:base() if b and b._upd then b._upd.dfa_in_air_loop_sound_event_instance = nil end end "
+                  "return 'ended a loop after 5 s' "
+                "end return nil";
+            if (kDfaLimit) lua_run_chunk(ctx, base, L, kDfaLimitLua, "dfa limit");
+            if (kNoMusic) lua_run_chunk(ctx, base, L, kNoMusicLua, nullptr);
+            if (kSoundLog) lua_run_chunk(ctx, base, L, kSoundLogLua, "sound");
             if (kGunFix) lua_run_chunk(ctx, base, L, kGunLua, nullptr);
             if (kGod) lua_run_chunk(ctx, base, L, kGodLua, nullptr);
             if (kRun) lua_run_chunk(ctx, base, L, kRun, "test");

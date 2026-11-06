@@ -118,6 +118,7 @@ static uint64_t fnv64(const void* p, size_t n, uint64_t h = 0xCBF29CE484222325ul
 
 // ---- device ----
 static HWND g_hwnd = nullptr;
+static std::atomic<int> g_shotBurstLeft{0};
 static ComPtr<ID3D11Device> g_dev;
 static ComPtr<ID3D11DeviceContext> g_ctx;
 static ComPtr<ID3D11DeviceContext1> g_ctx1;
@@ -171,6 +172,8 @@ static int g_modeNow = kWindowed;
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }
     if (m == WM_SIZE) g_sizeChanged = true;
+    // F9 with BCR2_SHOTDIR set: save the next 30 frames, to catch something seen during play.
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && getenv("BCR2_SHOTDIR")) { g_shotBurstLeft = 30; fprintf(stderr, "[capture] F9 pressed, saving 30 frames\n"); }
     if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29))) || (m == WM_KEYDOWN && w == VK_F11)) {
         if (!(l & (1 << 30))) {                                             // ignore auto-repeat
@@ -2482,7 +2485,6 @@ static void do_resolve() {
 
 // ---- present ----
 // BCR2_SHOTBURST=n with BCR2_SHOTDIR: dump the n frames after each simulated press, to count frames to the visible response.
-static std::atomic<int> g_shotBurstLeft{0};
 void gpu_note_press() {
     static const int kBurst = getenv("BCR2_SHOTBURST") ? atoi(getenv("BCR2_SHOTBURST")) : 0;
     fprintf(stderr, "[lat] press seen by guest at frame=%llu\n", (unsigned long long)g_frame);

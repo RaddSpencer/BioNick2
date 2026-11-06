@@ -119,6 +119,8 @@ static uint64_t fnv64(const void* p, size_t n, uint64_t h = 0xCBF29CE484222325ul
 // ---- device ----
 static HWND g_hwnd = nullptr;
 static std::atomic<int> g_shotBurstLeft{0};
+static std::atomic<int> g_shotStep{1};
+static uint64_t g_frame = 0;
 static ComPtr<ID3D11Device> g_dev;
 static ComPtr<ID3D11DeviceContext> g_ctx;
 static ComPtr<ID3D11DeviceContext1> g_ctx1;
@@ -160,7 +162,7 @@ static ComPtr<ID3D11Query> g_vbDone[kVbRings];                               // 
 static bool g_vbUsed[kVbRings] = {};
 static int g_vbIndex = 0;
 static uint32_t g_vbPos = 0, g_ibPos = 0;
-static uint64_t g_frame = 0, g_draws = 0, g_resolves = 0, g_drawsFrame = 0;
+static uint64_t g_draws = 0, g_resolves = 0, g_drawsFrame = 0;
 
 // Display modes. The window thread only asks; the GPU thread owns the swap chain and makes the change between frames.
 // Alt+Enter or F11: windowed fullscreen. Shift+Alt+Enter: exclusive fullscreen. BCR2_DISPLAY=window|borderless|fullscreen picks the starting mode.
@@ -172,8 +174,8 @@ static int g_modeNow = kWindowed;
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }
     if (m == WM_SIZE) g_sizeChanged = true;
-    // F9 with BCR2_SHOTDIR set: save the next 30 frames, to catch something seen during play.
-    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && getenv("BCR2_SHOTDIR")) { g_shotBurstLeft = 30; fprintf(stderr, "[capture] F9 pressed, saving 30 frames\n"); }
+    // F9 with BCR2_SHOTDIR set: save about 3 seconds of frames, to catch something seen during play.
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && getenv("BCR2_SHOTDIR")) { g_shotBurstLeft = 180; g_shotStep = 3; fprintf(stderr, "[capture] F9 pressed at frame %llu, saving every 3rd of the next 180 frames\n", (unsigned long long)g_frame); }
     if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29))) || (m == WM_KEYDOWN && w == VK_F11)) {
         if (!(l & (1 << 30))) {                                             // ignore auto-repeat
@@ -2551,7 +2553,7 @@ static void write_shot() {
     if (!dir) return;
     static const int every = getenv("BCR2_SHOTEVERY") ? std::max(atoi(getenv("BCR2_SHOTEVERY")), 1) : 60;
     bool burst = g_shotBurstLeft.load() > 0;
-    if (burst) g_shotBurstLeft--;
+    if (burst) { g_shotBurstLeft--; if (g_frame % g_shotStep.load() != 0) return; }
     if (!burst && (g_frame % every) != 0) return;
     D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
     d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;

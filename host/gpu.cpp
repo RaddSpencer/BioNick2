@@ -120,6 +120,8 @@ static uint64_t fnv64(const void* p, size_t n, uint64_t h = 0xCBF29CE484222325ul
 static HWND g_hwnd = nullptr;
 static std::atomic<int> g_shotBurstLeft{0};
 static std::atomic<int> g_shotStep{1};
+static std::atomic<bool> g_ringDump{false};
+static const int g_shotRingSize = getenv("BCR2_SHOTRING") ? atoi(getenv("BCR2_SHOTRING")) : 0;
 static uint64_t g_frame = 0;
 static ComPtr<ID3D11Device> g_dev;
 static ComPtr<ID3D11DeviceContext> g_ctx;
@@ -174,8 +176,8 @@ static int g_modeNow = kWindowed;
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }
     if (m == WM_SIZE) g_sizeChanged = true;
-    // F9 with BCR2_SHOTDIR set: save about 3 seconds of frames, to catch something seen during play.
-    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && getenv("BCR2_SHOTDIR")) { g_shotBurstLeft = 180; g_shotStep = 3; fprintf(stderr, "[capture] F9 pressed at frame %llu, saving every 3rd of the next 180 frames\n", (unsigned long long)g_frame); }
+    // F9 with BCR2_SHOTDIR set: save the last few seconds if BCR2_SHOTRING is set, else about the next 3 seconds, to catch something seen during play.
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && getenv("BCR2_SHOTDIR")) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } fprintf(stderr, "[capture] F9 pressed at frame %llu\n", (unsigned long long)g_frame); }
     if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29))) || (m == WM_KEYDOWN && w == VK_F11)) {
         if (!(l & (1 << 30))) {                                             // ignore auto-repeat
@@ -2548,19 +2550,9 @@ static void note_display_stats(LARGE_INTEGER presented, uint64_t frame) {
     }
 }
 
-static void write_shot() {
-    static const char* dir = getenv("BCR2_SHOTDIR");
-    if (!dir) return;
-    static const int every = getenv("BCR2_SHOTEVERY") ? std::max(atoi(getenv("BCR2_SHOTEVERY")), 1) : 60;
-    bool burst = g_shotBurstLeft.load() > 0;
-    if (burst) { g_shotBurstLeft--; if (g_frame % g_shotStep.load() != 0) return; }
-    if (!burst && (g_frame % every) != 0) return;
-    D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
-    d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
-    ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return;
-    g_ctx->CopyResource(st.Get(), g_backTex.Get());
-    D3D11_MAPPED_SUBRESOURCE ms; if (FAILED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) return;
-    std::string p = std::string(dir) + S("\\shot_%06llu.bmp", (unsigned long long)g_frame);
+static void save_shot(ID3D11Texture2D* st, const D3D11_TEXTURE2D_DESC& d, uint64_t frame, const char* dir) {
+    D3D11_MAPPED_SUBRESOURCE ms; if (FAILED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &ms))) return;
+    std::string p = std::string(dir) + S("\\shot_%06llu.bmp", (unsigned long long)frame);
     if (FILE* f = fopen(p.c_str(), "wb")) {
         BITMAPFILEHEADER fh{}; BITMAPINFOHEADER ih{};
         uint32_t imgSize = d.Width * d.Height * 4;
@@ -2575,7 +2567,45 @@ static void write_shot() {
         }
         fclose(f);
     }
-    g_ctx->Unmap(st.Get(), 0);
+    g_ctx->Unmap(st, 0);
+}
+// BCR2_SHOTRING=n with BCR2_SHOTDIR: keep the last n images, one every 2 frames, in memory. F9 then saves them, so something rare can be caught after it is seen.
+// BCR2_SHOTRINGAT=frame does the same as pressing F9 at that frame, for testing.
+static void shot_ring(const char* dir) {
+    static const int kN = g_shotRingSize;
+    static const uint64_t kAt = getenv("BCR2_SHOTRINGAT") ? _atoi64(getenv("BCR2_SHOTRINGAT")) : 0;
+    static std::vector<ComPtr<ID3D11Texture2D>> tex; static std::vector<uint64_t> frames; static int next = 0; static uint32_t w = 0, h = 0;
+    D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
+    d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    if (d.Width != w || d.Height != h) { tex.clear(); frames.clear(); tex.resize(kN); frames.assign(kN, ~0ull); next = 0; w = d.Width; h = d.Height; }
+    if (g_frame % 2 == 0) {
+        ComPtr<ID3D11Texture2D>& t = tex[next];
+        if (!t && FAILED(g_dev->CreateTexture2D(&d, nullptr, &t))) return;
+        g_ctx->CopyResource(t.Get(), g_backTex.Get());
+        frames[next] = g_frame;
+        next = (next + 1) % kN;
+    }
+    if (g_ringDump.exchange(false) || (kAt && g_frame == kAt)) {
+        LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
+        int saved = 0;
+        for (int i = 0; i < kN; i++) { const int k = (next + i) % kN; if (frames[k] != ~0ull) { save_shot(tex[k].Get(), d, frames[k], dir); saved++; } }
+        QueryPerformanceCounter(&b);
+        fprintf(stderr, "[capture] frame %llu: saved the previous %d images in %.1f s\n", (unsigned long long)g_frame, saved, (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs / 1000.0);
+    }
+}
+static void write_shot() {
+    static const char* dir = getenv("BCR2_SHOTDIR");
+    if (!dir) return;
+    if (g_shotRingSize > 0) shot_ring(dir);
+    static const int every = getenv("BCR2_SHOTEVERY") ? std::max(atoi(getenv("BCR2_SHOTEVERY")), 1) : 60;
+    bool burst = g_shotBurstLeft.load() > 0;
+    if (burst) { g_shotBurstLeft--; if (g_frame % g_shotStep.load() != 0) return; }
+    if (!burst && (g_frame % every) != 0) return;
+    D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
+    d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return;
+    g_ctx->CopyResource(st.Get(), g_backTex.Get());
+    save_shot(st.Get(), d, g_frame, dir);
 }
 
 // BCR2_DUMPFRAME=n with BCR2_SHOTDIR: log frame n's draws and resolves, then write each resolved surface as a BMP.

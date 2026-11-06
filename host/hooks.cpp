@@ -554,14 +554,14 @@ PPC_FUNC(sub_82634458) {
                 "return idx.bcr_flush()";
             // Death From Above's in-air sound is a loop that only an end event stops, and the console can get stuck playing it forever. The player posts the end when
             // leaving the state, only if it kept a handle to the loop, and one path posts the loop without keeping one. So this watches the events themselves and
-            // moves to the end event once a loop has run 5 seconds. BCR2_NODFALIMIT turns it off.
+            // moves to the end event once a loop has run 5 seconds. The impact event stops the loop too, so it also ends the wait. BCR2_NODFALIMIT turns it off.
             static const char* const kDfaLimitLua =
                 "local src = Global and Global.music_manager and Global.music_manager.source "
                 "local mt = src and getmetatable(src) local idx = mt and mt.__index "
                 "if type(idx) ~= 'table' or not Application then return nil end "
                 "if not rawget(idx, 'bcr_dfa') then local post = idx.post_event local d = {} idx.bcr_dfa = d "
                   "idx.post_event = function(self, e, ...) "
-                    "if e == 'spencer_dfa_in_air_loop' then d.t = Application:time() elseif e == 'spencer_dfa_in_air_end' then d.t = nil end "
+                    "if e == 'spencer_dfa_in_air_loop' then d.t = Application:time() elseif e == 'spencer_dfa_in_air_end' or e == 'spencer_dfa_hit' then d.t = nil end "
                     "return post(self, e, ...) end "
                 "end "
                 "local d = idx.bcr_dfa "

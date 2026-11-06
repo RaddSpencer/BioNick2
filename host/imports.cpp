@@ -1135,6 +1135,7 @@ static void RtlNtStatusToDosError_(PPCContext& ctx, uint8_t*) {
 
 // ---- file system: d:\ and game:\ map to the extracted content folder (read-only) ----
 static std::string g_root;
+const char* get_content_root() { return g_root.c_str(); }
 void set_content_root(const char* p) {
     g_root = p;
     while (!g_root.empty() && (g_root.back() == '\\' || g_root.back() == '/')) g_root.pop_back();

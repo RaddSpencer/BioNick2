@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <d3d11_1.h>
 #include <dxgi1_5.h>
+#include "shaderpack.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -961,6 +962,7 @@ static std::string uv_helper() {
     return "#define tfscale(n) tfp[n].xy\n";     // normalised lookups multiply by the uv scale; set per bind
 }
 
+static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen);
 static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen) {
     static std::unordered_map<uint64_t, XShader*> cache;
     uint64_t h = fnv64(code.data(), code.size() * 4, isVs ? 0x1234 : 0x5678);
@@ -970,6 +972,11 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     XShader* sh = new XShader();
     sh->hash = h;
     cache[h] = sh;
+    shader_record(code, isVs, paramGen);
+    if (const char* ud = getenv("BCR2_UCODEDUMP")) {                         // the raw microcode of each new shader, big-endian as in guest memory
+        std::string p = std::string(ud) + S("\\%s_%016llX.bin", isVs ? "vs" : "ps", (unsigned long long)h);
+        if (FILE* f = fopen(p.c_str(), "wb")) { for (uint32_t w : code) { uint32_t be = _byteswap_ulong(w); fwrite(&be, 4, 1, f); } fclose(f); }
+    }
     Translator T; T.ucode = code.data(); T.words = (uint32_t)code.size(); T.isVs = isVs; T.out = sh;
     T.decode_cf();
     T.walk();
@@ -1035,6 +1042,112 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     if (blob || kSync) finish_shader(sh, blob.Get(), isVs);
     else queue_compile(sh, std::move(src), isVs);
     return sh;
+}
+
+// ---- compiling shaders ahead of time ----
+// The game keeps its shaders in one bundle. Pixel shaders are used as they are there, so all of them can be compiled at first run. Vertex shaders are
+// patched at run time to fit each mesh's vertex format, which the bundle doesn't say. So a manifest lists which shaders were used with which changed
+// words, recorded by playing (BCR2_SHADERRECORD). It holds no shader code, only those patches, and is applied to the player's own game files.
+const char* get_content_root();
+static const char* const kShaderBundle = "3b6c2da5af6f2e42.bundle";
+static std::vector<uint8_t> g_packData;
+static std::vector<PackShader> g_pack;
+static bool g_packLoaded = false;
+static std::string g_manifestPath;
+static std::set<std::string> g_manifestLines;
+static const bool g_shaderRecord = getenv("BCR2_SHADERRECORD") != nullptr;
+
+static std::string exe_dir() {
+    wchar_t w[MAX_PATH]; GetModuleFileNameW(nullptr, w, MAX_PATH);
+    char a[MAX_PATH]; WideCharToMultiByte(CP_ACP, 0, w, -1, a, MAX_PATH, nullptr, nullptr);
+    std::string s = a; return s.substr(0, s.find_last_of('\\'));
+}
+static uint64_t pack_key(const PackShader& p) { return fnv64(&g_packData[p.offset], p.words * 4, p.isVs ? 0x1234 : 0x5678); }
+static bool pack_load() {
+    if (g_packLoaded) return !g_pack.empty();
+    g_packLoaded = true;
+    const std::string root = get_content_root();
+    if (root.empty()) return false;
+    const std::string path = root + "\\assets\\" + kShaderBundle;
+    if (!shaderpack_load(path, g_packData, g_pack)) { fprintf(stderr, "[shader] could not read %s\n", path.c_str()); g_pack.clear(); return false; }
+    fprintf(stderr, "[shader] %zu shader containers in %s\n", g_pack.size(), kShaderBundle);
+    return !g_pack.empty();
+}
+static void manifest_read() {
+    if (const char* e = getenv("BCR2_SHADERMANIFEST")) g_manifestPath = e;
+    else {                                                                   // beside the exe, or in the host folder above it during development
+        g_manifestPath = exe_dir() + "\\shader_manifest.txt";
+        const std::string up = exe_dir() + "\\..\\shader_manifest.txt";
+        if (GetFileAttributesA(g_manifestPath.c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributesA(up.c_str()) != INVALID_FILE_ATTRIBUTES) g_manifestPath = up;
+    }
+    if (FILE* f = fopen(g_manifestPath.c_str(), "r")) {
+        char line[8192];
+        while (fgets(line, sizeof line, f)) { std::string s = line; while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back(); if (!s.empty()) g_manifestLines.insert(s); }
+        fclose(f);
+    }
+}
+// Records a shader the game used: its container, plus the words that differ from it.
+static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen) {
+    if (!g_shaderRecord || !pack_load()) return;
+    const PackShader* best = nullptr; size_t bestDiff = (size_t)-1;
+    for (const PackShader& p : g_pack) {
+        if (p.isVs != isVs || p.words != code.size()) continue;
+        const uint32_t* w = (const uint32_t*)&g_packData[p.offset];
+        size_t diff = 0;
+        for (size_t i = 0; i < code.size() && diff < bestDiff; i++) if (_byteswap_ulong(w[i]) != code[i]) diff++;
+        if (diff < bestDiff) { bestDiff = diff; best = &p; if (diff == 0) break; }
+    }
+    if (!best || bestDiff > code.size() / 2) { static int nl = 0; if (nl++ < 20) fprintf(stderr, "[shader] %s of %zu words has no container\n", isVs ? "vs" : "ps", code.size()); return; }
+    if (!isVs && bestDiff == 0 && paramGen == 0xFFFFFFFFu) return;           // compiled anyway
+    const uint32_t* w = (const uint32_t*)&g_packData[best->offset];
+    std::string line = S("%c %016llX %08X", isVs ? 'v' : 'p', (unsigned long long)pack_key(*best), paramGen);
+    for (size_t i = 0; i < code.size(); i++) if (_byteswap_ulong(w[i]) != code[i]) line += S(" %zu=%08X", i, code[i]);
+    if (!g_manifestLines.insert(line).second) return;
+    if (FILE* f = fopen(g_manifestPath.c_str(), "a")) { fprintf(f, "%s\n", line.c_str()); fclose(f); }
+}
+static void shader_precompile() {
+    manifest_read();
+    if (getenv("BCR2_NOPRECOMPILE") || getenv("BCR2_SYNCSHADERS")) return;
+    // Done already for this build, render scale and manifest? Cached shaders load quickly on first use, so nothing more is needed.
+    WIN32_FILE_ATTRIBUTE_DATA fa{}; wchar_t ew[MAX_PATH]; GetModuleFileNameW(nullptr, ew, MAX_PATH); GetFileAttributesExW(ew, GetFileExInfoStandard, &fa);
+    const std::string stampWant = S("%08lX%08lX scale=%d manifest=%zu", fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime, g_resScale, g_manifestLines.size());
+    const std::string stampPath = shader_cache_dir() + "\\precompile.stamp";
+    if (FILE* f = fopen(stampPath.c_str(), "r")) {
+        char b[128] = {}; const size_t n = fread(b, 1, sizeof b - 1, f); fclose(f);
+        if (stampWant == std::string(b, n)) { fprintf(stderr, "[shader] already compiled ahead of time\n"); return; }
+    }
+    if (!pack_load()) return;
+    LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
+    std::unordered_map<uint64_t, const PackShader*> byKey;
+    for (const PackShader& p : g_pack) byKey.emplace(pack_key(p), &p);
+    std::vector<uint32_t> code;
+    auto load = [&](const PackShader& p) { code.resize(p.words); const uint32_t* w = (const uint32_t*)&g_packData[p.offset]; for (uint32_t i = 0; i < p.words; i++) code[i] = _byteswap_ulong(w[i]); };
+    size_t nPs = 0, nManifest = 0, nMissing = 0;
+    for (const auto& kv : byKey) if (!kv.second->isVs) { load(*kv.second); build_shader(code, false, 0xFFFFFFFFu); nPs++; }
+    for (const std::string& line : g_manifestLines) {
+        char kind = 0; unsigned long long key = 0; unsigned pg = 0; int used = 0;
+        if (sscanf(line.c_str(), "%c %llx %x%n", &kind, &key, &pg, &used) != 3) continue;
+        auto it = byKey.find(key);
+        if (it == byKey.end() || it->second->isVs != (kind == 'v')) { nMissing++; continue; }
+        load(*it->second);
+        const char* p = line.c_str() + used; unsigned idx = 0, val = 0; int adv = 0;
+        while (sscanf(p, " %u=%x%n", &idx, &val, &adv) == 2) { if (idx < code.size()) code[idx] = val; p += adv; }
+        build_shader(code, kind == 'v', pg);
+        nManifest++;
+    }
+    const int total = g_compilePending.load();
+    fprintf(stderr, "[shader] compiling ahead of time: %zu pixel shaders, %zu from the manifest (%zu not found), %d need compiling\n", nPs, nManifest, nMissing, total);
+    int shown = -1;
+    while (g_compilePending.load() > 0) {
+        const int left = g_compilePending.load();
+        if (left != shown) { shown = left; SetWindowTextA(g_hwnd, S("Bionic Commando Rearmed 2 - preparing shaders (%d of %d)", total - left, total).c_str()); }
+        Sleep(50);
+    }
+    SetWindowTextA(g_hwnd, "Bionic Commando Rearmed 2 (recomp)");
+    QueryPerformanceCounter(&t1);
+    fprintf(stderr, "[shader] done in %.1f s\n", (double)(t1.QuadPart - t0.QuadPart) * g_perfTicksToMs / 1000.0);
+    if (FILE* f = fopen(stampPath.c_str(), "w")) { fputs(stampWant.c_str(), f); fclose(f); }
+    if (!g_shaderRecord) { std::vector<uint8_t>().swap(g_packData); g_pack.clear(); g_packLoaded = false; }   // no longer needed
 }
 
 static inline uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
@@ -2761,6 +2874,7 @@ void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
         inited = true; g_base = base;
         LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_perfTicksToMs = 1000.0 / (double)f.QuadPart;
         g_devOk = device_init();
+        if (g_devOk) shader_precompile();
     }
     if (!g_devOk) return;
     {   // BCR2_PM4TRACE=<surface info hex>, with BCR2_PROBEQLIGHT: every packet while that target is bound, with where it was read from

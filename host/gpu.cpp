@@ -17,6 +17,11 @@
 #include <windows.h>
 #include <d3d11_1.h>
 #include <dxgi1_5.h>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -65,7 +70,8 @@ bool gpu_tracing() { return g_trace > 1000; }
 static double g_perfTicksToMs = 0;
 static double g_tDraw = 0, g_tResolve = 0, g_tTex = 0, g_tPresent = 0;
 static std::atomic<uint64_t> g_waitTicks[3];                                // ring empty, WAIT_REG_MEM, interrupt
-static uint64_t g_nCompiles = 0, g_nUploads = 0, g_upBytes = 0;
+static std::atomic<uint64_t> g_nCompiles{0};
+static uint64_t g_nUploads = 0, g_upBytes = 0;
 void gpu_note_wait(int kind, uint64_t qpcTicks) { g_waitTicks[kind] += qpcTicks; }
 // Parts of the slowest draw and of the swap, for the [spike] line.
 static double g_sCb = 0, g_sVb = 0, g_sIb = 0, g_sCall = 0, g_sRt = 0, g_swPrep = 0, g_swHold = 0, g_swTrack = 0;
@@ -188,23 +194,35 @@ static DWORD WINAPI window_thread(LPVOID ev) {
     return 0;
 }
 
-static ComPtr<ID3DBlob> compile_cached(const std::string& src, const char* entry, const char* target) {
+// Compiled shaders on disk: <exe dir>\shadercache, or BCR2_SHADERCACHE=<dir> to test a cold start without touching the real one.
+static const std::string& shader_cache_dir() {
     static const std::string dir = [] {
+        if (const char* e = getenv("BCR2_SHADERCACHE")) { CreateDirectoryA(e, nullptr); return std::string(e); }
         wchar_t w[MAX_PATH]; GetModuleFileNameW(nullptr, w, MAX_PATH);
         char a[MAX_PATH]; WideCharToMultiByte(CP_ACP, 0, w, -1, a, MAX_PATH, nullptr, nullptr);
         std::string s = a; s = s.substr(0, s.find_last_of('\\')) + "\\shadercache";
         CreateDirectoryA(s.c_str(), nullptr);
         return s;
     }();
+    return dir;
+}
+static ComPtr<ID3DBlob> load_cached(const std::string& src, const char* target) {
     uint64_t h = fnv64(src.data(), src.size()); h = fnv64(target, strlen(target), h);
-    std::string path = dir + "\\" + S("%016llX.dxbc", (unsigned long long)h);
+    std::string path = shader_cache_dir() + "\\" + S("%016llX.dxbc", (unsigned long long)h);
     ComPtr<ID3DBlob> blob;
     if (FILE* f = fopen(path.c_str(), "rb")) {
         fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
         if (n > 0 && SUCCEEDED(D3DCreateBlob(n, &blob))) { if (fread(blob->GetBufferPointer(), 1, n, f) != (size_t)n) blob.Reset(); }
         fclose(f);
-        if (blob) return blob;
     }
+    return blob;
+}
+static ComPtr<ID3DBlob> compile_cached(const std::string& src, const char* entry, const char* target) {
+    const std::string& dir = shader_cache_dir();
+    uint64_t h = fnv64(src.data(), src.size()); h = fnv64(target, strlen(target), h);
+    std::string path = dir + "\\" + S("%016llX.dxbc", (unsigned long long)h);
+    ComPtr<ID3DBlob> blob = load_cached(src, target);
+    if (blob) return blob;
     ComPtr<ID3DBlob> err;
     g_nCompiles++;
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, target,
@@ -379,7 +397,71 @@ struct XShader {
     std::vector<VfUse> vf;
     bool ok = false;
     uint64_t hash = 0;
+    std::atomic<bool> ready{false};                                          // false while a worker is compiling it; ok, vs and ps are valid once true
 };
+
+// New shaders compile on worker threads, so a mesh seen for the first time costs a frame or two of that mesh, not a freeze of the whole game.
+struct CompileJob { XShader* sh; std::string src; bool isVs; };
+static std::mutex g_compileLock;
+static std::condition_variable g_compileWake;
+static std::deque<CompileJob> g_compileQueue;
+static std::atomic<int> g_compilePending{0};                                 // queued or being compiled
+static void finish_shader(XShader* sh, ID3DBlob* blob, bool isVs) {
+    if (blob) {
+        if (isVs) sh->ok = SUCCEEDED(g_dev->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &sh->vs));
+        else sh->ok = SUCCEEDED(g_dev->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &sh->ps));
+    }
+    sh->ready.store(true, std::memory_order_release);
+}
+static void compile_worker() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        CompileJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_compileLock);
+            g_compileWake.wait(lk, [] { return !g_compileQueue.empty(); });
+            job = std::move(g_compileQueue.front()); g_compileQueue.pop_front();
+        }
+        auto blob = compile_cached(job.src, "main", job.isVs ? "vs_5_0" : "ps_5_0");
+        finish_shader(job.sh, blob.Get(), job.isVs);
+        g_compilePending--;
+    }
+}
+static void queue_compile(XShader* sh, std::string src, bool isVs) {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const unsigned n = std::max(1u, std::min(6u, std::thread::hardware_concurrency() / 3));
+        for (unsigned i = 0; i < n; i++) std::thread(compile_worker).detach();
+        fprintf(stderr, "[gfx] %u background shader compile threads\n", n);
+    });
+    g_compilePending++;
+    { std::lock_guard<std::mutex> lk(g_compileLock); g_compileQueue.push_back({ sh, std::move(src), isVs }); }
+    g_compileWake.notify_one();
+}
+// Whether a draw can go ahead. Full-screen passes wait, since leaving one out would flash the whole screen. So does everything during a large batch, as
+// when a level first appears: half a scene missing for most of a second looks worse than a short wait. Otherwise a draw waits only for what is left of a
+// small per-frame budget and is then left out for this frame.
+static double g_compileWaitMs = 0;                                           // used this frame
+static uint64_t g_drawsLeftOut = 0;
+static bool shaders_ready(XShader* a, XShader* b, bool mustWait) {
+    auto done = [&] { return (!a || a->ready.load(std::memory_order_acquire)) && (!b || b->ready.load(std::memory_order_acquire)); };
+    if (done()) return true;
+    static const double kBudgetMs = getenv("BCR2_COMPILEWAIT") ? atof(getenv("BCR2_COMPILEWAIT")) : 5.0;
+    static const int kBatch = getenv("BCR2_COMPILEBATCH") ? atoi(getenv("BCR2_COMPILEBATCH")) : 16;
+    if (g_compilePending.load() >= kBatch) mustWait = true;
+    LARGE_INTEGER s, q; QueryPerformanceCounter(&s);
+    for (;;) {
+        SwitchToThread();
+        if (done()) break;
+        QueryPerformanceCounter(&q);
+        if (!mustWait && g_compileWaitMs + (double)(q.QuadPart - s.QuadPart) * g_perfTicksToMs >= kBudgetMs) break;
+    }
+    QueryPerformanceCounter(&q);
+    g_compileWaitMs += (double)(q.QuadPart - s.QuadPart) * g_perfTicksToMs;
+    if (done()) return true;
+    g_drawsLeftOut++;
+    return false;
+}
 
 // Declarations shared by both stages.
 static const char* kCommon = R"(
@@ -944,14 +1026,14 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     }
     for (auto& kv : T.texs) sh->tex.push_back(kv.second);
     for (auto& kv : T.vfs) sh->vf.push_back({ kv.first, kv.second });
-    auto blob = compile_cached(src, "main", isVs ? "vs_5_0" : "ps_5_0");
-    if (blob) {
-        if (isVs) sh->ok = SUCCEEDED(g_dev->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &sh->vs));
-        else sh->ok = SUCCEEDED(g_dev->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &sh->ps));
-    }
-    static int total = 0, bad = 0;
-    total++; if (!sh->ok) bad++;
-    if (total <= 3 || (total % 50) == 0 || !sh->ok) fprintf(stderr, "[gfx] shaders translated=%d failed=%d (last %s %u dwords, %zu tex, %zu vf)\n", total, bad, isVs ? "vs" : "ps", T.words, sh->tex.size(), sh->vf.size());
+    static int total = 0;
+    total++;
+    if (total <= 3 || (total % 50) == 0) fprintf(stderr, "[gfx] shaders translated=%d (last %s %u dwords, %zu tex, %zu vf)\n", total, isVs ? "vs" : "ps", T.words, sh->tex.size(), sh->vf.size());
+    static const bool kSync = getenv("BCR2_SYNCSHADERS") != nullptr;         // compile on this thread, as before
+    auto blob = load_cached(src, isVs ? "vs_5_0" : "ps_5_0");                // already compiled once: cheap enough to do right here
+    if (!blob && kSync) blob = compile_cached(src, "main", isVs ? "vs_5_0" : "ps_5_0");
+    if (blob || kSync) finish_shader(sh, blob.Get(), isVs);
+    else queue_compile(sh, std::move(src), isVs);
     return sh;
 }
 
@@ -1665,6 +1747,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         for (auto& u : vs->vf) { uint32_t f0 = g_regs[R_FETCH + u.slot * 2], f1 = g_regs[R_FETCH + u.slot * 2 + 1]; fprintf(stderr, " %u:addr=%08X,words=%u,end=%u,stride=%u", u.slot, f0 & ~3u, (f1 >> 2) & 0xFFFFFF, f1 & 3, u.stride); }
         fprintf(stderr, "\n");
     }
+    if (!shaders_ready(vs, ps, prim == 8)) return;
     if (!vs->ok) return;
     if (ps && !ps->ok) ps = nullptr;
 
@@ -2508,6 +2591,11 @@ uint64_t gpu_frame_number() { return g_frame; }
 
 static void do_swap(uint32_t front) {
     LARGE_INTEGER swapStart; QueryPerformanceCounter(&swapStart);
+    if (g_drawsLeftOut) {
+        fprintf(stderr, "[shader] frame=%llu left out %llu draws waiting on a compile, waited %.1f ms\n", (unsigned long long)g_frame, (unsigned long long)g_drawsLeftOut, g_compileWaitMs);
+        g_drawsLeftOut = 0;
+    }
+    g_compileWaitMs = 0;
     mem_find();
     {   // BCR2_HWWATCH="frame:physical hex": name the game code that writes this word
         static const char* kHw = getenv("BCR2_HWWATCH");
@@ -2633,9 +2721,9 @@ static void do_swap(uint32_t front) {
                             (unsigned long long)g_frame, ms, g_tDraw >= pD ? g_tDraw - pD : g_tDraw, g_tTex >= pT ? g_tTex - pT : g_tTex,
                             g_tResolve >= pR ? g_tResolve - pR : g_tResolve, g_tPresent >= pP ? g_tPresent - pP : g_tPresent,
                             (w0 >= pW0 ? w0 - pW0 : w0) * g_perfTicksToMs, (w1 >= pW1 ? w1 - pW1 : w1) * g_perfTicksToMs, (w2 >= pW2 ? w2 - pW2 : w2) * g_perfTicksToMs,
-                            (unsigned long long)(g_nCompiles - pCompiles), (unsigned long long)(g_nUploads - pUploads), (unsigned long long)((g_upBytes - pUpBytes) / 1024), worstDraw, (unsigned long long)g_worstVs, g_worstNum, g_worstSurf, g_wCb, g_wVb, g_wIb, g_wCall, g_wRt, g_swPrep, g_swHold, g_swTrack);
+                            (unsigned long long)(g_nCompiles.load() - pCompiles), (unsigned long long)(g_nUploads - pUploads), (unsigned long long)((g_upBytes - pUpBytes) / 1024), worstDraw, (unsigned long long)g_worstVs, g_worstNum, g_worstSurf, g_wCb, g_wVb, g_wIb, g_wCall, g_wRt, g_swPrep, g_swHold, g_swTrack);
             }
-            pD = g_tDraw; pT = g_tTex; pR = g_tResolve; pP = g_tPresent; pW0 = w0; pW1 = w1; pW2 = w2; pCompiles = g_nCompiles; pUploads = g_nUploads; pUpBytes = g_upBytes;
+            pD = g_tDraw; pT = g_tTex; pR = g_tResolve; pP = g_tPresent; pW0 = w0; pW1 = w1; pW2 = w2; pCompiles = g_nCompiles.load(); pUploads = g_nUploads; pUpBytes = g_upBytes;
         }
         prevSwap = now;
         if (g_frame + 1 - lastFrame >= 300) {

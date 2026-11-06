@@ -502,10 +502,11 @@ PPC_FUNC(sub_82634458) {
     static const char* const kRun = getenv("BCR2_LUARUN");
     if (kGod || kRun) {
         // About once a second, while this thread is already inside Lua. New players and levels are picked up the next time around.
+        static const uint64_t kEvery = getenv("BCR2_LUAEVERY") ? _atoi64(getenv("BCR2_LUAEVERY")) : 60;   // frames between runs, for tests that need finer timing
         static std::atomic<uint64_t> nextFrame{ 300 };
         static thread_local bool inside = false;
         uint64_t due = nextFrame.load(), f = gpu_frame_number();
-        if (!inside && f >= due && nextFrame.compare_exchange_strong(due, f + 60)) {
+        if (!inside && f >= due && nextFrame.compare_exchange_strong(due, f + kEvery)) {
             inside = true;
             const PPCContext saved = ctx;
             const uint32_t L = saved.r3.u32, funcOff = saved.r4.u32 - PPC_LOAD_U32(L + 32);

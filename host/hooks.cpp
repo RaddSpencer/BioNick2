@@ -462,11 +462,65 @@ PPC_FUNC(sub_82638FA0) {
     throw GuestLuaThrow{ lj };
 }
 
+// ---- running Lua in the game's own state, for testing ----
+// BCR2_GODMODE sets the developers' own switches: the _god_mode flag that makes Damage:add_damage ignore damage on the player, and Global.unlimited_lives.
+// Both are toggles in the game's debug menu. BCR2_LUARUN=<lua> runs a chunk as well, and logs a string it returns.
+uint64_t gpu_frame_number();
+void sub_8264FF78(PPCContext& __restrict__ ctx, uint8_t* base);              // luaL_loadstring(L, s)
+void sub_8263C8A8(PPCContext& __restrict__ ctx, uint8_t* base);              // lua_pcall(L, nargs, nresults, errfunc)
+static void lua_run_chunk(PPCContext& ctx, uint8_t* base, uint32_t L, const char* text, const char* tag) {
+    const size_t n = strlen(text) + 1;
+    const uint32_t oldSp = ctx.r1.u32, buf = (oldSp - 0x400 - (uint32_t)n) & ~15u, sp = (buf - 0x200) & ~15u;
+    memcpy(base + buf, text, n);
+    const uint32_t topOff = PPC_LOAD_U32(L + 8) - PPC_LOAD_U32(L + 32);      // L->top against L->stack, which can move
+    ctx.r1.u64 = sp;
+    ctx.r3.u64 = L; ctx.r4.u64 = buf;
+    sub_8264FF78(ctx, base);
+    uint32_t status = ctx.r3.u32;
+    if (status == 0) {
+        ctx.r1.u64 = sp;
+        ctx.r3.u64 = L; ctx.r4.u64 = 0; ctx.r5.u64 = 1; ctx.r6.u64 = 0;
+        sub_8263C8A8(ctx, base);
+        status = ctx.r3.u32;
+    }
+    // One value is on top now: the chunk's result, or an error message. Lua strings have tag 4 and their characters at +16.
+    const uint32_t top = PPC_LOAD_U32(L + 8);
+    if (top >= 8 && PPC_LOAD_U32(top - 8 + 4) == 4 && (status != 0 || tag)) {
+        static int nl = 0;
+        if (nl++ < 2000) fprintf(stderr, "[lua-run] %s f=%llu status=%u: %s\n", tag ? tag : "god mode", (unsigned long long)gpu_frame_number(), status, (const char*)(base + PPC_LOAD_U32(top - 8) + 16));
+    }
+    PPC_STORE_U32(L + 8, PPC_LOAD_U32(L + 32) + topOff);
+    ctx.r1.u64 = oldSp;
+}
+
 extern "C" void __imp__sub_82634458(PPCContext& __restrict__ ctx, uint8_t* base);
 PPC_FUNC(sub_82634458) {
     t_lastLuaState = ctx.r3.u32;
     static const bool kTrace = getenv("BCR2_LUATRACE") != nullptr;
     if (kTrace) lua_trace_call(base, ctx.r4.u32);
+    static const bool kGod = getenv("BCR2_GODMODE") != nullptr;
+    static const char* const kRun = getenv("BCR2_LUARUN");
+    if (kGod || kRun) {
+        // About once a second, while this thread is already inside Lua. New players and levels are picked up the next time around.
+        static std::atomic<uint64_t> nextFrame{ 300 };
+        static thread_local bool inside = false;
+        uint64_t due = nextFrame.load(), f = gpu_frame_number();
+        if (!inside && f >= due && nextFrame.compare_exchange_strong(due, f + 60)) {
+            inside = true;
+            const PPCContext saved = ctx;
+            const uint32_t L = saved.r3.u32, funcOff = saved.r4.u32 - PPC_LOAD_U32(L + 32);
+            static const char* const kGodLua =
+                "if Global then Global.unlimited_lives = true end "
+                "if managers and managers.player then for _, p in pairs(managers.player:get_players()) do p:bcr_damage()._god_mode = true end end";
+            if (kGod) lua_run_chunk(ctx, base, L, kGodLua, nullptr);
+            if (kRun) lua_run_chunk(ctx, base, L, kRun, "test");
+            auto fpscr = ctx.fpscr;                                          // keeps the cached copy of the live MXCSR correct
+            ctx = saved;
+            ctx.fpscr = fpscr;
+            ctx.r4.u64 = PPC_LOAD_U32(L + 32) + funcOff;                     // the Lua stack may have moved
+            inside = false;
+        }
+    }
     __imp__sub_82634458(ctx, base);
 }
 

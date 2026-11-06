@@ -67,6 +67,8 @@ static double g_tDraw = 0, g_tResolve = 0, g_tTex = 0, g_tPresent = 0;
 static std::atomic<uint64_t> g_waitTicks[3];                                // ring empty, WAIT_REG_MEM, interrupt
 static uint64_t g_nCompiles = 0, g_nUploads = 0, g_upBytes = 0;
 void gpu_note_wait(int kind, uint64_t qpcTicks) { g_waitTicks[kind] += qpcTicks; }
+// Parts of the slowest draw and of the swap, for the [spike] line.
+static double g_sCb = 0, g_sVb = 0, g_sIb = 0, g_sCall = 0, g_sRt = 0, g_swPrep = 0, g_swHold = 0, g_swTrack = 0;
 struct PerfScope {
     double& acc; LARGE_INTEGER a;
     explicit PerfScope(double& t) : acc(t) { QueryPerformanceCounter(&a); }
@@ -142,7 +144,13 @@ static ComPtr<ID3D11PixelShader> g_psBlit, g_psBlitDepth, g_psBlitRaw, g_psColor
 static ComPtr<ID3D11Texture2D> g_lutTex;
 static ComPtr<ID3D11ShaderResourceView> g_lutSrv;
 static ComPtr<ID3D11SamplerState> g_blitSampler;
-static const uint32_t kVbRingSize = 96u << 20, kIbRingSize = 16u << 20;
+static const uint32_t kVbRingSize = 64u << 20, kIbRingSize = 16u << 20;
+static const int kVbRings = 3;
+static ComPtr<ID3D11Buffer> g_vbRings[kVbRings];
+static ComPtr<ID3D11ShaderResourceView> g_vbSrvs[kVbRings];
+static ComPtr<ID3D11Query> g_vbDone[kVbRings];                               // signalled when the GPU has finished with that ring's last contents
+static bool g_vbUsed[kVbRings] = {};
+static int g_vbIndex = 0;
 static uint32_t g_vbPos = 0, g_ibPos = 0;
 static uint64_t g_frame = 0, g_draws = 0, g_resolves = 0, g_drawsFrame = 0;
 
@@ -230,6 +238,22 @@ static bool tearing_supported() {
     return SUCCEEDED(f->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &ok, sizeof ok)) && ok;
 }
 
+// Wait until a QPC time. Sleep can wake many milliseconds late, which is a whole missed frame here, so use a high-resolution timer for most of the wait and spin the end.
+void gpu_wait_until(long long qpc) {
+    static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    static const double kToMs = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return 1000.0 / (double)f.QuadPart; }();
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const double left = (double)(qpc - now.QuadPart) * kToMs;
+    if (left > 1.5 && timer) {
+        LARGE_INTEGER due; due.QuadPart = -(LONGLONG)((left - 1.0) * 10000.0);
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, 100);
+    }
+    do { YieldProcessor(); QueryPerformanceCounter(&now); } while (now.QuadPart < qpc);
+}
+// How late the game tick fired against its exact time, reported on the [vrr] line.
+std::atomic<int> g_tickLateMaxUs{0};
+void gpu_note_tick_late(int us) { int m = g_tickLateMaxUs.load(); while (us > m && !g_tickLateMaxUs.compare_exchange_weak(m, us)) {} }
+
 bool gpu_vrr() { static const bool on = getenv("BCR2_VRR") != nullptr && tearing_supported(); return on; }   // no tearing support: keep the display lock
 
 static bool device_init() {
@@ -275,10 +299,17 @@ static bool device_init() {
     D3D11_BUFFER_DESC vb{}; vb.ByteWidth = kVbRingSize; vb.BindFlags = D3D11_BIND_SHADER_RESOURCE; vb.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
     if (g_noOverwriteSrv) { vb.Usage = D3D11_USAGE_DYNAMIC; vb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE; }
     else vb.Usage = D3D11_USAGE_DEFAULT;
-    g_dev->CreateBuffer(&vb, nullptr, &g_vbRing);
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{}; sv.Format = DXGI_FORMAT_R32_TYPELESS; sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
     sv.BufferEx.NumElements = kVbRingSize / 4; sv.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
-    g_dev->CreateShaderResourceView(g_vbRing.Get(), &sv, &g_vbSrv);
+    {   // Several rings, so a wrap can move to one the GPU has finished with. Discarding a ring this large stalled the render thread for 3 to 15 ms.
+        D3D11_QUERY_DESC qd{}; qd.Query = D3D11_QUERY_EVENT;
+        for (int i = 0; i < kVbRings; i++) {
+            g_dev->CreateBuffer(&vb, nullptr, &g_vbRings[i]);
+            g_dev->CreateShaderResourceView(g_vbRings[i].Get(), &sv, &g_vbSrvs[i]);
+            g_dev->CreateQuery(&qd, &g_vbDone[i]);
+        }
+        g_vbRing = g_vbRings[0]; g_vbSrv = g_vbSrvs[0];
+    }
     D3D11_BUFFER_DESC ib{}; ib.ByteWidth = kIbRingSize; ib.Usage = D3D11_USAGE_DYNAMIC; ib.BindFlags = D3D11_BIND_INDEX_BUFFER; ib.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g_dev->CreateBuffer(&ib, nullptr, &g_ibRing);
 
@@ -1417,8 +1448,17 @@ static uint32_t vb_alloc(uint32_t size, uint8_t*& ptr) {
     D3D11_MAPPED_SUBRESOURCE ms{};
     if (g_noOverwriteSrv) {
         D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
-        if (g_vbPos + size > kVbRingSize) { g_vbPos = 0; mode = D3D11_MAP_WRITE_DISCARD; }
-        g_ctx->Map(g_vbRing.Get(), 0, mode, 0, &ms);
+        if (g_vbPos + size > kVbRingSize) {
+            g_ctx->End(g_vbDone[g_vbIndex].Get());
+            g_vbUsed[g_vbIndex] = true;
+            g_vbIndex = (g_vbIndex + 1) % kVbRings;
+            g_vbRing = g_vbRings[g_vbIndex]; g_vbSrv = g_vbSrvs[g_vbIndex];
+            g_vbPos = 0;
+            // Normally that ring is long finished. If not, as in a burst of huge frames, a discard is the safe way to get memory.
+            BOOL done = FALSE;
+            if (!g_vbUsed[g_vbIndex] || g_ctx->GetData(g_vbDone[g_vbIndex].Get(), &done, sizeof done, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || !done) mode = D3D11_MAP_WRITE_DISCARD;
+        } else if (!g_vbUsed[g_vbIndex] && g_vbPos == 0) mode = D3D11_MAP_WRITE_DISCARD;   // the first map of a new buffer
+        { PerfScope t(g_sVb); g_ctx->Map(g_vbRing.Get(), 0, mode, 0, &ms); }
         ptr = (uint8_t*)ms.pData + g_vbPos;
     } else {
         static std::vector<uint8_t> scratch; scratch.resize(size); ptr = scratch.data();
@@ -1430,10 +1470,11 @@ static uint32_t vb_alloc(uint32_t size, uint8_t*& ptr) {
 static void vb_commit(uint32_t off, uint32_t size, const uint8_t* ptr) {
     if (g_noOverwriteSrv) { g_ctx->Unmap(g_vbRing.Get(), 0); return; }
     D3D11_BOX box{ off, 0, 0, off + align_up(size, 16), 1, 1 };
-    g_ctx->UpdateSubresource(g_vbRing.Get(), 0, &box, ptr, 0, 0);
+    { PerfScope t(g_sVb); g_ctx->UpdateSubresource(g_vbRing.Get(), 0, &box, ptr, 0, 0); }
 }
 static void upload_cb(ID3D11Buffer* b, const void* p, size_t n) {
     D3D11_MAPPED_SUBRESOURCE ms;
+    PerfScope t(g_sCb);
     if (SUCCEEDED(g_ctx->Map(b, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) { memcpy(ms.pData, p, n); g_ctx->Unmap(b, 0); }
 }
 
@@ -1538,11 +1579,11 @@ static bool fast_clear(bool withColor) {
 }
 
 // The slowest single draw of the frame, for the [spike] line: one stalled call and evenly slow draws need different fixes.
-static double g_worstDrawMs = 0; static uint64_t g_worstVs = 0; static uint32_t g_worstNum = 0, g_worstSurf = 0;
+static double g_worstDrawMs = 0, g_wCb = 0, g_wVb = 0, g_wIb = 0, g_wCall = 0, g_wRt = 0; static uint64_t g_worstVs = 0; static uint32_t g_worstNum = 0, g_worstSurf = 0;
 struct WorstDraw {
     uint32_t num; LARGE_INTEGER a;
-    explicit WorstDraw(uint32_t n) : num(n) { QueryPerformanceCounter(&a); }
-    ~WorstDraw() { LARGE_INTEGER b; QueryPerformanceCounter(&b); double ms = (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs; if (ms > g_worstDrawMs) { g_worstDrawMs = ms; g_worstVs = g_vsHash; g_worstNum = num; g_worstSurf = g_regs[R_SURFACE_INFO]; } }
+    explicit WorstDraw(uint32_t n) : num(n) { g_sCb = g_sVb = g_sIb = g_sCall = g_sRt = 0; QueryPerformanceCounter(&a); }
+    ~WorstDraw() { LARGE_INTEGER b; QueryPerformanceCounter(&b); double ms = (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs; if (ms > g_worstDrawMs) { g_worstDrawMs = ms; g_worstVs = g_vsHash; g_worstNum = num; g_worstSurf = g_regs[R_SURFACE_INFO]; g_wCb = g_sCb; g_wVb = g_sVb; g_wIb = g_sIb; g_wCall = g_sCall; g_wRt = g_sRt; } }
 };
 
 static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBase, uint32_t dmaSize) {
@@ -1585,6 +1626,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         (edram == 5 || (edram == 4 && ((g_regs[R_SURFACE_INFO] >> 16) & 3) != 0)) && fast_clear(edram == 4)) return;
 
     XShader* vs = build_shader(g_vsCode, true, 0xFFFFFFFFu);
+    g_vsHash = (uint32_t)((unsigned long long)vs->hash >> 32);
     uint32_t misc = g_regs[R_CONTEXT_MISC], pcntl = g_regs[R_PROGRAM_CNTL];
     uint32_t paramGen = ((pcntl >> 18) & 1) ? ((misc >> 8) & 0xFF) : 0xFFFFFFFFu;
     bool depthOnly = edram == 5;
@@ -1660,7 +1702,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     if (memcmp(rtvs, g_curRtv, sizeof(rtvs)) || dsv != g_curDsv) {
         ID3D11ShaderResourceView* nul[32] = {};
         g_ctx->PSSetShaderResources(0, 32, nul);
-        g_ctx->OMSetRenderTargets(4, rtvs, dsv);
+        { PerfScope t(g_sRt); g_ctx->OMSetRenderTargets(4, rtvs, dsv); }
         memcpy(g_curRtv, rtvs, sizeof(rtvs)); g_curDsv = dsv;
     }
 
@@ -1992,14 +2034,15 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         D3D11_MAP m = D3D11_MAP_WRITE_NO_OVERWRITE;
         if (g_ibPos + bytes > kIbRingSize) { g_ibPos = 0; m = D3D11_MAP_WRITE_DISCARD; }
         D3D11_MAPPED_SUBRESOURCE ms;
-        if (FAILED(g_ctx->Map(g_ibRing.Get(), 0, m, 0, &ms))) return;
+        HRESULT ibHr; { PerfScope t(g_sIb); ibHr = g_ctx->Map(g_ibRing.Get(), 0, m, 0, &ms); }
+        if (FAILED(ibHr)) return;
         memcpy((uint8_t*)ms.pData + g_ibPos, useIdx->data(), bytes);
         g_ctx->Unmap(g_ibRing.Get(), 0);
         g_ctx->IASetIndexBuffer(g_ibRing.Get(), DXGI_FORMAT_R32_UINT, g_ibPos);
         g_ibPos += bytes;
-        g_ctx->DrawIndexed(drawCount, 0, 0);
+        { PerfScope t(g_sCall); g_ctx->DrawIndexed(drawCount, 0, 0); }
     } else {
-        g_ctx->Draw(drawCount, 0);
+        PerfScope t(g_sCall); g_ctx->Draw(drawCount, 0);
     }
     {   // BCR2_DRAWPRINT=<surface info hex>, with BCR2_PROBEQLIGHT: a fingerprint of each draw to that target, to compare a frame's draws against another frame's
         static const char* kPrint = getenv("BCR2_DRAWPRINT");
@@ -2464,6 +2507,7 @@ void hw_watch_set(uint32_t phys);
 uint64_t gpu_frame_number() { return g_frame; }
 
 static void do_swap(uint32_t front) {
+    LARGE_INTEGER swapStart; QueryPerformanceCounter(&swapStart);
     mem_find();
     {   // BCR2_HWWATCH="frame:physical hex": name the game code that writes this word
         static const char* kHw = getenv("BCR2_HWWATCH");
@@ -2523,24 +2567,31 @@ static void do_swap(uint32_t front) {
     write_shot();
     HRESULT hr;
     LARGE_INTEGER presented; QueryPerformanceCounter(&presented);
+    g_swPrep = (double)(presented.QuadPart - swapStart.QuadPart) * g_perfTicksToMs;
     {   // A tick that follows the display can wait for its refresh: nothing piles up, and no frame is discarded when one arrives close to the deadline.
         if (gpu_vrr()) {
             // Hold the frame until a fixed time after its tick, so differences in render time don't reach the screen as uneven frame times.
             static const double kPhaseMs = getenv("BCR2_VRRPHASE") ? atof(getenv("BCR2_VRRPHASE")) : 14.0;
-            static uint64_t nLate = 0, nShown = 0; static double phaseSum = 0, phaseMax = 0;
+            static uint64_t nLate = 0, nShown = 0; static double phaseSum = 0, phaseMax = 0, holdLateMax = 0;
             LARGE_INTEGER ready; QueryPerformanceCounter(&ready);
             const long long tick = g_lastTickQpc.load();
             const double phase = tick ? (double)(ready.QuadPart - tick) * g_perfTicksToMs : 0;
             phaseSum += phase; phaseMax = std::max(phaseMax, phase); nShown++;
-            if (phase > kPhaseMs) nLate++;
-            else if (tick) {
-                const double left = kPhaseMs - phase;
-                if (left > 2.0) Sleep((DWORD)(left - 1.5));
-                for (;;) { LARGE_INTEGER q; QueryPerformanceCounter(&q); if ((double)(q.QuadPart - tick) * g_perfTicksToMs >= kPhaseMs) break; YieldProcessor(); }
+            // Never hold a frame past one frame time since the last present. One that finishes just after the next tick reads as early for that tick,
+            // and holding it to that tick's target would turn about 1 ms of lateness into a whole extra frame.
+            static long long lastPresent = 0;
+            const double sinceLast = lastPresent ? (double)(ready.QuadPart - lastPresent) * g_perfTicksToMs : 1e9;
+            const double wait = std::min(kPhaseMs - phase, 1000.0 / 60.0 - sinceLast);
+            if (wait <= 0 || !tick) nLate++;
+            else {
+                const long long until = ready.QuadPart + (long long)(wait / g_perfTicksToMs);
+                { PerfScope th(g_swHold); gpu_wait_until(until); }
+                LARGE_INTEGER q; QueryPerformanceCounter(&q); holdLateMax = std::max(holdLateMax, (double)(q.QuadPart - until) * g_perfTicksToMs);
             }
             QueryPerformanceCounter(&presented);
+            lastPresent = presented.QuadPart;
             { PerfScope perfPresent(g_tPresent); hr = g_swap->Present(0, (g_tearing && g_modeNow != kExclusive) ? DXGI_PRESENT_ALLOW_TEARING : 0); }
-            if (nShown >= 300) { fprintf(stderr, "[vrr] frame ready after its tick: avg=%.1f max=%.1f ms, past the %.1f ms target: %llu of %llu\n", phaseSum / nShown, phaseMax, kPhaseMs, (unsigned long long)nLate, (unsigned long long)nShown); nShown = nLate = 0; phaseSum = phaseMax = 0; }
+            if (nShown >= 300) { fprintf(stderr, "[vrr] frame ready after its tick: avg=%.1f max=%.1f ms, shown with no hold (target %.1f ms): %llu of %llu; latest wake: hold %.2f ms, tick %.2f ms\n", phaseSum / nShown, phaseMax, kPhaseMs, (unsigned long long)nLate, (unsigned long long)nShown, holdLateMax, g_tickLateMaxUs.exchange(0) / 1000.0); nShown = nLate = 0; phaseSum = phaseMax = holdLateMax = 0; }
         } else {
         static const int kForce = getenv("BCR2_PRESENTINTERVAL") ? atoi(getenv("BCR2_PRESENTINTERVAL")) : -1;
         UINT interval = kForce >= 0 ? (UINT)kForce : (g_presentFollowsDisplay.load() ? 1u : 0u);
@@ -2561,6 +2612,7 @@ static void do_swap(uint32_t front) {
         }
     }
     {
+        PerfScope tt(g_swTrack);
         track_output();
         note_display_stats(presented, g_frame);
     }
@@ -2577,11 +2629,11 @@ static void do_swap(uint32_t front) {
             if (ms > 20.0 && g_frame > 300) {
                 static int nSpike = 0;
                 if (nSpike++ < 20000)
-                    fprintf(stderr, "[spike] frame=%llu ms=%.1f draw=%.1f tex=%.1f res=%.1f pres=%.1f ring=%.1f reg=%.1f intr=%.1f compiles=%llu uploads=%llu upKB=%llu worst=%.1f vs=%016llX num=%u surf=%08X\n",
+                    fprintf(stderr, "[spike] frame=%llu ms=%.1f draw=%.1f tex=%.1f res=%.1f pres=%.1f ring=%.1f reg=%.1f intr=%.1f compiles=%llu uploads=%llu upKB=%llu worst=%.1f vs=%08llX num=%u surf=%08X wcb=%.1f wvb=%.1f wib=%.1f wcall=%.1f wrt=%.1f prep=%.1f hold=%.1f track=%.1f\n",
                             (unsigned long long)g_frame, ms, g_tDraw >= pD ? g_tDraw - pD : g_tDraw, g_tTex >= pT ? g_tTex - pT : g_tTex,
                             g_tResolve >= pR ? g_tResolve - pR : g_tResolve, g_tPresent >= pP ? g_tPresent - pP : g_tPresent,
                             (w0 >= pW0 ? w0 - pW0 : w0) * g_perfTicksToMs, (w1 >= pW1 ? w1 - pW1 : w1) * g_perfTicksToMs, (w2 >= pW2 ? w2 - pW2 : w2) * g_perfTicksToMs,
-                            (unsigned long long)(g_nCompiles - pCompiles), (unsigned long long)(g_nUploads - pUploads), (unsigned long long)((g_upBytes - pUpBytes) / 1024), worstDraw, (unsigned long long)g_worstVs, g_worstNum, g_worstSurf);
+                            (unsigned long long)(g_nCompiles - pCompiles), (unsigned long long)(g_nUploads - pUploads), (unsigned long long)((g_upBytes - pUpBytes) / 1024), worstDraw, (unsigned long long)g_worstVs, g_worstNum, g_worstSurf, g_wCb, g_wVb, g_wIb, g_wCall, g_wRt, g_swPrep, g_swHold, g_swTrack);
             }
             pD = g_tDraw; pT = g_tTex; pR = g_tResolve; pP = g_tPresent; pW0 = w0; pW1 = w1; pW2 = w2; pCompiles = g_nCompiles; pUploads = g_nUploads; pUpBytes = g_upBytes;
         }

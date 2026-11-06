@@ -682,7 +682,7 @@ static void vblank_thread() {
 }
 
 // ---- vsync: calls the game's graphics interrupt callback (source 0) 60 times a second ----
-bool gpu_vrr(); void gpu_note_tick();
+bool gpu_vrr(); void gpu_note_tick(); void gpu_wait_until(long long qpc); void gpu_note_tick_late(int us);
 static void vsync_thread(uint8_t* base) {
     const uint32_t PCR = 0x7E000000, TOBJ = 0x7E010000, STK = 0x7E100000, STKSZ = 0x40000;
     VirtualAlloc(base + PCR, 0x20000, MEM_COMMIT, PAGE_READWRITE);
@@ -704,7 +704,9 @@ static void vsync_thread(uint8_t* base) {
         } else {
             // Sleep until about 2 ms before the tick, then yield up to it. Sleeping the whole way adds up to 1 ms of jitter per frame.
             auto left = next - std::chrono::steady_clock::now();
-            if (left > std::chrono::milliseconds(2)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (gpu_vrr()) {                                  // a timer that wakes on time: being late here is a whole missed frame
+                if (left > std::chrono::steady_clock::duration::zero()) { LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f); gpu_wait_until(q.QuadPart + std::chrono::duration_cast<std::chrono::microseconds>(left).count() * f.QuadPart / 1000000); }
+            } else if (left > std::chrono::milliseconds(2)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
             else if (left > std::chrono::steady_clock::duration::zero()) std::this_thread::yield();
         }
         if (!g_gpu.intrCb) continue;
@@ -718,8 +720,11 @@ static void vsync_thread(uint8_t* base) {
             next = synced ? now + kTick : next + kTick;
             if (gpu_vrr()) {                                  // exactly 1/60 s: whole ticks from a start time, so the rounding in kTick cannot accumulate
                 static auto start = now; static long long k = 0;
+                static auto lastDue = now;
                 next = start + std::chrono::nanoseconds(++k * 1000000000ll / 60);
                 if (next < now) { start = now; k = 1; next = start + std::chrono::nanoseconds(1000000000ll / 60); }   // after a stall, start over
+                gpu_note_tick_late((int)std::chrono::duration_cast<std::chrono::microseconds>(now - lastDue).count());
+                lastDue = next;
                 gpu_note_tick();
             }
             if (next < now) next = now + kTick;
@@ -1664,6 +1669,8 @@ static void ObReferenceObjectByHandle_(PPCContext& ctx, uint8_t* base) {
 }
 
 // ---- thread configuration (object-pointer based) ----
+// Quit from the game's menu: on the console this returns to the dashboard. There is nothing to return to here, so end the process.
+static void XamLoaderLaunchTitle_(PPCContext& ctx, uint8_t*) { fprintf(stderr, "[exit] game asked to leave (lr=%08X)\n", (uint32_t)ctx.lr); fflush(stderr); ExitProcess(0); }
 static void KeSetAffinityThread_(PPCContext& ctx, uint8_t* base) {
     if (ctx.r5.u32) wr32(base, ctx.r5.u32, 0);     // previous affinity
     ctx.r3.u64 = 0;
@@ -2277,6 +2284,7 @@ void register_all_imports() {
     register_by_name("NtResumeThread",  NtResumeThread_);
     register_by_name("ObReferenceObjectByHandle", ObReferenceObjectByHandle_);
     register_by_name("ObDereferenceObject",       NoOp_);
+    register_by_name("XamLoaderLaunchTitle",    XamLoaderLaunchTitle_);
     register_by_name("KeSetAffinityThread",     KeSetAffinityThread_);
     register_by_name("KeSetBasePriorityThread", KeSetBasePriorityThread_);
     register_by_name("KeResumeThread",           KeResumeThread_);

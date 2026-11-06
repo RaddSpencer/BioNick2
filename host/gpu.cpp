@@ -1694,6 +1694,15 @@ static void compute_scissor(int& x0, int& y0, int& x1, int& y1) {
     x0 = std::max(x0, 0); y0 = std::max(y0, 0); x1 = std::max(x1, x0); y1 = std::max(y1, y0);
 }
 
+// From EDRAM rows, as compute_scissor and resolves work in, to where the host keeps them: the negative of an active window offset.
+static void host_tile_shift(int& x, int& y) {
+    x = y = 0;
+    if ((g_regs[R_MODE_CNTL] >> 16) & 1) {
+        uint32_t wo = g_regs[R_WINDOW_OFFSET];
+        x = -sext(wo & 0x7FFF, 15); y = -sext((wo >> 16) & 0x7FFF, 15);
+    }
+}
+
 // BCR2_WATCHSURF="hexbase,x,y": during the traced frame, log whenever that pixel of that resolved surface has changed.
 static void watch_surface(const char* where) {
     static const char* e = getenv("BCR2_WATCHSURF");
@@ -2121,10 +2130,9 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     float xs = (vte & 1) ? reg_f(R_VPORT_XSCALE) : 1, xo = (vte & 2) ? reg_f(R_VPORT_XSCALE + 1) : 0;
     float ys = (vte & 4) ? reg_f(R_VPORT_XSCALE + 2) : 1, yo = (vte & 8) ? reg_f(R_VPORT_XSCALE + 3) : 0;
     float zs = (vte & 16) ? reg_f(R_VPORT_XSCALE + 4) : 1, zo = (vte & 32) ? reg_f(R_VPORT_XSCALE + 5) : 0;
-    if ((mode >> 16) & 1) {
-        uint32_t wo = g_regs[R_WINDOW_OFFSET];
-        xo += sext(wo & 0x7FFF, 15); yo += sext((wo >> 16) & 0x7FFF, 15);
-    }
+    // A window offset does not move anything on the host: each tile stays at its real screen rows and the resolve reads it from there (host_tile_shift).
+    // Tiled depth passes are matched later by an untiled pass with depth EQUAL. Shifted geometry, in the transform or by the viewport, gets slightly
+    // different depth, and the lower tile speckled where the test missed.
     // Half a host pixel, not half a guest pixel: at a higher scale the larger shift would leave the first row and column of fullscreen passes unwritten.
     if (!(g_regs[R_VTX_CNTL] & 1)) { xo += 0.5f / g_resScale; yo += 0.5f / g_resScale; }
     cb.vpNdc[0] = xs * 2.0f / rw; cb.vpNdc[1] = -ys * 2.0f / rh; cb.vpNdc[2] = xo * 2.0f / rw - 1.0f; cb.vpNdc[3] = 1.0f - yo * 2.0f / rh;
@@ -2189,6 +2197,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     D3D11_VIEWPORT vp{ 0, 0, (float)(rw * g_resScale), (float)(rh * g_resScale), 0, 1 };
     g_ctx->RSSetViewports(1, &vp);
     int sx0, sy0, sx1, sy1; compute_scissor(sx0, sy0, sx1, sy1);
+    { int hx, hy; host_tile_shift(hx, hy); sx0 += hx; sx1 += hx; sy0 += hy; sy1 += hy; }
     D3D11_RECT sc{ sx0 * g_resScale, sy0 * g_resScale, std::min(sx1, (int)rw) * g_resScale, std::min(sy1, (int)rh) * g_resScale };
     g_ctx->RSSetScissorRects(1, &sc);
 
@@ -2422,6 +2431,7 @@ static void do_resolve() {
     int pa = (int)(pitch & ~7u);
     x1 = std::min(x1, pa); x0 = std::min(x0, pa);
     if (x1 <= x0 || y1 <= y0) return;
+    int hostX, hostY; host_tile_shift(hostX, hostY);
 
     uint32_t destBase = g_regs[R_COPY_DEST_BASE] & 0x1FFFFFFFu, destPitch = g_regs[R_COPY_DEST_PITCH] & 0x3FFF, destH = (g_regs[R_COPY_DEST_PITCH] >> 16) & 0x3FFF;
     uint32_t di = g_regs[R_COPY_DEST_INFO];
@@ -2462,10 +2472,11 @@ static void do_resolve() {
         if (!sf) sf = make_surface(destBase, destPitch, std::max(destH ? destH : (uint32_t)y1, 1u), bytes, fmt);
         if (sf) {
             const int rs = g_resScale;
+            const int srcX = (x0 + hostX) * rs, srcY = (y0 + hostY) * rs;
             int dx0 = x0 + ox, dy0 = y0 + oy, dx1 = x1 + ox, dy1 = y1 + oy;
-            blit(src->srv.Get(), isDepth ? g_psBlitDepth.Get() : g_psBlit.Get(), sf->rtv.Get(), sf->w * rs, sf->h * rs, dx0 * rs, dy0 * rs, std::min(dx1, (int)sf->w) * rs, std::min(dy1, (int)sf->h) * rs, x0 * rs, y0 * rs, destSwap && !isDepth);
+            blit(src->srv.Get(), isDepth ? g_psBlitDepth.Get() : g_psBlit.Get(), sf->rtv.Get(), sf->w * rs, sf->h * rs, dx0 * rs, dy0 * rs, std::min(dx1, (int)sf->w) * rs, std::min(dy1, (int)sf->h) * rs, srcX, srcY, destSwap && !isDepth);
             if (isDepth && sf->rawRtv)
-                blit(src->srv.Get(), g_psBlitRaw.Get(), sf->rawRtv.Get(), sf->w * rs, sf->h * rs, dx0 * rs, dy0 * rs, std::min(dx1, (int)sf->w) * rs, std::min(dy1, (int)sf->h) * rs, x0 * rs, y0 * rs, false, 1, 1, src->stencilSrv.Get());
+                blit(src->srv.Get(), g_psBlitRaw.Get(), sf->rawRtv.Get(), sf->w * rs, sf->h * rs, dx0 * rs, dy0 * rs, std::min(dx1, (int)sf->w) * rs, std::min(dy1, (int)sf->h) * rs, srcX, srcY, false, 1, 1, src->stencilSrv.Get());
             sf->guestHash = guest_sample_hash(sf->base, sf->end - sf->base);
             sf->swapped = destSwap && !isDepth;
         }
@@ -2473,7 +2484,7 @@ static void do_resolve() {
     if (colorClear && colorSrc) {
         uint32_t cv = g_regs[R_COLOR_CLEAR];
         float col[4] = { ((cv >> 16) & 255) / 255.0f, ((cv >> 8) & 255) / 255.0f, (cv & 255) / 255.0f, (cv >> 24) / 255.0f };
-        D3D11_RECT r{ x0 * g_resScale, y0 * g_resScale, x1 * g_resScale, y1 * g_resScale };
+        D3D11_RECT r{ (x0 + hostX) * g_resScale, (y0 + hostY) * g_resScale, (x1 + hostX) * g_resScale, (y1 + hostY) * g_resScale };
         if (g_ctx1) g_ctx1->ClearView(colorSrc->rtv.Get(), col, &r, 1);
         else g_ctx->ClearRenderTargetView(colorSrc->rtv.Get(), col);
     }

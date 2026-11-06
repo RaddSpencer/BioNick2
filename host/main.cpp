@@ -226,16 +226,49 @@ void hw_watch_set(uint32_t phys) {   // from a helper thread, since a running th
     if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); }
 }
 
+// BCR2_HWREADS: up to four full guest addresses, watched for reads and writes. The log's slot says which one fired.
+static uint32_t g_hwReads[4];
+static DWORD WINAPI hw_reads_thread(LPVOID) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te{}; te.dwSize = sizeof te;
+    int n = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        SuspendThread(t);
+        CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(t, &c)) {
+            DWORD64* dr[4] = { &c.Dr0, &c.Dr1, &c.Dr2, &c.Dr3 };
+            c.Dr7 = 0;
+            for (int i = 0; i < 4; i++) if (g_hwReads[i]) { *dr[i] = (DWORD64)(g_base + g_hwReads[i]); c.Dr7 |= (1ull << (i * 2)) | (0xFull << (16 + i * 4)); }
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (SetThreadContext(t, &c)) n++;
+        }
+        ResumeThread(t);
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    fprintf(stderr, "[hwwatch] reads of %08X %08X %08X %08X armed on %d threads\n", g_hwReads[0], g_hwReads[1], g_hwReads[2], g_hwReads[3], n);
+    return 0;
+}
+void hw_watch_reads(const uint32_t* a, int n) {
+    for (int i = 0; i < 4; i++) g_hwReads[i] = i < n ? a[i] : 0;
+    HANDLE h = CreateThread(nullptr, 0, hw_reads_thread, nullptr, 0, nullptr);
+    if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); }
+}
+
 static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
-    if (code == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 7)) {
+    if (code == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 0xF)) {
         static std::atomic<int> logged{0};
+        const unsigned slots = (unsigned)(ep->ContextRecord->Dr6 & 0xF);
         ep->ContextRecord->Dr6 = 0;
         static const uint32_t kSkipLr = getenv("BCR2_HWSKIPLR") ? (uint32_t)strtoul(getenv("BCR2_HWSKIPLR"), nullptr, 16) : 0;   // leave out hits from this return address
         const bool skip = kSkipLr && g_ctx && (uint32_t)g_ctx->lr == kSkipLr;
-        if (!skip && logged++ < 60) {
+        if (!skip && logged++ < (g_hwReads[0] ? 2000 : 60)) {
             uint32_t lr = g_ctx ? (uint32_t)g_ctx->lr : 0, sp = g_ctx ? g_ctx->r1.u32 : 0;
-            fprintf(stderr, "[hwwatch] thread=%lu rip+%llX lr=%08X r1=%08X r3=%08X r4=%08X r5=%08X bt:", GetCurrentThreadId(), (unsigned long long)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)GetModuleHandleW(nullptr)), lr, sp, g_ctx ? g_ctx->r3.u32 : 0, g_ctx ? g_ctx->r4.u32 : 0, g_ctx ? g_ctx->r5.u32 : 0);
+            fprintf(stderr, "[hwwatch] slots=%X thread=%lu rip+%llX lr=%08X r1=%08X r3=%08X r4=%08X r5=%08X bt:", slots, GetCurrentThreadId(), (unsigned long long)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)GetModuleHandleW(nullptr)), lr, sp, g_ctx ? g_ctx->r3.u32 : 0, g_ctx ? g_ctx->r4.u32 : 0, g_ctx ? g_ctx->r5.u32 : 0);
             for (int k = 0; k < 10 && sp >= 0x40000000u && sp < 0x80000000u; k++) {
                 uint32_t cs = _byteswap_ulong(*(uint32_t*)(g_base + sp));
                 if (cs <= sp || cs - sp > 0x100000 || cs >= 0x80000000u) break;

@@ -586,6 +586,74 @@ PPC_FUNC(sub_82634458) {
     __imp__sub_82634458(ctx, base);
 }
 
+// The game's memset. The recompiler ended it at its first conditional return (bdzlr at 827E9BBC) and made the rest a separate function that nothing calls, so
+// sizes leaving 2 or 3 bytes after the last whole word left those bytes unwritten. The sound engine's avoid-repeat bitmap is 2 bytes: its second byte kept garbage,
+// which marked entries as already played, so the picker ran off the end of its list and half of the voice lines never started. This is the whole function.
+PPC_FUNC(sub_827E9B30) {
+    memset(base + ctx.r3.u32, ctx.r4.u8, ctx.r5.u32);
+}
+// BCR2_RANSEQLOG: the sound engine's random and sequence containers: what each one picked. sub_82792340 picks an index, sub_82792918 turns it into a child object.
+// Objects carry their id at +12. sub_82767E28 finds an object by id, which shows whether the id it was handed exists.
+extern "C" void __imp__sub_82792918(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82792918) {
+    static const bool kLog = getenv("BCR2_RANSEQLOG") != nullptr;
+    if (!kLog) { __imp__sub_82792918(ctx, base); return; }
+    const uint32_t self = ctx.r3.u32, idxOut = ctx.r5.u32, idOut = ctx.r6.u32, sp = ctx.r1.u32;
+    __imp__sub_82792918(ctx, base);
+    const uint32_t node = ctx.r3.u32;
+    fprintf(stderr, "[ranseq] f=%llu container=%08X mode=%02X%02X avoid=%u -> index=%u id=%08X node=%08X nodeid=%08X sp=%08X\n", (unsigned long long)gpu_frame_number(), PPC_LOAD_U32(self + 12), base[self + 278], base[self + 279], (unsigned)PPC_LOAD_U16(self + 276), (unsigned)PPC_LOAD_U16(idxOut), PPC_LOAD_U32(idOut), node, node ? PPC_LOAD_U32(node + 12) : 0, sp);
+}
+extern "C" void __imp__sub_82792050(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82792050) {
+    static const bool kLog = getenv("BCR2_RANSEQLOG") != nullptr;
+    if (!kLog) { __imp__sub_82792050(ctx, base); return; }
+    const uint32_t self = ctx.r3.u32, before = PPC_LOAD_U32(self + 260);
+    __imp__sub_82792050(ctx, base);
+    const uint32_t st = ctx.r3.u32;
+    fprintf(stderr, "[ranseq] state of %08X: was %08X now %08X returned %08X", PPC_LOAD_U32(self + 12), before, PPC_LOAD_U32(self + 260), st);
+    if (st) fprintf(stderr, " fields total=%u remaining=%u played=%u", PPC_LOAD_U32(st + 16), (unsigned)PPC_LOAD_U16(st + 20), (unsigned)PPC_LOAD_U16(st + 22));
+    fprintf(stderr, "\n");
+}
+extern "C" void __imp__sub_82792340(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82792340) {
+    static const bool kLog = getenv("BCR2_RANSEQLOG") != nullptr;
+    if (!kLog) { __imp__sub_82792340(ctx, base); return; }
+    const uint32_t self = ctx.r3.u32, st = ctx.r4.u32, flag = ctx.r5.u32;
+    __imp__sub_82792340(ctx, base);
+    fprintf(stderr, "[ranseq] pick in %08X: index=%u ok=%u remaining=%u played=%u\n", PPC_LOAD_U32(self + 12), ctx.r3.u32, (unsigned)base[flag], (unsigned)PPC_LOAD_U16(st + 20), (unsigned)PPC_LOAD_U16(st + 22));
+}
+extern "C" void __imp__sub_82791800(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82791800) {
+    static const bool kLog = getenv("BCR2_RANSEQLOG") != nullptr;
+    if (!kLog) { __imp__sub_82791800(ctx, base); return; }
+    const uint32_t self = ctx.r3.u32, count = ctx.r4.u32;
+    __imp__sub_82791800(ctx, base);
+    fprintf(stderr, "[ranseq] create state for %08X count=%u -> %08X\n", PPC_LOAD_U32(self + 12), count, ctx.r3.u32);
+}
+extern "C" void __imp__sub_827915E0(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_827915E0) {
+    static const bool kLog = getenv("BCR2_RANSEQLOG") != nullptr;
+    if (!kLog) { __imp__sub_827915E0(ctx, base); return; }
+    const uint32_t self = ctx.r3.u32, st = ctx.r4.u32, idx = ctx.r5.u32, played = PPC_LOAD_U32(st + 36), avoid = PPC_LOAD_U32(st + 40);
+    const uint8_t pb = base[played], ab = base[avoid];
+    __imp__sub_827915E0(ctx, base);
+    fprintf(stderr, "[ranseq]   %08X available(%u) = %08X (raw r3 %016llX) played@%08X=%02X avoid@%08X=%02X\n", PPC_LOAD_U32(self + 12), idx, ctx.r3.u32, (unsigned long long)ctx.r3.u64, played, pb, avoid, ab);
+}
+extern "C" void __imp__sub_827ED460(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_827ED460) {
+    static const bool kLog = getenv("BCR2_RANSEQLOG") != nullptr;
+    const uint32_t lr = (uint32_t)ctx.lr;
+    __imp__sub_827ED460(ctx, base);
+    if (kLog && lr >= 0x82792340u && lr < 0x82792900u) fprintf(stderr, "[ranseq]   rand() = %u (raw %016llX) lr %08X\n", ctx.r3.u32, (unsigned long long)ctx.r3.u64, lr);
+}
+extern "C" void __imp__sub_82767E28(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82767E28) {
+    static const bool kLog = getenv("BCR2_RANSEQLOG") != nullptr;
+    if (!kLog) { __imp__sub_82767E28(ctx, base); return; }
+    const uint32_t id = ctx.r4.u32, lr = (uint32_t)ctx.lr;
+    __imp__sub_82767E28(ctx, base);
+    if (lr >= 0x82790000u && lr < 0x82794000u) fprintf(stderr, "[ranseq] lookup id=%08X -> %08X (lr %08X)\n", id, ctx.r3.u32, lr);
+}
 // A stub the recompiler has no entry for: the function before it ends in a no-return call, so analysis
 // missed the boundary. Its three siblings at 82394938.. have entries. Only ever reached through a pointer.
 //   li r6,0x80 ; li r5,9 ; addi r3,r3,0x88 ; b 0x82371540

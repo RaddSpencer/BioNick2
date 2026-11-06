@@ -2714,6 +2714,14 @@ static void update_display() {
 // BCR2_MEMFIND="frame:HEX,HEX,...": at that frame, list every guest address holding one of these big-endian words, with the words around it.
 // Use it to walk from a value seen in a draw back to the game object that holds it, and from there to whatever points at that object.
 static void mem_find() {
+    // BCR2_MEMSAVE="frame:hexaddr:hexlen:path" writes that guest memory to a file, to compare with what it was loaded from.
+    static const char* const kSave = getenv("BCR2_MEMSAVE");
+    if (kSave) {
+        unsigned long long fr = 0; unsigned addr = 0, len = 0; int used = 0;
+        if (sscanf(kSave, "%llu:%x:%x:%n", &fr, &addr, &len, &used) == 3 && used && g_frame == fr) {
+            if (FILE* f = fopen(kSave + used, "wb")) { fwrite(g_base + addr, 1, len, f); fclose(f); fprintf(stderr, "[memsave] f=%llu %08X +%X\n", fr, addr, len); }
+        }
+    }
     static const char* kFind = getenv("BCR2_MEMFIND");
     if (!kFind) return;
     static const uint64_t kFrame = _strtoui64(kFind, nullptr, 10);
@@ -2745,6 +2753,7 @@ static void mem_find() {
 }
 
 void hw_watch_set(uint32_t phys);
+void hw_watch_reads(const uint32_t* a, int n);
 uint64_t gpu_frame_number() { return g_frame; }
 
 static void do_swap(uint32_t front) {
@@ -2758,6 +2767,13 @@ static void do_swap(uint32_t front) {
     {   // BCR2_HWWATCH="frame:physical hex": name the game code that writes this word
         static const char* kHw = getenv("BCR2_HWWATCH");
         if (kHw && g_frame == _strtoui64(kHw, nullptr, 10)) if (const char* p = strchr(kHw, ':')) hw_watch_set((uint32_t)strtoul(p + 1, nullptr, 16));
+    }
+    {   // BCR2_HWREADS="frame:hex,hex,..": which code reads these guest words, up to four
+        static const char* kRd = getenv("BCR2_HWREADS");
+        if (kRd && g_frame == _strtoui64(kRd, nullptr, 10)) if (const char* p = strchr(kRd, ':')) {
+            uint32_t a[4]; int n = 0; while (n < 4 && (*p == ':' || *p == ',')) { char* e; a[n++] = (uint32_t)strtoul(p + 1, &e, 16); p = e; }
+            hw_watch_reads(a, n);
+        }
     }
     update_display();
     static const int64_t kDumpCount = getenv("BCR2_DUMPCOUNT") ? _atoi64(getenv("BCR2_DUMPCOUNT")) : 1;   // that many consecutive frames, to compare stages between frames

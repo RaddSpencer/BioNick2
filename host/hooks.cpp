@@ -526,7 +526,7 @@ PPC_FUNC(sub_82634458) {
         static std::atomic<uint64_t> nextPc{ 200 };
         static bool installed = false;
         uint64_t due = nextPc.load(), f = gpu_frame_number();
-        if (kPcMenu && !inside && f >= due && nextPc.compare_exchange_strong(due, f + (installed ? 10 : 30))) {
+        if (kPcMenu && !inside && f >= due && nextPc.compare_exchange_strong(due, f + (installed ? 4 : 30))) {
             inside = true;
             const PPCContext saved = ctx;
             const uint32_t L = saved.r3.u32, funcOff = saved.r4.u32 - PPC_LOAD_U32(L + 32);

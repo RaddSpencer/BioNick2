@@ -1,4 +1,5 @@
 #include "upgradecycle.h"
+#include "settings.h"
 #include "ppc_config.h"
 #include "ppc_context.h"
 #include "guestfp.h"
@@ -1867,6 +1868,7 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t* base) {
             *(uint16_t*)(base + st + 14) = _byteswap_ushort((uint16_t)g.sThumbRY);
         }
     }
+    if (st) settings_capture_filter(base + st);   // Controls screen: swallow the buttons that can be assigned, and note which one was pressed
     if (st) upgrades_poll_pad(_byteswap_ushort(*(uint16_t*)(base + st + 4)), base[st + 6], base[st + 7]);   // the upgrade cycle buttons (upgradecycle.cpp), whichever inputs they are bound to
     ctx.r3.u64 = 0;
 }

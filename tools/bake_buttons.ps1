@@ -16,15 +16,15 @@ $sets = [ordered]@{
     xbox = @{ dir = 'Xbox Series'; files = @{
         a = 'xbox_button_color_a'; b = 'xbox_button_color_b'; x = 'xbox_button_color_x'; y = 'xbox_button_color_y'
         lb = 'xbox_lb'; rb = 'xbox_rb'; lt = 'xbox_lt'; rt = 'xbox_rt'; back = 'xbox_button_back_icon'; start = 'xbox_button_start_icon'
-        lstick = 'xbox_stick_l'; rstick = 'xbox_stick_r' } }
+        lstick = 'xbox_stick_side_l'; rstick = 'xbox_stick_side_r' } }
     playstation = @{ dir = 'PlayStation Series'; files = @{
         a = 'playstation_button_color_cross'; b = 'playstation_button_color_circle'; x = 'playstation_button_color_square'; y = 'playstation_button_color_triangle'
         lb = 'playstation_trigger_l1'; rb = 'playstation_trigger_r1'; lt = 'playstation_trigger_l2'; rt = 'playstation_trigger_r2'
-        back = 'playstation5_button_create'; start = 'playstation5_button_options'; lstick = 'playstation_stick_l'; rstick = 'playstation_stick_r' } }
+        back = 'playstation5_button_create'; start = 'playstation5_button_options'; lstick = 'playstation_stick_side_l'; rstick = 'playstation_stick_side_r' } }
     switch = @{ dir = 'Nintendo Switch'; files = @{
         a = 'switch_button_b'; b = 'switch_button_a'; x = 'switch_button_y'; y = 'switch_button_x'
         lb = 'switch_button_l'; rb = 'switch_button_r'; lt = 'switch_button_zl'; rt = 'switch_button_zr'
-        back = 'switch_button_minus'; start = 'switch_button_plus'; lstick = 'switch_stick_l'; rstick = 'switch_stick_r' } }
+        back = 'switch_button_minus'; start = 'switch_button_plus'; lstick = 'switch_stick_side_l'; rstick = 'switch_stick_side_r' } }
 }
 New-Item -ItemType Directory -Force $Out | Out-Null
 foreach ($name in $sets.Keys) {

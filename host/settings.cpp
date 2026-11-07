@@ -154,6 +154,8 @@ local STR = {
   bcr_pc_swap = "Swap Confirm & Cancel",
   bcr_exit_q = "Exit without saving changes?",
   bcr_exit_cap = "Controls",
+  bcr_restart_q = "Some changes need a restart. Save and restart now?",
+  bcr_restart_cap = "Restart",
   bcr_yes = "Yes",
   bcr_no = "No",
   bcr_back = "Exit",
@@ -300,6 +302,7 @@ local function toggle_item(key, text, options)
   for _, o in ipairs(options) do item[#item + 1] = { _meta = "option", value = o[1], text_id = o[2] } end
   return item
 end
+local RESTART_KEYS = { scale = true, outres = true, vrr = true }
 local function wire_items(node)
   for _, it in ipairs(node._items) do
     local key = it._parameters.bcr_key
@@ -311,6 +314,7 @@ local function wire_items(node)
           return
         end
         Global.bcr_pc[key] = v
+        if RESTART_KEYS[key] then Global.bcr_restart_pending = true end
         if key == "buttons" and Global.bcr_set_labels then Global.bcr_set_labels(v) end
         push(key, v)
         Global.bcr_apply_binds()
@@ -326,6 +330,8 @@ local function wire_items(node)
     end
   end
 end
+)LUA"
+R"LUA(
 local function build(kind, menu, name, header, items, default_name, with_reset, straight, plain)
   local data = { _meta = "node", name = name }
   local flat = kind == "pause" or straight
@@ -352,7 +358,21 @@ if P and not rawget(P, "bcr_orig_init") then
       parameters.row_item_font = "fonts/merged_bcfont_44"
       parameters._stripe_panel_y = 0
     end
+    local om0 = managers.menu and managers.menu._open_menus
+    local in_pause = om0 and om0[#om0] and om0[#om0].name == "menu_pause" and np and np.name ~= "bcr_controls"
+    if in_pause and type(parameters) == "table" then
+      parameters._stripe_panel_y = 0
+      parameters._stripe_panel_height = 720
+    end
     local r = orig(self, node, layer, parameters, ...)
+    if in_pause and self.item_panel and self._stripe_header then
+      local n = 0
+      for _ in ipairs(self.row_items or {}) do n = n + 1 end
+      local top = math.max(20, (720 - (90 + n * 31)) / 2)
+      self._stripe_header:set_y(top)
+      self.item_panel:set_y(top + 90)
+      if np.name == "bcr_gamma" and self._stripe_background then self._stripe_background:set_color(Color(1, 0, 0, 0)) end
+    end
     if np and np.name == "bcr_controls" and self.item_panel and self.row_items then
       local y = 0
       for _, ri in ipairs(self.row_items) do
@@ -383,9 +403,11 @@ for g = 50, 150, 5 do
   STR["bcr_gm_" .. g] = string.format("%.2f", g / 100)
   GAMMA_OPTIONS[#GAMMA_OPTIONS + 1] = { tostring(g), "bcr_gm_" .. g }
 end
-local function gfx_items()
+local function gfx_items(kind)
   local items = {}
-  for _, d in ipairs(GFX) do items[#items + 1] = toggle_item(d.key, d.text, d.options) end
+  for _, d in ipairs(GFX) do
+    if not (kind == "pause" and RESTART_KEYS[d.key]) then items[#items + 1] = toggle_item(d.key, d.text, d.options) end
+  end
   items[#items + 1] = { _meta = "item", name = "bcr_gamma_open", text_id = "bcr_pc_gamma", next_node = "bcr_gamma" }
   return items
 end
@@ -399,8 +421,9 @@ local function extend_settings(menu)
   data[#data + 1] = { _meta = "default_item", name = "bcr_graphics_open" }
   local tmp = MenuNode:new(data)
   wire_items(tmp)
-  for _, it in ipairs(tmp._items) do
-    if sn.add_item then sn:add_item(it) else sn._items[#sn._items + 1] = it end
+  for i, it in ipairs(tmp._items) do
+    if i == 1 then table.insert(sn._items, 1, it)
+    elseif sn.add_item then sn:add_item(it) else sn._items[#sn._items + 1] = it end
   end
   local mod = sn._parameters.modifier
   if type(mod) ~= "table" then mod = {} sn._parameters.modifier = mod end
@@ -435,7 +458,7 @@ end
 for _, which in ipairs({ { "main", main }, { "pause", pause } }) do
   local kind, menu = which[1], which[2]
   if menu and menu.data and menu.data._nodes then
-    menu.data._nodes.graphics_settings = build(kind, menu, "graphics_settings", "bcr_pc_settings", gfx_items(), "bcr_display", false)
+    menu.data._nodes.graphics_settings = build(kind, menu, "graphics_settings", "bcr_pc_settings", gfx_items(kind), "bcr_display", false)
     menu.data._nodes.bcr_gamma = build(kind, menu, "bcr_gamma", "bcr_pc_gamma", { toggle_item("gamma", "bcr_pc_gamma", GAMMA_OPTIONS) }, "bcr_gamma", false, true, true)
     extend_settings(menu)
     menu.data._nodes.bcr_controls = build(kind, menu, "bcr_controls", "bcr_controls", control_items(), "bcr_b_jump", true, true)
@@ -450,9 +473,9 @@ for _, which in ipairs({ { "main", main }, { "pause", pause } }) do
   end
 end
 local dlg = reg.menu_dialog
-if dlg and dlg.data and dlg.data._nodes and tweak_data and tweak_data.menu and tweak_data.menu.dialog then
-  tweak_data.menu.dialog.bcr_confirm_exit = { caption_id = "bcr_exit_cap", dialog_type = "popup", fade_in = true, fade_in_delay = 0.3, fade_in_speed = 1.5, text_id = "bcr_exit_q" }
-  local data = { _meta = "node", name = "bcr_confirm_exit", config = "bcr_confirm_exit", back_item = "bcr_no" }
+local function make_dialog(name, cap_id, text_id, yes_fn)
+  tweak_data.menu.dialog[name] = { caption_id = cap_id, dialog_type = "popup", fade_in = true, fade_in_delay = 0.3, fade_in_speed = 1.5, text_id = text_id }
+  local data = { _meta = "node", name = name, config = name, back_item = "bcr_no" }
   data[1] = { _meta = "item", name = "bcr_yes", text_id = "bcr_yes" }
   data[2] = { _meta = "item", name = "bcr_no", text_id = "bcr_no" }
   data[3] = { _meta = "default_item", name = "bcr_no" }
@@ -463,11 +486,10 @@ if dlg and dlg.data and dlg.data._nodes and tweak_data and tweak_data.menu and t
   for _, it in ipairs(dn._items) do
     if it._parameters.name == "bcr_yes" then
       it._parameters.callback = { function()
-        Global.bcr_reset_defaults()
         local om = managers.menu._open_menus
         local under = om and om[#om - 1]
         close_dialog()
-        if under and under.logic and under.logic.navigate_back then under.logic:navigate_back(true) end
+        yes_fn(under)
       end }
     else
       it._parameters.callback = { close_dialog }
@@ -475,7 +497,14 @@ if dlg and dlg.data and dlg.data._nodes and tweak_data and tweak_data.menu and t
   end
   dn._parameters.back_callback = { close_dialog }
   if dlg.callback_handler then dn:set_callback_handler(dlg.callback_handler) end
-  dlg.data._nodes.bcr_confirm_exit = dn
+  dlg.data._nodes[name] = dn
+end
+if dlg and dlg.data and dlg.data._nodes and tweak_data and tweak_data.menu and tweak_data.menu.dialog then
+  make_dialog("bcr_confirm_exit", "bcr_exit_cap", "bcr_exit_q", function(under)
+    Global.bcr_reset_defaults()
+    if under and under.logic and under.logic.navigate_back then under.logic:navigate_back(true) end
+  end)
+  make_dialog("bcr_restart_prompt", "bcr_restart_cap", "bcr_restart_q", function() push("restart", "1") end)
 end
 return "installed"
 )LUA";
@@ -488,7 +517,7 @@ local m = r and r.menu_main
 if not (m and m.data and m.data._nodes) then return nil end
 if not (m.data._nodes.graphics_settings and m.data._nodes.bcr_controls) then return "reinstall" end
 local dg = r.menu_dialog
-if dg and dg.data and dg.data._nodes and not dg.data._nodes.bcr_confirm_exit then return "reinstall" end
+if dg and dg.data and dg.data._nodes and not (dg.data._nodes.bcr_confirm_exit and dg.data._nodes.bcr_restart_prompt) then return "reinstall" end
 local om = managers.menu._open_menus
 local top = om and om[#om]
 local A = "@ASSIGN@"
@@ -553,7 +582,7 @@ if MD and not rawget(MD, "bcr_rows") then
     if d then
       for i = #d, 1, -1 do
         local tid = d[i].text_id
-        if tid == "map_friend_time" or tid == "map_world_time" then table.remove(d, i) end
+        if tid == "map_friend_time" or tid == "map_world_time" or tid == "map_coop" then table.remove(d, i) end
       end
     end
     return res
@@ -629,6 +658,18 @@ if ui ~= Global.bcr_ui then
   Global.bcr_ui = ui
   o = (o and (o .. ";") or "") .. "ui=" .. ui
 end
+if top and top.name == "menu_main" and Global.bcr_lastnode == "graphics_settings" and nname and nname ~= "graphics_settings" and nname ~= "bcr_gamma" and Global.bcr_restart_pending then
+  Global.bcr_restart_pending = false
+  Global.bcr_prompt_wait = 6
+end
+if Global.bcr_prompt_wait then
+  Global.bcr_prompt_wait = Global.bcr_prompt_wait - 1
+  if Global.bcr_prompt_wait <= 0 then
+    Global.bcr_prompt_wait = nil
+    managers.menu:open_dialog_menu("bcr_restart_prompt")
+  end
+end
+if nname then Global.bcr_lastnode = nname end
 if cap ~= Global.bcr_cap then
   Global.bcr_cap = cap
   o = (o and (o .. ";") or "") .. "cap=" .. cap
@@ -761,6 +802,17 @@ void settings_capture_filter(uint8_t* st) {
     st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w;
 }
 
+// The menu asked for a restart (after the player confirmed): start the same command line again and end this process. BCR2_NORESTART only logs, for tests.
+static void restart_host() {
+    fprintf(stderr, "[settings] restart requested\n"); fflush(stderr);
+    if (getenv("BCR2_NORESTART")) return;
+    std::wstring cmd = GetCommandLineW();
+    wchar_t wd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, wd);
+    STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, wd, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); fprintf(stderr, "[settings] started a new copy, exiting\n"); fflush(stderr); ExitProcess(0); }
+    fprintf(stderr, "[settings] could not start a new copy (error %lu); staying open\n", GetLastError());
+}
+
 void settings_apply_from_lua(const std::string& changes) {
     std::lock_guard<std::mutex> lk(lock_());
     size_t at = 0;
@@ -775,6 +827,7 @@ void settings_apply_from_lua(const std::string& changes) {
         std::string k = item.substr(0, eq), v = item.substr(eq + 1);
         if (k == "cap") { cap_action_() = v; cap_fresh_() = true; gpu_set_gamma_preview(v == "gamma"); fprintf(stderr, "[settings] pad capture: %s\n", v.empty() ? "off" : v.c_str()); continue; }
         if (k == "ui") { ui_open_() = v == "1"; continue; }
+        if (k == "restart") { if (save) save_ini(); restart_host(); continue; }
         const Def* d = find_def(k);
         if (!d || !allowed(*d, v)) { fprintf(stderr, "[settings] ignoring menu change '%s'\n", item.c_str()); continue; }
         values_()[k] = v;

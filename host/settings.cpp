@@ -133,6 +133,7 @@ const char* kInstallLua = R"LUA(
 local INIT = @INIT@
 if not (managers and managers.menu and managers.menu._registered_menus and managers.localization and Global) then return "wait: managers" end
 local reg = managers.menu._registered_menus
+if not (managers.music and managers.music.music_events) then return "wait: music" end
 local main, pause = reg.menu_main, reg.menu_pause
 if not (main and main.data and main.data._nodes and main.data._nodes.main) then return "wait: menu_main" end
 local MenuNode = getmetatable(main.data._nodes.main)
@@ -140,6 +141,8 @@ if not (MenuNode and MenuNode.new) then return "wait: node class" end
 local STR = {
   bcr_pc_settings = "Graphics Settings",
   bcr_pc_gamma = "Gamma",
+  bcr_music_title = "Music Test",
+  bcr_music_track = "Track",
   bcr_pc_filter = "Texture Filtering",
   bcr_pc_filter_default = "Game Default",
   bcr_pc_filter_bilinear = "Bilinear",
@@ -209,6 +212,8 @@ local GLYPH = { a = 57344, b = 57345, x = 57346, y = 57347, back = 57348, start 
 local function set_labels(set)
   local t = LABELS[set] or LABELS.xbox
   for k, v in pairs(t) do STR["bcr_src_" .. k] = GLYPH[k] and utf8.char(GLYPH[k]) or v end
+  STR.bcr_music_start = utf8.char(GLYPH.x) .. " Start"
+  STR.bcr_music_stop = utf8.char(GLYPH.y) .. " Stop"
 end
 set_labels(INIT.buttons)
 local L = managers.localization
@@ -382,6 +387,7 @@ if P and not rawget(P, "bcr_orig_init") then
       parameters.row_item_font = "fonts/merged_bcfont_44"
       parameters._stripe_panel_y = 0
     end
+    if np and np.name == "bcr_music" and type(parameters) == "table" then parameters.row_item_font = "fonts/merged_bcfont_44" end
     local om0 = managers.menu and managers.menu._open_menus
     local in_pause = om0 and om0[#om0] and om0[#om0].name == "menu_pause" and np and np.name ~= "bcr_controls"
     if in_pause and type(parameters) == "table" then
@@ -396,6 +402,18 @@ if P and not rawget(P, "bcr_orig_init") then
       self._stripe_header:set_y(top)
       self.item_panel:set_y(top + 90)
       if np.name == "bcr_gamma" and self._stripe_background then self._stripe_background:set_color(Color(1, 0, 0, 0)) end
+    end
+    if np and np.name == "bcr_music" and self.row_items then
+      local y = 0
+      for _, ri in ipairs(self.row_items) do
+        local gp = ri.gui_panel
+        if gp then
+          gp:set_height(58)
+          gp:set_y(y)
+          y = y + 38
+        end
+      end
+      if self.item_panel then self.item_panel:set_h(y + 60) end
     end
     if np and np.name == "bcr_controls" and self.item_panel and self.row_items then
       local y = 0
@@ -435,6 +453,27 @@ local function gfx_items(kind)
   items[#items + 1] = { _meta = "item", name = "bcr_gamma_open", text_id = "bcr_pc_gamma", next_node = "bcr_gamma" }
   return items
 end
+)LUA"
+R"LUA(
+local MUSIC_EVENTS = {}
+do
+  local ev = managers.music and managers.music.music_events and managers.music:music_events("")
+  if type(ev) == "table" then
+    for _, e in pairs(ev) do
+      local s = tostring(e)
+      if s:find("^[Pp]lay_") then MUSIC_EVENTS[#MUSIC_EVENTS + 1] = s end
+    end
+  end
+  table.sort(MUSIC_EVENTS)
+end
+local function music_items()
+  local track = { _meta = "item", name = "bcr_track", text_id = "bcr_music_track", type = "CoreMenuItemToggle.ItemToggle" }
+  for _, e in ipairs(MUSIC_EVENTS) do
+    STR["bcr_mt_" .. e] = e
+    track[#track + 1] = { _meta = "option", value = e, text_id = "bcr_mt_" .. e }
+  end
+  return { track, { _meta = "item", name = "bcr_mstart", text_id = "bcr_music_start" }, { _meta = "item", name = "bcr_mstop", text_id = "bcr_music_stop" } }
+end
 local function extend_settings(menu)
   local sn = menu.data._nodes.settings
   if not sn or sn.bcr_ext then return end
@@ -442,6 +481,7 @@ local function extend_settings(menu)
   local data = { _meta = "node", name = "bcr_tmp" }
   data[#data + 1] = { _meta = "item", name = "bcr_graphics_open", text_id = "bcr_pc_settings", next_node = "graphics_settings" }
   for _, d in ipairs(SETS) do data[#data + 1] = toggle_item(d.key, d.text, d.options) end
+  data[#data + 1] = { _meta = "item", name = "bcr_music_open", text_id = "bcr_music_title", next_node = "bcr_music" }
   data[#data + 1] = { _meta = "default_item", name = "bcr_graphics_open" }
   local tmp = MenuNode:new(data)
   wire_items(tmp)
@@ -484,6 +524,7 @@ for _, which in ipairs({ { "main", main }, { "pause", pause } }) do
   if menu and menu.data and menu.data._nodes then
     menu.data._nodes.graphics_settings = build(kind, menu, "graphics_settings", "bcr_pc_settings", gfx_items(kind), "bcr_display", false)
     menu.data._nodes.bcr_gamma = build(kind, menu, "bcr_gamma", "bcr_pc_gamma", { toggle_item("gamma", "bcr_pc_gamma", GAMMA_OPTIONS) }, "bcr_gamma", false, true, true)
+    menu.data._nodes.bcr_music = build(kind, menu, "bcr_music", "bcr_music_title", music_items(), "bcr_track", false, true, true)
     extend_settings(menu)
     menu.data._nodes.bcr_controls = build(kind, menu, "bcr_controls", "bcr_controls", control_items(), "bcr_b_jump", true, true)
     local mn = menu.data._nodes[kind]
@@ -545,7 +586,16 @@ if dg and dg.data and dg.data._nodes and not (dg.data._nodes.bcr_confirm_exit an
 local om = managers.menu._open_menus
 local top = om and om[#om]
 local A = "@ASSIGN@"
-if A == "!exit" then
+if A == "!mplay" or A == "!mstop" then
+  local sn = top and top.logic and top.logic:selected_node()
+  local tk = sn and sn._items and sn._items[1]
+  if A == "!mplay" and tk then
+    managers.music:stop()
+    managers.music:post_event(tk:value())
+  else
+    managers.music:stop()
+  end
+elseif A == "!exit" then
   managers.menu:open_dialog_menu("bcr_confirm_exit")
 elseif A ~= "" and Global.bcr_assign then
   local k, s = A:match("^(.-):(.*)$")
@@ -674,6 +724,8 @@ if nname == "bcr_controls" then
   else cap = "lock" end
 elseif nname == "bcr_gamma" then
   cap = "gamma"
+elseif nname == "bcr_music" then
+  cap = "music"
 elseif nname == "start_game_node" then
   cap = "noy"
 end
@@ -693,6 +745,7 @@ if Global.bcr_prompt_wait then
     managers.menu:open_dialog_menu("bcr_restart_prompt")
   end
 end
+if Global.bcr_lastnode == "bcr_music" and nname ~= "bcr_music" and managers.music then managers.music:stop() end
 if nname then Global.bcr_lastnode = nname end
 local fp = "@FPS@"
 if pc and pc.fps == "on" and Overlay then
@@ -791,6 +844,15 @@ static void capture_locked(uint8_t* st) {
     uint16_t raw; memcpy(&raw, st + 4, 2);
     uint16_t w = (uint16_t)((raw >> 8) | (raw << 8));
     if (mode == "gamma") return;                                         // the gamma screen: every button works as normal
+    if (mode == "music") {                                               // the music test: X starts the track, Y stops it, and neither reaches the menu
+        uint32_t cur = (uint32_t)(w & 0xC000);
+        if (cap_fresh_()) { cap_fresh_() = false; cap_prev_() = cur; }
+        const uint32_t edge = cur & ~cap_prev_();
+        if (edge && cap_pending_().empty()) cap_pending_() = (edge & 0x4000) ? "!mplay" : "!mstop";
+        cap_prev_() = cur;
+        w &= (uint16_t)~0xC000; st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w;
+        return;
+    }
     if (mode == "noy") { w &= (uint16_t)~0x8000; st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w; return; }
     struct B { uint32_t bit; const char* name; };
     static const B kBtn[] = { { 0x1000, "a" }, { 0x2000, "b" }, { 0x4000, "x" }, { 0x8000, "y" }, { 0x0100, "lb" }, { 0x0200, "rb" }, { 0x0040, "l3" }, { 0x0080, "r3" } };

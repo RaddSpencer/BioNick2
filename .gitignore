@@ -18,6 +18,7 @@ functions_round2.toml
 
 # saves and test data
 host/saves*/
+host/bcr2.ini
 
 # logs and captured output
 *.log

@@ -132,6 +132,9 @@ static ComPtr<ID3D11Texture2D> g_backTex;
 static ComPtr<ID3D11SamplerState> g_presentSampler;
 static ComPtr<ID3D11PixelShader> g_psPresentPlain;
 static uint32_t g_backW = 1280, g_backH = 720;
+// Player settings (bcr2.ini) become BCR2_* switches here, before the render scale below and the display code read them. Statics in one file initialise in order.
+void settings_apply_to_env();
+static const bool g_settingsLoaded = (settings_apply_to_env(), true);
 // Renders at a whole multiple of the game's 1280x720: by default the smallest one that covers the display (2 at 1440p, 3 at 4K), or BCR2_RESSCALE=n.
 // Every size kept in the renderer (Rt::w, Surface::w, resolve rectangles) stays in guest pixels, and only what reaches D3D is multiplied: texture sizes,
 // viewports, scissors, clears and resolve copies. Chosen once at launch.
@@ -172,6 +175,8 @@ enum DisplayMode { kWindowed = 0, kBorderless = 1, kExclusive = 2 };
 static std::atomic<int> g_modeWanted{kWindowed};
 static std::atomic<bool> g_sizeChanged{false};
 static int g_modeNow = kWindowed;
+int gpu_display_mode() { return g_modeWanted.load(); }
+void gpu_set_display_mode(int mode) { g_modeWanted = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }

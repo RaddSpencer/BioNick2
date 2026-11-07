@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "settings.h"
 struct ShRec { char tag; DWORD tid; uint32_t before, after, a4, a5, lr; };
 static ShRec g_shRing[64];
 static std::atomic<unsigned> g_shN{0};
@@ -468,7 +469,7 @@ PPC_FUNC(sub_82638FA0) {
 uint64_t gpu_frame_number();
 void sub_8264FF78(PPCContext& __restrict__ ctx, uint8_t* base);              // luaL_loadstring(L, s)
 void sub_8263C8A8(PPCContext& __restrict__ ctx, uint8_t* base);              // lua_pcall(L, nargs, nresults, errfunc)
-static void lua_run_chunk(PPCContext& ctx, uint8_t* base, uint32_t L, const char* text, const char* tag) {
+static void lua_run_chunk(PPCContext& ctx, uint8_t* base, uint32_t L, const char* text, const char* tag, std::string* result = nullptr) {
     const size_t n = strlen(text) + 1;
     const uint32_t oldSp = ctx.r1.u32, buf = (oldSp - 0x400 - (uint32_t)n) & ~15u, sp = (buf - 0x200) & ~15u;
     memcpy(base + buf, text, n);
@@ -485,6 +486,7 @@ static void lua_run_chunk(PPCContext& ctx, uint8_t* base, uint32_t L, const char
     }
     // One value is on top now: the chunk's result, or an error message. Lua strings have tag 4 and their characters at +16.
     const uint32_t top = PPC_LOAD_U32(L + 8);
+    if (result && status == 0 && top >= 8 && PPC_LOAD_U32(top - 8 + 4) == 4) *result = (const char*)(base + PPC_LOAD_U32(top - 8) + 16);
     if (top >= 8 && PPC_LOAD_U32(top - 8 + 4) == 4 && (status != 0 || tag)) {
         static int nl = 0;
         if (nl++ < 200000) fprintf(stderr, "[lua-run] %s f=%llu status=%u: %s\n", tag ? tag : "god mode", (unsigned long long)gpu_frame_number(), status, (const char*)(base + PPC_LOAD_U32(top - 8) + 16));
@@ -504,11 +506,38 @@ PPC_FUNC(sub_82634458) {
     static const bool kDfaLimit = getenv("BCR2_NODFALIMIT") == nullptr;
     static const bool kNoMusic = getenv("BCR2_NOMUSIC") != nullptr;
     static const bool kSoundLog = getenv("BCR2_SOUNDLOG") != nullptr;
+    static thread_local bool inside = false;
+    static const bool kPcMenu = getenv("BCR2_NOPCMENU") == nullptr;
+    {   // The PC Settings menu: installs it into the game's menu data, then collects what the player changed there a few times a second.
+        static std::atomic<uint64_t> nextPc{ 200 };
+        static bool installed = false;
+        uint64_t due = nextPc.load(), f = gpu_frame_number();
+        if (kPcMenu && !inside && f >= due && nextPc.compare_exchange_strong(due, f + (installed ? 10 : 30))) {
+            inside = true;
+            const PPCContext saved = ctx;
+            const uint32_t L = saved.r3.u32, funcOff = saved.r4.u32 - PPC_LOAD_U32(L + 32);
+            std::string r;
+            if (!installed) {
+                lua_run_chunk(ctx, base, L, settings_install_lua().c_str(), nullptr, &r);
+                static std::string lastR;
+                if (r != lastR) { lastR = r; fprintf(stderr, "[settings] menu install at frame %llu: %s\n", (unsigned long long)f, r.empty() ? "(nothing returned)" : r.c_str()); }
+                if (r == "installed") installed = true;
+            } else {
+                lua_run_chunk(ctx, base, L, settings_poll_lua().c_str(), nullptr, &r);
+                if (r == "reinstall") installed = false;
+                else if (!r.empty()) settings_apply_from_lua(r);
+            }
+            auto fpscr = ctx.fpscr;
+            ctx = saved;
+            ctx.fpscr = fpscr;
+            ctx.r4.u64 = PPC_LOAD_U32(L + 32) + funcOff;
+            inside = false;
+        }
+    }
     if (kGod || kRun || kGunFix || kNoMusic || kSoundLog || kDfaLimit) {
         // About once a second, while this thread is already inside Lua. New players and levels are picked up the next time around.
         static const uint64_t kEvery = getenv("BCR2_LUAEVERY") ? _atoi64(getenv("BCR2_LUAEVERY")) : 60;   // frames between runs, for tests that need finer timing
         static std::atomic<uint64_t> nextFrame{ 300 };
-        static thread_local bool inside = false;
         uint64_t due = nextFrame.load(), f = gpu_frame_number();
         if (!inside && f >= due && nextFrame.compare_exchange_strong(due, f + kEvery)) {
             inside = true;

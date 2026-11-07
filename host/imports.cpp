@@ -2372,6 +2372,7 @@ register_by_name("XamInputGetKeystroke",   XamInputGetKeystrokeEx_);
 register_by_name("XMsgInProcessCall", XMsgInProcessCall_);
 register_by_name("XamContentGetLicenseMask", XamContentGetLicenseMask_);
 register_by_name("XamShowDeviceSelectorUI", XamShowDeviceSelectorUI_);
+register_by_name("XamShowAchievementsUI", ReturnZero_);       // the menu's Achievements item: nothing to show, report success rather than ending the process
 register_by_name("XamContentGetDeviceState", XamContentGetDeviceState_);
 register_by_name("XamContentGetDeviceData", XamContentGetDeviceData_);
 register_by_name("XamContentCreateEnumerator", XamContentCreateEnumerator_);

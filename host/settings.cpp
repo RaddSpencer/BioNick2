@@ -1,4 +1,4 @@
-// Settings file and the in-game PC Settings and Controls menus.
+﻿// Settings file and the in-game PC Settings and Controls menus.
 //
 // The menus replace the Achievements entry of the game's main and pause menus (nothing in this build can show achievements) and the Controls entry of
 // Help & Options (a picture of the controller). They are built at run time, in Lua, from the same node and item classes the game's menu files use, so the
@@ -283,7 +283,7 @@ if P and not rawget(P, "bcr_orig_init") then
     if np and np.name == "bcr_controls" and self.row_items then
       for _, ri in pairs(self.row_items) do
         local gp = ri.gui_panel
-        if gp then gp:set_height(gp:height() + 16) end
+        if gp then gp:set_height(gp:height() + 30) end
       end
     end
     return r

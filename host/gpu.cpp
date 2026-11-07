@@ -1378,6 +1378,74 @@ static void packed_mip_offset(uint32_t w, uint32_t h, uint32_t level, uint32_t b
     x /= block; y /= block;
 }
 
+// BCR2_TEXDUMP=<dir>: every texture of 64 pixels or more is written as two BMPs the first time it is uploaded and whenever its content changes: <base>_f<fmt>_<w>x<h>_rgb.bmp
+// and _a.bmp (alpha as grey). Compressed formats are decoded here on the CPU. For finding what an unknown texture is, such as a font atlas.
+static void bc_colors(const uint8_t* b, uint8_t c[4][4], bool bc1) {
+    uint16_t c0 = (uint16_t)(b[0] | b[1] << 8), c1 = (uint16_t)(b[2] | b[3] << 8);
+    auto ex = [](uint16_t v, uint8_t* o) { o[0] = (uint8_t)(((v >> 11) & 31) * 255 / 31); o[1] = (uint8_t)(((v >> 5) & 63) * 255 / 63); o[2] = (uint8_t)((v & 31) * 255 / 31); o[3] = 255; };
+    ex(c0, c[0]); ex(c1, c[1]);
+    if (!bc1 || c0 > c1) { for (int i = 0; i < 3; i++) { c[2][i] = (uint8_t)((2 * c[0][i] + c[1][i]) / 3); c[3][i] = (uint8_t)((c[0][i] + 2 * c[1][i]) / 3); } c[2][3] = c[3][3] = 255; }
+    else { for (int i = 0; i < 3; i++) { c[2][i] = (uint8_t)((c[0][i] + c[1][i]) / 2); c[3][i] = 0; } c[2][3] = 255; c[3][3] = 0; }
+}
+static void write_bmp(const std::string& path, const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h, bool alphaOnly) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return;
+    uint32_t imgBytes = w * h * 4, off = 54;
+    uint8_t hd[54] = { 'B', 'M' };
+    auto p32 = [&](int at, uint32_t v) { memcpy(hd + at, &v, 4); };
+    p32(2, off + imgBytes); p32(10, off); p32(14, 40); p32(18, w); p32(22, (uint32_t)(-(int32_t)h)); hd[26] = 1; hd[28] = 32; p32(34, imgBytes);
+    fwrite(hd, 1, 54, f);
+    std::vector<uint8_t> row(w * 4);
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            const uint8_t* s = &rgba[((size_t)y * w + x) * 4];
+            uint8_t* d = &row[x * 4];
+            if (alphaOnly) d[0] = d[1] = d[2] = s[3]; else { d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; }
+            d[3] = 255;
+        }
+        fwrite(row.data(), 1, row.size(), f);
+    }
+    fclose(f);
+}
+static void dump_texture_bmp(const char* dir, uint32_t base, uint32_t fmt, uint32_t w, uint32_t h, const TexFmt& tf, const uint8_t* data) {
+    static std::unordered_map<uint32_t, uint64_t> last;
+    static int count = 0;
+    if (w < 64 && h < 64) return;
+    uint64_t hs = fnv64(data, (size_t)w * h / (tf.conv ? 1 : (tf.block * tf.block)) * (tf.conv ? 4 : tf.bpb));
+    auto it = last.find(base);
+    if (it != last.end() && it->second == hs) return;
+    last[base] = hs;
+    if (count++ >= 400) return;
+    std::vector<uint8_t> rgba((size_t)w * h * 4, 0);
+    if (tf.conv || tf.dxgi == DXGI_FORMAT_R8G8B8A8_UNORM) memcpy(rgba.data(), data, rgba.size());
+    else if (tf.dxgi == DXGI_FORMAT_BC1_UNORM || tf.dxgi == DXGI_FORMAT_BC2_UNORM || tf.dxgi == DXGI_FORMAT_BC3_UNORM) {
+        const bool bc1 = tf.dxgi == DXGI_FORMAT_BC1_UNORM, bc3 = tf.dxgi == DXGI_FORMAT_BC3_UNORM;
+        const uint32_t bw = w / 4, bh = h / 4;
+        for (uint32_t by = 0; by < bh; by++) for (uint32_t bx = 0; bx < bw; bx++) {
+            const uint8_t* b = data + ((size_t)by * bw + bx) * tf.bpb;
+            uint8_t c[4][4]; bc_colors(bc1 ? b : b + 8, c, bc1);
+            uint8_t al[16]; for (int i = 0; i < 16; i++) al[i] = 255;
+            if (tf.dxgi == DXGI_FORMAT_BC2_UNORM) { for (int i = 0; i < 16; i++) { uint8_t n = (uint8_t)((b[i / 2] >> ((i & 1) * 4)) & 15); al[i] = (uint8_t)(n * 17); } }
+            if (bc3) {
+                uint8_t a0 = b[0], a1 = b[1], tab[8]; tab[0] = a0; tab[1] = a1;
+                if (a0 > a1) for (int i = 1; i < 7; i++) tab[i + 1] = (uint8_t)(((7 - i) * a0 + i * a1) / 7);
+                else { for (int i = 1; i < 5; i++) tab[i + 1] = (uint8_t)(((5 - i) * a0 + i * a1) / 5); tab[6] = 0; tab[7] = 255; }
+                uint64_t bits = 0; for (int i = 0; i < 6; i++) bits |= (uint64_t)b[2 + i] << (8 * i);
+                for (int i = 0; i < 16; i++) al[i] = tab[(bits >> (3 * i)) & 7];
+            }
+            uint32_t ci = (uint32_t)((bc1 ? b : b + 8)[4] | (bc1 ? b : b + 8)[5] << 8 | (bc1 ? b : b + 8)[6] << 16 | (uint32_t)(bc1 ? b : b + 8)[7] << 24);
+            for (int i = 0; i < 16; i++) {
+                const uint8_t* cc = c[(ci >> (2 * i)) & 3];
+                uint8_t* d = &rgba[(((size_t)by * 4 + i / 4) * w + bx * 4 + (i & 3)) * 4];
+                d[0] = cc[0]; d[1] = cc[1]; d[2] = cc[2]; d[3] = (bc1 && cc[3] == 0) ? 0 : (tf.dxgi == DXGI_FORMAT_BC1_UNORM ? 255 : al[i]);
+            }
+        }
+    } else { fprintf(stderr, "[texdump] %08X fmt=%u %ux%u: not decoded (host format %d)\n", base, fmt, w, h, (int)tf.dxgi); return; }
+    std::string stem = std::string(dir) + "\\" + S("%08X_f%u_%ux%u", base, fmt, w, h);
+    write_bmp(stem + "_rgb.bmp", rgba, w, h, false);
+    write_bmp(stem + "_a.bmp", rgba, w, h, true);
+    fprintf(stderr, "[texdump] %08X fmt=%u %ux%u written\n", base, fmt, w, h);
+}
 static HostTex* get_texture(const FetchInfo& fi) {
     TexFmt tf;
     if (!tex_fmt(fi.fmt, tf)) { logf_once(S("texf%u", fi.fmt).c_str(), "unsupported texture format %u (%ux%u at %X)", fi.fmt, fi.w, fi.h, fi.base); return nullptr; }
@@ -1447,6 +1515,7 @@ static HostTex* get_texture(const FetchInfo& fi) {
             }
         }
     }
+    { static const char* kDump = getenv("BCR2_TEXDUMP"); if (kDump) dump_texture_bmp(kDump, fi.base, fi.fmt, hw, hh, tf, out.data()); }
     const uint32_t levels = maxLevel + 1;
     bool same = ht->tex && ht->hostW == hw && ht->hostH == hh && ht->levels == levels;
     if (!same) {

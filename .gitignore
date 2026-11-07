@@ -36,3 +36,6 @@ bctr_*.txt
 imports.txt
 build_log.txt
 missing_entries.txt
+
+# downloaded art packs; only what the game uses is copied into host/assets
+assets_src/

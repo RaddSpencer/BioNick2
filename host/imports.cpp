@@ -1839,6 +1839,7 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t* base) {
               case 'T': rt = 255; break;           // right trigger
               case 'Z': lt = 255; break;           // left trigger
               case 'C': buttons = 0x0080; break;   // right stick click
+              case 'c': buttons = 0x0040; break;   // left stick click
             }
         }
         static std::atomic<uint32_t> lastCycle{0xFFFFFFFFu};
@@ -1866,15 +1867,7 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t* base) {
             *(uint16_t*)(base + st + 14) = _byteswap_ushort((uint16_t)g.sThumbRY);
         }
     }
-    if (st) {   // LT and a click of the right stick cycle the equipped arm upgrades (upgradecycle.cpp). The game uses neither. Acts on the press, with some slack on the trigger.
-        static bool ltDown = false, r3Down = false;
-        const uint16_t b = _byteswap_ushort(*(uint16_t*)(base + st + 4));
-        const uint8_t lt = base[st + 6];
-        const bool ltNow = ltDown ? lt > 60 : lt > 140, r3Now = (b & 0x0080) != 0;
-        if (ltNow && !ltDown) upgrades_note_press(0);
-        if (r3Now && !r3Down) upgrades_note_press(1);
-        ltDown = ltNow; r3Down = r3Now;
-    }
+    if (st) upgrades_poll_pad(_byteswap_ushort(*(uint16_t*)(base + st + 4)), base[st + 6], base[st + 7]);   // the upgrade cycle buttons (upgradecycle.cpp), whichever inputs they are bound to
     ctx.r3.u64 = 0;
 }
 // XamInputGetCapabilities(user, flags, XINPUT_CAPABILITIES* out): 20 bytes

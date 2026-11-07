@@ -22,6 +22,9 @@ void gpu_set_display_mode(int mode);
 void gpu_set_button_set(int s);
 void gpu_set_gamma(int percent);
 void gpu_set_gamma_preview(bool on);
+std::string gpu_fps_text();
+void gpu_set_texfilter(int mode);
+void gpu_set_aa(int mode);
 
 namespace {
 
@@ -36,6 +39,9 @@ const Def kDefs[] = {
     { "scale",   "auto",   { "auto", "1", "2", "3", "4", nullptr },           "BCR2_RESSCALE" },
     { "outres",  "auto",   { "auto", "720", "1080", "1440", "2160", nullptr }, "BCR2_OUTRES" },
     { "vrr",     "off",    { "off", "on", nullptr },                          "BCR2_VRR" },
+    { "filter",  "default", { "default", "bilinear", "trilinear", "aniso2", "aniso4", "aniso8", "aniso16", nullptr }, nullptr },
+    { "aa",      "off",    { "off", "fxaa", "fxaahigh", nullptr },            nullptr },
+    { "fps",     "off",    { "off", "on", nullptr },                          nullptr },
     { "gamma",   "100",    { nullptr },                                       nullptr },             // percent, 50 to 150: checked by number
     { "buttons", "xbox",    { "xbox", "playstation", "switch", nullptr },     nullptr },
     { "nojump",  "off",     { "off", "on", nullptr },                          nullptr },
@@ -103,6 +109,8 @@ void save_ini() {
     }
 }
 
+int filter_from_name(const std::string& v) { static const char* n[] = { "default", "bilinear", "trilinear", "aniso2", "aniso4", "aniso8", "aniso16" }; for (int i = 0; i < 7; i++) if (v == n[i]) return i; return 0; }
+int aa_from_name(const std::string& v) { return v == "fxaa" ? 1 : v == "fxaahigh" ? 2 : 0; }
 int button_set_from_name(const std::string& v) { return v == "playstation" ? 2 : v == "switch" ? 3 : 1; }
 
 // Press-to-remap state. The menu poll says which action row is selected; the pad filter records the first assignable button pressed while one is.
@@ -132,6 +140,19 @@ if not (MenuNode and MenuNode.new) then return "wait: node class" end
 local STR = {
   bcr_pc_settings = "Graphics Settings",
   bcr_pc_gamma = "Gamma",
+  bcr_pc_filter = "Texture Filtering",
+  bcr_pc_filter_default = "Game Default",
+  bcr_pc_filter_bilinear = "Bilinear",
+  bcr_pc_filter_trilinear = "Trilinear",
+  bcr_pc_filter_aniso2 = "Anisotropic 2x",
+  bcr_pc_filter_aniso4 = "Anisotropic 4x",
+  bcr_pc_filter_aniso8 = "Anisotropic 8x",
+  bcr_pc_filter_aniso16 = "Anisotropic 16x",
+  bcr_pc_aa = "Antialiasing",
+  bcr_pc_aa_off = "Off",
+  bcr_pc_aa_fxaa = "FXAA",
+  bcr_pc_aa_fxaahigh = "FXAA (High)",
+  bcr_pc_fps = "FPS Display",
   bcr_pc_outres = "Render Resolution (restart)",
   bcr_pc_outres_auto = "Auto",
   bcr_pc_outres_720 = "720p",
@@ -207,6 +228,9 @@ local GFX = {
   { key = "scale", text = "bcr_pc_scale", options = { { "auto", "bcr_pc_scale_auto" }, { "1", "bcr_pc_scale_1" }, { "2", "bcr_pc_scale_2" }, { "3", "bcr_pc_scale_3" } } },
   { key = "outres", text = "bcr_pc_outres", options = { { "auto", "bcr_pc_outres_auto" }, { "720", "bcr_pc_outres_720" }, { "1080", "bcr_pc_outres_1080" }, { "1440", "bcr_pc_outres_1440" }, { "2160", "bcr_pc_outres_2160" } } },
   { key = "vrr", text = "bcr_pc_vrr", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
+  { key = "filter", text = "bcr_pc_filter", options = { { "default", "bcr_pc_filter_default" }, { "bilinear", "bcr_pc_filter_bilinear" }, { "trilinear", "bcr_pc_filter_trilinear" }, { "aniso2", "bcr_pc_filter_aniso2" }, { "aniso4", "bcr_pc_filter_aniso4" }, { "aniso8", "bcr_pc_filter_aniso8" }, { "aniso16", "bcr_pc_filter_aniso16" } } },
+  { key = "aa", text = "bcr_pc_aa", options = { { "off", "bcr_pc_aa_off" }, { "fxaa", "bcr_pc_aa_fxaa" }, { "fxaahigh", "bcr_pc_aa_fxaahigh" } } },
+  { key = "fps", text = "bcr_pc_fps", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
 }
 local SETS = {
   { key = "buttons", text = "bcr_pc_buttons", options = { { "xbox", "bcr_pc_buttons_xbox" }, { "playstation", "bcr_pc_buttons_playstation" }, { "switch", "bcr_pc_buttons_switch" } } },
@@ -670,6 +694,26 @@ if Global.bcr_prompt_wait then
   end
 end
 if nname then Global.bcr_lastnode = nname end
+local fp = "@FPS@"
+if pc and pc.fps == "on" and Overlay then
+  local ft = Global.bcr_fps_txt
+  if not (ft and alive(ft)) then
+    local ws = Overlay:gui():create_screen_workspace()
+    Global.bcr_fps_ws = ws
+    ft = ws:panel():text({ text = fp, font = "fonts/merged_bcfont_44", font_size = 28, color = Color(1, 1, 1, 1), layer = 10000, x = 16, y = 10 })
+    Global.bcr_fps_txt = ft
+    Global.bcr_fps_last = nil
+  end
+  if Global.bcr_fps_last ~= fp then
+    Global.bcr_fps_last = fp
+    ft:set_text(fp)
+    local _, _, tw, th = ft:text_rect()
+    ft:set_size(tw + 8, th + 4)
+  end
+  ft:set_visible(true)
+elseif Global.bcr_fps_txt and alive(Global.bcr_fps_txt) then
+  Global.bcr_fps_txt:set_visible(false)
+end
 if cap ~= Global.bcr_cap then
   Global.bcr_cap = cap
   o = (o and (o .. ";") or "") .. "cap=" .. cap
@@ -706,6 +750,8 @@ void settings_apply_to_env() {
         else _putenv_s(d.env, v.c_str());
     }
     gpu_set_gamma(atoi(values_()["gamma"].c_str()));
+    gpu_set_texfilter(filter_from_name(values_()["filter"]));
+    gpu_set_aa(aa_from_name(values_()["aa"]));
     upgrades_set_source(0, values_()["b_cycleact"].c_str());
     upgrades_set_source(1, values_()["b_cyclepas"].c_str());
     fprintf(stderr, "[settings] %s: display=%s scale=%s vrr=%s buttons=%s\n", ini_path().c_str(), values_()["display"].c_str(), values_()["scale"].c_str(), values_()["vrr"].c_str(), values_()["buttons"].c_str());
@@ -731,7 +777,8 @@ std::string settings_poll_lua() {
         assign = cap_pending_();
         cap_pending_().clear();
     }
-    return replace_all(replace_all(lua_text(kPollLua), "@DISPLAY@", display_name(gpu_display_mode())), "@ASSIGN@", assign);
+    bool fpsOn; { std::lock_guard<std::mutex> lk(lock_()); fpsOn = values_()["fps"] == "on"; }
+    return replace_all(replace_all(replace_all(lua_text(kPollLua), "@DISPLAY@", display_name(gpu_display_mode())), "@ASSIGN@", assign), "@FPS@", fpsOn ? gpu_fps_text() : std::string());
 }
 
 bool settings_capture_active() { std::lock_guard<std::mutex> lk(lock_()); return !cap_action_().empty(); }
@@ -834,10 +881,12 @@ void settings_apply_from_lua(const std::string& changes) {
         save = true;
         if (k == "display") { gpu_set_display_mode(display_from_name(v)); fprintf(stderr, "[settings] display = %s (applied now)\n", v.c_str()); }
         else if (k == "gamma") { gpu_set_gamma(atoi(v.c_str())); }
+        else if (k == "filter") { gpu_set_texfilter(filter_from_name(v)); fprintf(stderr, "[settings] texture filtering = %s (applied now)\n", v.c_str()); }
+        else if (k == "aa") { gpu_set_aa(aa_from_name(v)); fprintf(stderr, "[settings] antialiasing = %s (applied now)\n", v.c_str()); }
         else if (k == "buttons") { gpu_set_button_set(button_set_from_name(v)); fprintf(stderr, "[settings] buttons = %s (applied now)\n", v.c_str()); }
         else if (k == "b_cycleact") { upgrades_set_source(0, v.c_str()); fprintf(stderr, "[settings] cycle active upgrade = %s (applied now)\n", v.c_str()); }
         else if (k == "b_cyclepas") { upgrades_set_source(1, v.c_str()); fprintf(stderr, "[settings] cycle passive upgrade = %s (applied now)\n", v.c_str()); }
-        else if ((k[0] == 'b' && k[1] == '_') || k == "nojump" || k == "god" || k == "swapconfirm" || k == "gamma") fprintf(stderr, "[settings] %s = %s (applied now)\n", k.c_str(), v.c_str());
+        else if ((k[0] == 'b' && k[1] == '_') || k == "nojump" || k == "god" || k == "swapconfirm" || k == "gamma" || k == "fps") fprintf(stderr, "[settings] %s = %s (applied now)\n", k.c_str(), v.c_str());
         else fprintf(stderr, "[settings] %s = %s (takes effect after a restart)\n", k.c_str(), v.c_str());
     }
     if (save) save_ini();

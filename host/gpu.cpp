@@ -184,6 +184,22 @@ static std::atomic<float> g_gamma{1.0f};
 static std::atomic<bool> g_gammaPreview{false};
 void gpu_set_gamma(int percent) { g_gamma = (percent < 50 ? 50 : percent > 200 ? 200 : percent) / 100.0f; }
 void gpu_set_gamma_preview(bool on) { g_gammaPreview = on; }
+// Texture filtering the player picked (0 = as the game asks, 1 bilinear, 2 trilinear, 3 to 6 anisotropic 2x 4x 8x 16x) and the antialiasing pass (0 off, 1 FXAA, 2 FXAA high).
+static std::atomic<int> g_texFilter{0};
+static std::atomic<int> g_aaMode{0};
+void gpu_set_texfilter(int mode) { g_texFilter = mode < 0 ? 0 : mode > 6 ? 6 : mode; }
+void gpu_set_aa(int mode) { g_aaMode = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+// Frames per second and average frame time over the last quarter second, for the FPS display. Written by the render thread at each present.
+static std::atomic<float> g_fpsNow{0.0f}, g_msNow{0.0f};
+std::string gpu_fps_text() { char b[48]; snprintf(b, sizeof b, "%.0f FPS  %.1f ms", g_fpsNow.load(), g_msNow.load()); return b; }
+static void note_present_for_fps() {
+    static LARGE_INTEGER last{}, freq{}; static int frames = 0;
+    if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); return; }
+    frames++;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const double dt = (double)(now.QuadPart - last.QuadPart) / (double)freq.QuadPart;
+    if (dt >= 0.25) { g_fpsNow = (float)(frames / dt); g_msNow = (float)(1000.0 * dt / frames); frames = 0; last = now; }
+}
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }
@@ -388,22 +404,36 @@ static bool device_init() {
     // The final pass. Several samples per output pixel when the picture is bigger than the window (supersampling), the game's own gamma ramp, the player's gamma,
     // and the gamma screen's sample picture under the menu (t2) while it is open.
     const char* presentCommon =
-        "Texture2D src:register(t0); Texture2D lut:register(t1); Texture2D prv:register(t2); SamplerState smp:register(s0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; float gam; float pv; float pad; };\n"
-        "float4 main(float4 p:SV_Position):SV_Target { float w,h; src.GetDimensions(w,h); float2 c0=p.xy*scale+ofs; float4 c;\n"
+        "Texture2D src:register(t0); Texture2D lut:register(t1); Texture2D prv:register(t2); SamplerState smp:register(s0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; float gam; float pv; float aa; };\n"
+        "static float2 dimv;\n"
+        "float4 tap(float2 t){ float4 c=src.SampleLevel(smp,t/dimv,0); return swaprb? c.bgra : c; }\n"
+        "float luma(float3 c){ return dot(c,float3(0.299,0.587,0.114)); }\n"
+        // FXAA (after Timothy Lottes' console version): find the local edge direction from the luma of the four corners and blend along it. aa 1 reaches 4 texels, 2 reaches 8.
+        "float4 shade(float2 t){ float4 m=tap(t); if(aa<0.5) return m;\n"
+        "  float3 nw=tap(t+float2(-1,-1)).rgb, ne=tap(t+float2(1,-1)).rgb, sw=tap(t+float2(-1,1)).rgb, se=tap(t+float2(1,1)).rgb;\n"
+        "  float lM=luma(m.rgb), lNW=luma(nw), lNE=luma(ne), lSW=luma(sw), lSE=luma(se);\n"
+        "  float lMin=min(lM,min(min(lNW,lNE),min(lSW,lSE))), lMax=max(lM,max(max(lNW,lNE),max(lSW,lSE)));\n"
+        "  if(lMax-lMin < max(0.0312, lMax*0.125)) return m;\n"
+        "  float2 dir=float2(-((lNW+lNE)-(lSW+lSE)), ((lNW+lSW)-(lNE+lSE)));\n"
+        "  float reduce=max((lNW+lNE+lSW+lSE)*0.03125, 0.0078125);\n"
+        "  float rcp=1.0/(min(abs(dir.x),abs(dir.y))+reduce); float span=(aa>1.5)?8.0:4.0;\n"
+        "  dir=clamp(dir*rcp,-span,span);\n"
+        "  float3 A=0.5*(tap(t+dir*(1.0/3.0-0.5)).rgb+tap(t+dir*(2.0/3.0-0.5)).rgb);\n"
+        "  float3 B=A*0.5+0.25*(tap(t+dir*-0.5).rgb+tap(t+dir*0.5).rgb);\n"
+        "  float lB=luma(B); return float4((lB<lMin||lB>lMax)? A : B, 1.0); }\n"
+        "float4 main(float4 p:SV_Position):SV_Target { float w,h; src.GetDimensions(w,h); dimv=float2(w,h); float2 c0=p.xy*scale+ofs; float4 c;\n"
         "  int2 n=(int2)clamp(ceil(scale-0.001),1.0,4.0);\n"
-        "  if(n.x>1||n.y>1){ float4 a=0; for(int j=0;j<n.y;j++) for(int i=0;i<n.x;i++){ float2 o=((float2(i,j)+0.5)/n-0.5)*scale; a+=src.SampleLevel(smp,(c0+o)/float2(w,h),0); } c=a/(float)(n.x*n.y); }\n"
-        "  else c=src.SampleLevel(smp,c0/float2(w,h),0);\n"
-        "  if(swaprb) c=c.bgra;\n"
+        "  if(n.x>1||n.y>1){ float4 a=0; for(int j=0;j<n.y;j++) for(int i=0;i<n.x;i++){ float2 o=((float2(i,j)+0.5)/n-0.5)*scale; a+=shade(c0+o); } c=a/(float)(n.x*n.y); }\n"
+        "  else c=shade(c0);\n"
         "  float3 col=c.rgb;\n"
         "#ifdef LUT\n"
         "  float3 u=(saturate(col)*255.0+0.5)/256.0;\n"
         "  col=float3(lut.SampleLevel(smp,float2(u.r,0.5),0).r, lut.SampleLevel(smp,float2(u.g,0.5),0).g, lut.SampleLevel(smp,float2(u.b,0.5),0).b);\n"
         "#endif\n"
         "  col=saturate(col);\n"
-        "  if(pv>0.5){ float3 im=prv.SampleLevel(smp,c0/float2(w,h),0).rgb; col=saturate(col+im*(1.0-max(col.r,max(col.g,col.b)))); }\n"
+        "  if(pv>0.5){ float3 im=prv.SampleLevel(smp,c0/dimv,0).rgb; col=saturate(col+im*(1.0-max(col.r,max(col.g,col.b)))); }\n"
         "  if(abs(gam-1.0)>0.001) col=pow(col,1.0/gam);\n"
-        "  return float4(col,1.0); }\n";
-    if (auto b = compile_cached(std::string("#define LUT 1\n") + presentCommon, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentLut);
+        "  return float4(col,1.0); }\n";    if (auto b = compile_cached(std::string("#define LUT 1\n") + presentCommon, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentLut);
     if (auto b = compile_cached(presentCommon, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentPlain);    {
         D3D11_TEXTURE2D_DESC d{}; d.Width = 256; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R10G10B10A2_UNORM; d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -1785,6 +1815,16 @@ static ID3D11SamplerState* get_sampler(const uint32_t* tf, const TexUse& u) {
         if (g_trace > 1000 && (texFmt == 22 || texFmt == 23) && seen.insert(((uint64_t)tf[1] << 8) | u.slot).second)
             fprintf(stderr, "[depthfetch] slot=%u base=%08X fmt=%u mag=%u min=%u mip=%u (fetch %u %u %u, shader %d %d %d)\n", u.slot, tf[1] & 0xFFFFF000u, texFmt, mag, min, mip, (tf[3] >> 19) & 3, (tf[3] >> 21) & 3, (tf[3] >> 23) & 3, u.magf, u.minf, u.mipf);
     }
+    {   // the player's texture filtering: only for textures the game already filters (a point-sampled one is probably data, not a picture)
+        const int tfm = g_texFilter.load();
+        const uint32_t tfmt = tf[1] & 63;
+        if (tfm > 0 && (mag == 1 || min == 1) && mip != 2 && tfmt != 22 && tfmt != 23) {
+            mag = min = 1;
+            if (tfm == 1) { mip = 0; aniso = 1; }
+            else if (tfm == 2) { mip = 1; aniso = 1; }
+            else { mip = 1; aniso = 2u << (tfm - 3); }
+        }
+    }
     uint32_t in[11] = { cx, cy, cz, mag, min, mip, border, minL, maxL, (uint32_t)lodBias32, aniso };
     uint64_t k = fnv64(in, sizeof(in));
     auto& e = g_samplers[k];
@@ -2525,7 +2565,7 @@ static void blit(ID3D11ShaderResourceView* src, ID3D11PixelShader* ps, ID3D11Ren
     g_ctx->PSSetShaderResources(0, 32, nul);
     g_ctx->OMSetRenderTargets(1, &dst, nullptr);
     invalidate_binds();
-    struct { float ofs[2]; float scale[2]; uint32_t sw; float gam; float pv; float pad; } p{ { (float)(sx - dx0), (float)(sy - dy0) }, { scaleX, scaleY }, swaprb ? 1u : 0u, g_gamma.load(), (g_blitExtra ? 1.0f : 0.0f), 0.0f };
+    struct { float ofs[2]; float scale[2]; uint32_t sw; float gam; float pv; float aa; } p{ { (float)(sx - dx0), (float)(sy - dy0) }, { scaleX, scaleY }, swaprb ? 1u : 0u, g_gamma.load(), (g_blitExtra ? 1.0f : 0.0f), (float)g_aaMode.load() };
     if (ofsOverride) { p.ofs[0] = ofsOverride[0]; p.ofs[1] = ofsOverride[1]; }
     upload_cb(g_cbBlit.Get(), &p, sizeof(p));
     ID3D11Buffer* cb = g_cbBlit.Get();
@@ -3035,6 +3075,7 @@ static void do_swap(uint32_t front) {
         g_ctx->ClearRenderTargetView(g_backRtv.Get(), c);
     }
     write_shot();
+    note_present_for_fps();
     HRESULT hr;
     LARGE_INTEGER presented; QueryPerformanceCounter(&presented);
     g_swPrep = (double)(presented.QuadPart - swapStart.QuadPart) * g_perfTicksToMs;

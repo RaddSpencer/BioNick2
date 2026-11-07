@@ -12,9 +12,9 @@
 namespace {
 std::atomic<int> g_active{0}, g_passive{0};
 
-// The three cosmetics the game treats specially are left out: they are not upgrades. No -- comments, this text can also be handed to the game as one line.
+// The three cosmetics the game treats specially, and the prestige item (no HUD icon), are left out. No -- comments, this text can also be handed to the game as one line.
 const char* kCycleLua = R"LUA(
-local SKIP = { cool_shades = true, dogtags = true, trucker_cap = true }
+local SKIP = { cool_shades = true, dogtags = true, trucker_cap = true, ultimate_prestige = true }
 local function cycle(slot, n)
   if not (managers and managers.player and managers.menu) then return nil end
   if next(managers.menu._open_menus or {}) then return nil end

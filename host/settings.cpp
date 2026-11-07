@@ -357,19 +357,6 @@ if MenuCallbackHandler then
   MenuCallbackHandler.vis_cb_retro_not_unlocked = function() return true end
   MenuCallbackHandler.vis_cb_retro_unlocked = function() return false end
 end
-local MG = rawget(_G, "Map3dNodeGui")
-if MG and not rawget(MG, "bcr_hint") then
-  local orig_hint = MG._show_btn_hint
-  MG.bcr_hint = true
-  MG._show_btn_hint = function(self, cfg, ...)
-    if type(cfg) == "table" then
-      local keep = {}
-      for _, e in ipairs(cfg) do if e.text ~= "menu_update_times" then keep[#keep + 1] = e end end
-      cfg = keep
-    end
-    return orig_hint(self, cfg, ...)
-  end
-end
 local function settings_items()
   local items = {}
   for _, d in ipairs(DEFS) do items[#items + 1] = toggle_item(d.key, d.text, d.options) end
@@ -469,14 +456,19 @@ local pc = Global.bcr_pc
 if pc and managers.player and (pc.god == "on" or Global.bcr_god_on) then
   local on = pc.god == "on"
   if Player and not Player.bcr_god_die then
-    local die = Player.die
+    local die, rag = Player.die, Player.ragdoll
     Player.bcr_god_die = true
     Player.die = function(self, killer, is_water)
-      local d = self._unit:bcr_damage()
-      local g = d._god_mode
-      d._god_mode = false
-      die(self, killer, is_water)
-      d._god_mode = g
+      if self._unit:bcr_damage()._god_mode then
+        die(self, killer, is_water)
+        if self._controller and self._controller.enable then self._controller:enable() end
+        return
+      end
+      return die(self, killer, is_water)
+    end
+    Player.ragdoll = function(self, ...)
+      if self._unit:bcr_damage()._god_mode then return end
+      return rag(self, ...)
     end
   end
   Global.unlimited_lives = on or nil
@@ -492,6 +484,35 @@ if pc and gm and gm.set_jump_allowed and (pc.nojump == "on" or Global.bcr_nojump
   gm:set_jump_allowed(pc.nojump ~= "on")
   Global.bcr_nojump_set = pc.nojump == "on"
 end
+local MG = rawget(_G, "Map3dNodeGui")
+if MG and not rawget(MG, "bcr_hint") then
+  local orig_hint = MG._show_btn_hint
+  MG.bcr_hint = true
+  MG._show_btn_hint = function(self, cfg, ...)
+    if type(cfg) == "table" then
+      local keep = {}
+      for _, e in ipairs(cfg) do if e.text ~= "menu_update_times" then keep[#keep + 1] = e end end
+      cfg = keep
+    end
+    return orig_hint(self, cfg, ...)
+  end
+end
+local MD = rawget(_G, "Map3dData")
+if MD and not rawget(MD, "bcr_rows") then
+  local orig_init = MD.init
+  MD.bcr_rows = true
+  MD.init = function(self, ...)
+    local res = orig_init(self, ...)
+    local d = self._data
+    if d then
+      for i = #d, 1, -1 do
+        local tid = d[i].text_id
+        if tid == "map_friend_time" or tid == "map_world_time" then table.remove(d, i) end
+      end
+    end
+    return res
+  end
+end
 local mm = r.menu_map
 local sn = mm and mm.data and mm.data._nodes and mm.data._nodes.start_game_node
 if sn and not sn.bcr_trim then
@@ -505,6 +526,24 @@ if Global.bcr_apply_binds then Global.bcr_apply_binds() end
 local o = Global.bcr_pc_out
 Global.bcr_pc_out = nil
 if Global.bcr_pc and not o then Global.bcr_pc.display = "@DISPLAY@" end
+local g = top and top.renderer and top.renderer.active_node_gui and top.renderer:active_node_gui()
+if g and g._states then
+  local sw = pc and pc.swapconfirm == "on"
+  local want_sel, want_back = sw and "btn_b" or "btn_a", sw and "btn_a" or "btn_b"
+  local changed = false
+  for _, st in pairs(g._states) do
+    local cfg = st.btn_hint_config
+    if cfg then
+      for _, e in ipairs(cfg) do
+        if e.text == "menu_select" and e.btn ~= want_sel then e.btn = want_sel changed = true
+        elseif e.text == "menu_back" and e.btn ~= want_back then e.btn = want_back changed = true end
+      end
+    end
+  end
+  if changed and g._current_state and g._states[g._current_state] and g._show_btn_hint then
+    g:_show_btn_hint(g._states[g._current_state].btn_hint_config)
+  end
+end
 local cap = ""
 local n = top and top.logic and top.logic:selected_node()
 local nname = n and n:parameters().name

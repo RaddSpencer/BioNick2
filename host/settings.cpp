@@ -36,6 +36,7 @@ const Def kDefs[] = {
     { "buttons", "xbox",    { "xbox", "playstation", "switch", nullptr },     nullptr },
     { "nojump",  "off",     { "off", "on", nullptr },                          nullptr },
     { "god",     "off",     { "off", "on", nullptr },                          nullptr },
+    { "swapconfirm", "off", { "off", "on", nullptr },                          nullptr },
     // Which physical input triggers each action. The defaults are the game's own layout.
     { "b_jump",      "a",     { BCR_SOURCES, nullptr }, nullptr },
     { "b_arm",       "b",     { BCR_SOURCES, nullptr }, nullptr },
@@ -85,7 +86,8 @@ void save_ini() {
     if (FILE* f = fopen(ini_path().c_str(), "w")) {
         fprintf(f, "# Bionic Commando Rearmed 2 (recomp) settings. Written by the PC Settings and Controls menus; you can edit it by hand while the game is closed.\n");
         fprintf(f, "# display: window, borderless or fullscreen.  scale: auto, 1, 2, 3 or 4 times 1280x720.  vrr: on for a G-Sync or FreeSync display, else off.  buttons: xbox, playstation or switch (the button labels).\n");
-        fprintf(f, "# nojump: on turns the jump button off.  god: on makes the player invulnerable with unlimited lives.\n");
+        fprintf(f, "# nojump: on turns jumping off (the Retro rule: the Death From Above move still works).  god: on makes the player invulnerable with unlimited lives.\n");
+        fprintf(f, "# swapconfirm: on makes the right face button (Xbox B) confirm and the bottom one (Xbox A) cancel in the menus.\n");
         fprintf(f, "# b_*: the input that triggers each action: a b x y lb rb lt rt l3 r3.\n");
         for (const Def& d : kDefs) fprintf(f, "%s=%s\n", d.key, values_()[d.key].c_str());
         fclose(f);
@@ -99,6 +101,8 @@ std::string& cap_action_() { static std::string s; return s; }
 std::string& cap_pending_() { static std::string s; return s; }
 bool& cap_fresh_() { static bool b = false; return b; }
 uint32_t& cap_prev_() { static uint32_t m = 0; return m; }
+bool& ui_open_() { static bool b = false; return b; }
+bool& cap_block_() { static bool b = false; return b; }
 int display_from_name(const std::string& v) { return v == "borderless" ? 1 : v == "fullscreen" ? 2 : 0; }
 const char* display_name(int m) { return m == 1 ? "borderless" : m == 2 ? "fullscreen" : "window"; }
 
@@ -132,6 +136,11 @@ local STR = {
   bcr_pc_buttons = "Button Labels",
   bcr_pc_nojump = "Disable Jump",
   bcr_pc_god = "God Mode",
+  bcr_pc_swap = "Swap Confirm & Cancel",
+  bcr_exit_q = "Exit without saving changes?",
+  bcr_exit_cap = "Controls",
+  bcr_yes = "Yes",
+  bcr_no = "No",
   bcr_back = "Exit",
   bcr_blank = " ",
   bcr_pc_buttons_xbox = "Xbox",
@@ -144,7 +153,7 @@ local STR = {
   bcr_act_jump = "Jump",
   bcr_act_arm = "Extend Bionic Arm",
   bcr_act_fire = "Fire",
-  bcr_act_upgrade = "Use Arm Upgrade",
+  bcr_act_upgrade = "Use Active Upgrade",
   bcr_act_next = "Next Weapon",
   bcr_act_prev = "Previous Weapon",
   bcr_act_cycleact = "Cycle Active Upgrade",
@@ -183,6 +192,7 @@ local DEFS = {
   { key = "buttons", text = "bcr_pc_buttons", options = { { "xbox", "bcr_pc_buttons_xbox" }, { "playstation", "bcr_pc_buttons_playstation" }, { "switch", "bcr_pc_buttons_switch" } } },
   { key = "nojump", text = "bcr_pc_nojump", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
   { key = "god", text = "bcr_pc_god", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
+  { key = "swapconfirm", text = "bcr_pc_swap", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
 }
 local SRC = { "a", "b", "x", "y", "lb", "rb", "lt", "rt", "l3", "r3" }
 local PHYS = { a = "a", b = "b", x = "x", y = "y", lb = "left_shoulder", rb = "right_shoulder", lt = "left_trigger", rt = "right_trigger", back = "back", start = "start", l3 = "left_thumb", r3 = "right_thumb", up = "d_up", down = "d_down", left = "d_left", right = "d_right" }
@@ -209,9 +219,7 @@ Global.bcr_apply_binds = function()
   for _, a in ipairs(ACTIONS) do
     if a.names then
       local src = Global.bcr_pc[a.key] or a.def
-      local want = PHYS[src]
-      if a.key == "b_jump" and Global.bcr_pc.nojump == "on" then want = nil end
-      for _, nm in ipairs(a.names) do
+      local want = PHYS[src]      for _, nm in ipairs(a.names) do
         local conn = cm[nm]
         if conn then
           local cur = conn._input_name_list or {}
@@ -257,19 +265,31 @@ Global.bcr_assign = function(key, src)
   end
   Global.bcr_apply_binds()
 end
+Global.bcr_reset_defaults = function()
+  for _, a in ipairs(ACTIONS) do
+    Global.bcr_pc[a.key] = a.def
+    push(a.key, a.def)
+  end
+  for _, mname in ipairs({ "menu_main", "menu_pause" }) do
+    local mm = reg[mname]
+    local n = mm and mm.data and mm.data._nodes and mm.data._nodes.bcr_controls
+    if n then refresh(n) end
+  end
+  Global.bcr_apply_binds()
+end
 local function toggle_item(key, text, options)
   local item = { _meta = "item", name = "bcr_" .. key, bcr_key = key, text_id = text, type = "CoreMenuItemToggle.ItemToggle" }
   for _, o in ipairs(options) do item[#item + 1] = { _meta = "option", value = o[1], text_id = o[2] } end
   return item
 end
-local function build(kind, menu, name, header, items, default_name, with_reset, straight)
+local function build(kind, menu, name, header, items, default_name, with_reset, straight, plain)
   local data = { _meta = "node", name = name }
   local flat = kind == "pause" or straight
   if straight and kind == "main" then data.camera_position = "left_outside" end
   if flat then data.header = header else data.header_id = header end
   for _, it in ipairs(items) do data[#data + 1] = it end
   if with_reset then data[#data + 1] = { _meta = "item", name = "bcr_reset", text_id = "bcr_reset" } end
-  if straight then data[#data + 1] = { _meta = "item", name = "bcr_back", text_id = "bcr_back" } end
+  if straight and not plain then data[#data + 1] = { _meta = "item", name = "bcr_back", text_id = "bcr_back" } end
   data[#data + 1] = { _meta = "default_item", name = default_name }
   data[#data + 1] = { _meta = "node_type", name = flat and "MenuPauseNodeGui" or "Menu3dNodeGui" }
   local node = MenuNode:new(data)
@@ -294,14 +314,7 @@ local function build(kind, menu, name, header, items, default_name, with_reset, 
         if top and top.logic and top.logic.navigate_back then top.logic:navigate_back(true) end
       end }
     elseif it._parameters.name == "bcr_reset" then
-      it._parameters.callback = { function()
-        for _, a in ipairs(ACTIONS) do
-          Global.bcr_pc[a.key] = a.def
-          push(a.key, a.def)
-        end
-        refresh(node)
-        Global.bcr_apply_binds()
-      end }
+      it._parameters.callback = { function() Global.bcr_reset_defaults() end }
     end
   end
   node._parameters.modifier = { refresh }
@@ -334,6 +347,27 @@ if P and not rawget(P, "bcr_orig_init") then
       self.item_panel:set_y(105)
     end
     return r
+  end
+end
+if managers.api and not rawget(managers.api, "bcr_rev") then
+  managers.api.bcr_rev = true
+  managers.api.reverse_buttons = function() return Global.bcr_pc and Global.bcr_pc.swapconfirm == "on" end
+end
+if MenuCallbackHandler then
+  MenuCallbackHandler.vis_cb_retro_not_unlocked = function() return true end
+  MenuCallbackHandler.vis_cb_retro_unlocked = function() return false end
+end
+local MG = rawget(_G, "Map3dNodeGui")
+if MG and not rawget(MG, "bcr_hint") then
+  local orig_hint = MG._show_btn_hint
+  MG.bcr_hint = true
+  MG._show_btn_hint = function(self, cfg, ...)
+    if type(cfg) == "table" then
+      local keep = {}
+      for _, e in ipairs(cfg) do if e.text ~= "menu_update_times" then keep[#keep + 1] = e end end
+      cfg = keep
+    end
+    return orig_hint(self, cfg, ...)
   end
 end
 local function settings_items()
@@ -382,6 +416,34 @@ for _, which in ipairs({ { "main", main }, { "pause", pause } }) do
     patch(menu, "help_options", "controls", "bcr_controls", nil)
   end
 end
+local dlg = reg.menu_dialog
+if dlg and dlg.data and dlg.data._nodes and tweak_data and tweak_data.menu and tweak_data.menu.dialog then
+  tweak_data.menu.dialog.bcr_confirm_exit = { caption_id = "bcr_exit_cap", dialog_type = "popup", fade_in = true, fade_in_delay = 0.3, fade_in_speed = 1.5, text_id = "bcr_exit_q" }
+  local data = { _meta = "node", name = "bcr_confirm_exit", config = "bcr_confirm_exit", back_item = "bcr_no" }
+  data[1] = { _meta = "item", name = "bcr_yes", text_id = "bcr_yes" }
+  data[2] = { _meta = "item", name = "bcr_no", text_id = "bcr_no" }
+  data[3] = { _meta = "default_item", name = "bcr_no" }
+  local dn = MenuNode:new(data)
+  local function close_dialog()
+    managers.menu:close_dialog_menu()
+  end
+  for _, it in ipairs(dn._items) do
+    if it._parameters.name == "bcr_yes" then
+      it._parameters.callback = { function()
+        Global.bcr_reset_defaults()
+        local om = managers.menu._open_menus
+        local under = om and om[#om - 1]
+        close_dialog()
+        if under and under.logic and under.logic.navigate_back then under.logic:navigate_back(true) end
+      end }
+    else
+      it._parameters.callback = { close_dialog }
+    end
+  end
+  dn._parameters.back_callback = { close_dialog }
+  if dlg.callback_handler then dn:set_callback_handler(dlg.callback_handler) end
+  dlg.data._nodes.bcr_confirm_exit = dn
+end
 return "installed"
 )LUA";
 
@@ -392,8 +454,14 @@ local r = managers and managers.menu and managers.menu._registered_menus
 local m = r and r.menu_main
 if not (m and m.data and m.data._nodes) then return nil end
 if not (m.data._nodes.pc_settings and m.data._nodes.bcr_controls) then return "reinstall" end
+local dg = r.menu_dialog
+if dg and dg.data and dg.data._nodes and not dg.data._nodes.bcr_confirm_exit then return "reinstall" end
+local om = managers.menu._open_menus
+local top = om and om[#om]
 local A = "@ASSIGN@"
-if A ~= "" and Global.bcr_assign then
+if A == "!exit" then
+  managers.menu:open_dialog_menu("bcr_confirm_exit")
+elseif A ~= "" and Global.bcr_assign then
   local k, s = A:match("^(.-):(.*)$")
   if k then Global.bcr_assign(k, s) end
 end
@@ -419,25 +487,47 @@ if pc and managers.player and (pc.god == "on" or Global.bcr_god_on) then
   for _, p in pairs(managers.player:get_players()) do p:bcr_damage()._god_mode = on end
   Global.bcr_god_on = on
 end
+local gm = managers.game
+if pc and gm and gm.set_jump_allowed and (pc.nojump == "on" or Global.bcr_nojump_set) then
+  gm:set_jump_allowed(pc.nojump ~= "on")
+  Global.bcr_nojump_set = pc.nojump == "on"
+end
+local mm = r.menu_map
+local sn = mm and mm.data and mm.data._nodes and mm.data._nodes.start_game_node
+if sn and not sn.bcr_trim then
+  sn.bcr_trim = true
+  for i = #sn._items, 1, -1 do
+    local nm = sn._items[i]._parameters.name
+    if nm == "coop" or nm == "difficulty_with_retro" then table.remove(sn._items, i) end
+  end
+end
 if Global.bcr_apply_binds then Global.bcr_apply_binds() end
 local o = Global.bcr_pc_out
 Global.bcr_pc_out = nil
 if Global.bcr_pc and not o then Global.bcr_pc.display = "@DISPLAY@" end
 local cap = ""
-local om = managers.menu._open_menus
-local top = om and om[#om]
 local n = top and top.logic and top.logic:selected_node()
-if n and n:parameters().name == "bcr_controls" then
+local nname = n and n:parameters().name
+if nname == "bcr_controls" then
   local it = top.logic:selected_item()
-  local k = it and it:parameters().bcr_key
-  if k and k:sub(1, 2) == "b_" then cap = k end
+  local p = it and it:parameters()
+  if p and p.bcr_key and p.bcr_key:sub(1, 2) == "b_" then cap = "assign:" .. p.bcr_key
+  elseif p and p.name == "bcr_back" then cap = "exit"
+  elseif p and p.name == "bcr_reset" then cap = "reset"
+  else cap = "lock" end
+elseif nname == "start_game_node" then
+  cap = "noy"
+end
+local ui = (om and #om > 0) and "1" or "0"
+if ui ~= Global.bcr_ui then
+  Global.bcr_ui = ui
+  o = (o and (o .. ";") or "") .. "ui=" .. ui
 end
 if cap ~= Global.bcr_cap then
   Global.bcr_cap = cap
   o = (o and (o .. ";") or "") .. "cap=" .. cap
 end
-return o
-)LUA";
+return o)LUA";
 
 std::string replace_all(std::string s, const std::string& a, const std::string& b) {
     for (size_t p = 0; (p = s.find(a, p)) != std::string::npos; p += b.size()) s.replace(p, a.size(), b);
@@ -498,13 +588,16 @@ std::string settings_poll_lua() {
 
 bool settings_capture_active() { std::lock_guard<std::mutex> lk(lock_()); return !cap_action_().empty(); }
 
-void settings_capture_filter(uint8_t* st) {
-    std::lock_guard<std::mutex> lk(lock_());
+// cap_action_ is what the menu poll reported for the selected row: "assign:<action>" (press a button to give it to that action), "lock" (a fixed row: no buttons),
+// "reset" and "exit" (only the confirm button works; on "exit" the cancel button asks to leave without saving), or "noy" (the level start screen: Y does nothing).
+static void capture_locked(uint8_t* st) {
     if (cap_action_().empty()) { cap_fresh_() = true; return; }
-    struct B { uint32_t bit; const char* name; };
-    static const B kBtn[] = { { 0x1000, "a" }, { 0x2000, "b" }, { 0x4000, "x" }, { 0x8000, "y" }, { 0x0100, "lb" }, { 0x0200, "rb" }, { 0x0040, "l3" }, { 0x0080, "r3" } };
+    const std::string mode = cap_action_().substr(0, cap_action_().find(':'));
     uint16_t raw; memcpy(&raw, st + 4, 2);
     uint16_t w = (uint16_t)((raw >> 8) | (raw << 8));
+    if (mode == "noy") { w &= (uint16_t)~0x8000; st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w; return; }
+    struct B { uint32_t bit; const char* name; };
+    static const B kBtn[] = { { 0x1000, "a" }, { 0x2000, "b" }, { 0x4000, "x" }, { 0x8000, "y" }, { 0x0100, "lb" }, { 0x0200, "rb" }, { 0x0040, "l3" }, { 0x0080, "r3" } };
     uint32_t cur = 0;
     for (const B& b : kBtn) if (w & b.bit) cur |= b.bit;
     // triggers count as pressed from 140, released below 60 (the same as the upgrade cycle code)
@@ -514,18 +607,50 @@ void settings_capture_filter(uint8_t* st) {
     if (st[7] >= 140 || ((prev & kRT) && st[7] >= 60)) cur |= kRT;
     if (cap_fresh_()) { cap_fresh_() = false; prev = cur; }              // whatever opened the screen is still held: not a choice
     uint32_t edge = cur & ~prev;
+    const bool swap = values_()["swapconfirm"] == "on";
+    const uint32_t confirmBit = swap ? 0x2000 : 0x1000, cancelBit = swap ? 0x1000 : 0x2000;
     if (edge && cap_pending_().empty()) {
-        const char* name = nullptr;
-        for (const B& b : kBtn) if (edge & b.bit) { name = b.name; break; }
-        if (!name) name = (edge & kLT) ? "lt" : "rt";
-        cap_pending_() = cap_action_() + ":" + name;
+        if (mode == "assign") {
+            const char* name = nullptr;
+            for (const B& b : kBtn) if (edge & b.bit) { name = b.name; break; }
+            if (!name) name = (edge & kLT) ? "lt" : "rt";
+            cap_pending_() = cap_action_().substr(cap_action_().find(':') + 1) + ":" + name;
+        } else if (mode == "exit" && (edge & cancelBit)) {
+            cap_pending_() = "!exit"; cap_block_() = true; fprintf(stderr, "[settings] cancel on Exit: asking\n");
+        }
     }
     cap_prev_() = cur;
-    uint16_t hide = 0;
+    uint16_t hide = 0x0010 | 0x0020;                                     // Start and Back never leave this screen either
     for (const B& b : kBtn) hide |= (uint16_t)b.bit;
+    if (mode == "reset" || mode == "exit") hide &= (uint16_t)~confirmBit;
     w &= (uint16_t)~hide;
     st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w;
     st[6] = 0; st[7] = 0;
+}
+
+// With "Swap Confirm & Cancel" on, the bottom and right face buttons trade places while a menu is open (the Lua poll says so). Gameplay keeps the layout set on the Controls screen.
+void settings_capture_filter(uint8_t* st) {
+    std::lock_guard<std::mutex> lk(lock_());
+    uint16_t rawIn; memcpy(&rawIn, st + 4, 2);
+    const uint16_t physIn = (uint16_t)((rawIn >> 8) | (rawIn << 8));
+    capture_locked(st);
+    if (cap_block_()) {                                                  // the cancel press that asked the question must not also answer it
+        const uint16_t cancelBit = values_()["swapconfirm"] == "on" ? 0x1000 : 0x2000;
+        if (physIn & cancelBit) {
+            uint16_t r2; memcpy(&r2, st + 4, 2);
+            uint16_t w2 = (uint16_t)((r2 >> 8) | (r2 << 8));
+            w2 &= (uint16_t)~cancelBit;
+            st[4] = (uint8_t)(w2 >> 8); st[5] = (uint8_t)w2;
+        } else cap_block_() = false;
+    }
+    if (values_()["swapconfirm"] != "on" || !ui_open_()) return;
+    uint16_t raw; memcpy(&raw, st + 4, 2);
+    uint16_t w = (uint16_t)((raw >> 8) | (raw << 8));
+    const bool a = (w & 0x1000) != 0, b = (w & 0x2000) != 0;
+    w &= (uint16_t)~0x3000;
+    if (a) w |= 0x2000;
+    if (b) w |= 0x1000;
+    st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w;
 }
 
 void settings_apply_from_lua(const std::string& changes) {
@@ -540,7 +665,8 @@ void settings_apply_from_lua(const std::string& changes) {
         size_t eq = item.find('=');
         if (eq == std::string::npos) continue;
         std::string k = item.substr(0, eq), v = item.substr(eq + 1);
-        if (k == "cap") { cap_action_() = v; cap_fresh_() = true; continue; }
+        if (k == "cap") { cap_action_() = v; cap_fresh_() = true; fprintf(stderr, "[settings] pad capture: %s\n", v.empty() ? "off" : v.c_str()); continue; }
+        if (k == "ui") { ui_open_() = v == "1"; continue; }
         const Def* d = find_def(k);
         if (!d || !allowed(*d, v)) { fprintf(stderr, "[settings] ignoring menu change '%s'\n", item.c_str()); continue; }
         values_()[k] = v;

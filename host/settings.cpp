@@ -20,6 +20,8 @@
 int gpu_display_mode();
 void gpu_set_display_mode(int mode);
 void gpu_set_button_set(int s);
+void gpu_set_gamma(int percent);
+void gpu_set_gamma_preview(bool on);
 
 namespace {
 
@@ -32,7 +34,9 @@ struct Def { const char* key; const char* def; const char* allowed[20]; const ch
 const Def kDefs[] = {
     { "display", "window", { "window", "borderless", "fullscreen", nullptr }, "BCR2_DISPLAY" },
     { "scale",   "auto",   { "auto", "1", "2", "3", "4", nullptr },           "BCR2_RESSCALE" },
+    { "outres",  "auto",   { "auto", "720", "1080", "1440", "2160", nullptr }, "BCR2_OUTRES" },
     { "vrr",     "off",    { "off", "on", nullptr },                          "BCR2_VRR" },
+    { "gamma",   "100",    { nullptr },                                       nullptr },             // percent, 50 to 150: checked by number
     { "buttons", "xbox",    { "xbox", "playstation", "switch", nullptr },     nullptr },
     { "nojump",  "off",     { "off", "on", nullptr },                          nullptr },
     { "god",     "off",     { "off", "on", nullptr },                          nullptr },
@@ -56,7 +60,11 @@ std::string ini_path() {
 }
 
 const Def* find_def(const std::string& key) { for (const Def& d : kDefs) if (key == d.key) return &d; return nullptr; }
-bool allowed(const Def& d, const std::string& v) { for (const char* a : d.allowed) if (a && v == a) return true; return false; }
+bool allowed(const Def& d, const std::string& v) {
+    if (!strcmp(d.key, "gamma")) { char* end = nullptr; long n = strtol(v.c_str(), &end, 10); return end && !*end && !v.empty() && n >= 50 && n <= 150; }
+    for (const char* a : d.allowed) if (a && v == a) return true;
+    return false;
+}
 
 std::string trim(std::string s) {
     size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
@@ -86,6 +94,7 @@ void save_ini() {
     if (FILE* f = fopen(ini_path().c_str(), "w")) {
         fprintf(f, "# Bionic Commando Rearmed 2 (recomp) settings. Written by the PC Settings and Controls menus; you can edit it by hand while the game is closed.\n");
         fprintf(f, "# display: window, borderless or fullscreen.  scale: auto, 1, 2, 3 or 4 times 1280x720.  vrr: on for a G-Sync or FreeSync display, else off.  buttons: xbox, playstation or switch (the button labels).\n");
+        fprintf(f, "# scale: internal render size (1 = 720p, 2 = 1440p, 3 = 2160p).  outres: the size of the picture on screen, auto or 720, 1080, 1440, 2160 (the render is resampled to it).  gamma: percent, 50 to 150.\n");
         fprintf(f, "# nojump: on turns jumping off (the Retro rule: the Death From Above move still works).  god: on makes the player invulnerable with unlimited lives.\n");
         fprintf(f, "# swapconfirm: on makes the right face button (Xbox B) confirm and the bottom one (Xbox A) cancel in the menus.\n");
         fprintf(f, "# b_*: the input that triggers each action: a b x y lb rb lt rt l3 r3.\n");
@@ -121,17 +130,23 @@ if not (main and main.data and main.data._nodes and main.data._nodes.main) then 
 local MenuNode = getmetatable(main.data._nodes.main)
 if not (MenuNode and MenuNode.new) then return "wait: node class" end
 local STR = {
-  bcr_pc_settings = "PC Settings",
+  bcr_pc_settings = "Graphics Settings",
+  bcr_pc_gamma = "Gamma",
+  bcr_pc_outres = "Render Resolution (restart)",
+  bcr_pc_outres_auto = "Auto",
+  bcr_pc_outres_720 = "720p",
+  bcr_pc_outres_1080 = "1080p",
+  bcr_pc_outres_1440 = "1440p",
+  bcr_pc_outres_2160 = "2160p",
   bcr_pc_display = "Display Mode",
   bcr_pc_display_window = "Windowed",
   bcr_pc_display_borderless = "Borderless",
   bcr_pc_display_fullscreen = "Exclusive Fullscreen",
-  bcr_pc_scale = "Render Resolution (restart)",
+  bcr_pc_scale = "Internal Resolution (restart)",
   bcr_pc_scale_auto = "Auto",
   bcr_pc_scale_1 = "720p",
   bcr_pc_scale_2 = "1440p",
   bcr_pc_scale_3 = "2160p",
-  bcr_pc_scale_4 = "2880p",
   bcr_pc_vrr = "Variable Refresh (restart)",
   bcr_pc_buttons = "Button Labels",
   bcr_pc_nojump = "Disable Jump",
@@ -185,10 +200,13 @@ if not rawget(L, "bcr_orig_text") then
 end
 Global.bcr_pc = Global.bcr_pc or INIT
 Global.bcr_set_labels = set_labels
-local DEFS = {
+local GFX = {
   { key = "display", text = "bcr_pc_display", options = { { "window", "bcr_pc_display_window" }, { "borderless", "bcr_pc_display_borderless" }, { "fullscreen", "bcr_pc_display_fullscreen" } } },
-  { key = "scale", text = "bcr_pc_scale", options = { { "auto", "bcr_pc_scale_auto" }, { "1", "bcr_pc_scale_1" }, { "2", "bcr_pc_scale_2" }, { "3", "bcr_pc_scale_3" }, { "4", "bcr_pc_scale_4" } } },
+  { key = "scale", text = "bcr_pc_scale", options = { { "auto", "bcr_pc_scale_auto" }, { "1", "bcr_pc_scale_1" }, { "2", "bcr_pc_scale_2" }, { "3", "bcr_pc_scale_3" } } },
+  { key = "outres", text = "bcr_pc_outres", options = { { "auto", "bcr_pc_outres_auto" }, { "720", "bcr_pc_outres_720" }, { "1080", "bcr_pc_outres_1080" }, { "1440", "bcr_pc_outres_1440" }, { "2160", "bcr_pc_outres_2160" } } },
   { key = "vrr", text = "bcr_pc_vrr", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
+}
+local SETS = {
   { key = "buttons", text = "bcr_pc_buttons", options = { { "xbox", "bcr_pc_buttons_xbox" }, { "playstation", "bcr_pc_buttons_playstation" }, { "switch", "bcr_pc_buttons_switch" } } },
   { key = "nojump", text = "bcr_pc_nojump", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
   { key = "god", text = "bcr_pc_god", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
@@ -282,17 +300,7 @@ local function toggle_item(key, text, options)
   for _, o in ipairs(options) do item[#item + 1] = { _meta = "option", value = o[1], text_id = o[2] } end
   return item
 end
-local function build(kind, menu, name, header, items, default_name, with_reset, straight, plain)
-  local data = { _meta = "node", name = name }
-  local flat = kind == "pause" or straight
-  if straight and kind == "main" then data.camera_position = "left_outside" end
-  if flat then data.header = header else data.header_id = header end
-  for _, it in ipairs(items) do data[#data + 1] = it end
-  if with_reset then data[#data + 1] = { _meta = "item", name = "bcr_reset", text_id = "bcr_reset" } end
-  if straight and not plain then data[#data + 1] = { _meta = "item", name = "bcr_back", text_id = "bcr_back" } end
-  data[#data + 1] = { _meta = "default_item", name = default_name }
-  data[#data + 1] = { _meta = "node_type", name = flat and "MenuPauseNodeGui" or "Menu3dNodeGui" }
-  local node = MenuNode:new(data)
+local function wire_items(node)
   for _, it in ipairs(node._items) do
     local key = it._parameters.bcr_key
     if key then
@@ -317,6 +325,19 @@ local function build(kind, menu, name, header, items, default_name, with_reset, 
       it._parameters.callback = { function() Global.bcr_reset_defaults() end }
     end
   end
+end
+local function build(kind, menu, name, header, items, default_name, with_reset, straight, plain)
+  local data = { _meta = "node", name = name }
+  local flat = kind == "pause" or straight
+  if straight and kind == "main" then data.camera_position = "left_outside" end
+  if flat then data.header = header else data.header_id = header end
+  for _, it in ipairs(items) do data[#data + 1] = it end
+  if with_reset then data[#data + 1] = { _meta = "item", name = "bcr_reset", text_id = "bcr_reset" } end
+  if straight and not plain then data[#data + 1] = { _meta = "item", name = "bcr_back", text_id = "bcr_back" } end
+  data[#data + 1] = { _meta = "default_item", name = default_name }
+  data[#data + 1] = { _meta = "node_type", name = flat and "MenuPauseNodeGui" or "Menu3dNodeGui" }
+  local node = MenuNode:new(data)
+  wire_items(node)
   node._parameters.modifier = { refresh }
   if menu.callback_handler then node:set_callback_handler(menu.callback_handler) end
   return node
@@ -357,10 +378,34 @@ if MenuCallbackHandler then
   MenuCallbackHandler.vis_cb_retro_not_unlocked = function() return true end
   MenuCallbackHandler.vis_cb_retro_unlocked = function() return false end
 end
-local function settings_items()
+local GAMMA_OPTIONS = {}
+for g = 50, 150, 5 do
+  STR["bcr_gm_" .. g] = string.format("%.2f", g / 100)
+  GAMMA_OPTIONS[#GAMMA_OPTIONS + 1] = { tostring(g), "bcr_gm_" .. g }
+end
+local function gfx_items()
   local items = {}
-  for _, d in ipairs(DEFS) do items[#items + 1] = toggle_item(d.key, d.text, d.options) end
+  for _, d in ipairs(GFX) do items[#items + 1] = toggle_item(d.key, d.text, d.options) end
+  items[#items + 1] = { _meta = "item", name = "bcr_gamma_open", text_id = "bcr_pc_gamma", next_node = "bcr_gamma" }
   return items
+end
+local function extend_settings(menu)
+  local sn = menu.data._nodes.settings
+  if not sn or sn.bcr_ext then return end
+  sn.bcr_ext = true
+  local data = { _meta = "node", name = "bcr_tmp" }
+  data[#data + 1] = { _meta = "item", name = "bcr_graphics_open", text_id = "bcr_pc_settings", next_node = "graphics_settings" }
+  for _, d in ipairs(SETS) do data[#data + 1] = toggle_item(d.key, d.text, d.options) end
+  data[#data + 1] = { _meta = "default_item", name = "bcr_graphics_open" }
+  local tmp = MenuNode:new(data)
+  wire_items(tmp)
+  for _, it in ipairs(tmp._items) do
+    if sn.add_item then sn:add_item(it) else sn._items[#sn._items + 1] = it end
+  end
+  local mod = sn._parameters.modifier
+  if type(mod) ~= "table" then mod = {} sn._parameters.modifier = mod end
+  mod[#mod + 1] = refresh
+  if menu.callback_handler then sn:set_callback_handler(menu.callback_handler) end
 end
 local function control_items()
   local items = {}
@@ -390,14 +435,15 @@ end
 for _, which in ipairs({ { "main", main }, { "pause", pause } }) do
   local kind, menu = which[1], which[2]
   if menu and menu.data and menu.data._nodes then
-    menu.data._nodes.pc_settings = build(kind, menu, "pc_settings", "bcr_pc_settings", settings_items(), "bcr_display", false)
+    menu.data._nodes.graphics_settings = build(kind, menu, "graphics_settings", "bcr_pc_settings", gfx_items(), "bcr_display", false)
+    menu.data._nodes.bcr_gamma = build(kind, menu, "bcr_gamma", "bcr_pc_gamma", { toggle_item("gamma", "bcr_pc_gamma", GAMMA_OPTIONS) }, "bcr_gamma", false, true, true)
+    extend_settings(menu)
     menu.data._nodes.bcr_controls = build(kind, menu, "bcr_controls", "bcr_controls", control_items(), "bcr_b_jump", true, true)
-    patch(menu, kind, "achievements_x360", "pc_settings", "bcr_pc_settings")
     local mn = menu.data._nodes[kind]
     if mn and mn._items then
       for i = #mn._items, 1, -1 do
         local nm = mn._items[i]._parameters and mn._items[i]._parameters.name
-        if nm and tostring(nm):find("^leaderboards") then table.remove(mn._items, i) end
+        if nm and (tostring(nm):find("^leaderboards") or tostring(nm):find("^achievements")) then table.remove(mn._items, i) end
       end
     end
     patch(menu, "help_options", "controls", "bcr_controls", nil)
@@ -440,7 +486,7 @@ const char* kPollLua = R"LUA(
 local r = managers and managers.menu and managers.menu._registered_menus
 local m = r and r.menu_main
 if not (m and m.data and m.data._nodes) then return nil end
-if not (m.data._nodes.pc_settings and m.data._nodes.bcr_controls) then return "reinstall" end
+if not (m.data._nodes.graphics_settings and m.data._nodes.bcr_controls) then return "reinstall" end
 local dg = r.menu_dialog
 if dg and dg.data and dg.data._nodes and not dg.data._nodes.bcr_confirm_exit then return "reinstall" end
 local om = managers.menu._open_menus
@@ -571,6 +617,8 @@ if nname == "bcr_controls" then
   elseif p and p.name == "bcr_back" then cap = "exit"
   elseif p and p.name == "bcr_reset" then cap = "reset"
   else cap = "lock" end
+elseif nname == "bcr_gamma" then
+  cap = "gamma"
 elseif nname == "start_game_node" then
   cap = "noy"
 end
@@ -611,9 +659,10 @@ void settings_apply_to_env() {
         const std::string& v = values_()[d.key];
         if (!d.env || getenv(d.env)) continue;                         // no switch for this one, or an explicit switch beats the file
         if (!strcmp(d.key, "vrr")) { if (v == "on") _putenv_s(d.env, "1"); }
-        else if (!strcmp(d.key, "scale")) { if (v != "auto") _putenv_s(d.env, v.c_str()); }
+        else if (!strcmp(d.key, "scale") || !strcmp(d.key, "outres")) { if (v != "auto") _putenv_s(d.env, v.c_str()); }
         else _putenv_s(d.env, v.c_str());
     }
+    gpu_set_gamma(atoi(values_()["gamma"].c_str()));
     upgrades_set_source(0, values_()["b_cycleact"].c_str());
     upgrades_set_source(1, values_()["b_cyclepas"].c_str());
     fprintf(stderr, "[settings] %s: display=%s scale=%s vrr=%s buttons=%s\n", ini_path().c_str(), values_()["display"].c_str(), values_()["scale"].c_str(), values_()["vrr"].c_str(), values_()["buttons"].c_str());
@@ -651,6 +700,7 @@ static void capture_locked(uint8_t* st) {
     const std::string mode = cap_action_().substr(0, cap_action_().find(':'));
     uint16_t raw; memcpy(&raw, st + 4, 2);
     uint16_t w = (uint16_t)((raw >> 8) | (raw << 8));
+    if (mode == "gamma") return;                                         // the gamma screen: every button works as normal
     if (mode == "noy") { w &= (uint16_t)~0x8000; st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w; return; }
     struct B { uint32_t bit; const char* name; };
     static const B kBtn[] = { { 0x1000, "a" }, { 0x2000, "b" }, { 0x4000, "x" }, { 0x8000, "y" }, { 0x0100, "lb" }, { 0x0200, "rb" }, { 0x0040, "l3" }, { 0x0080, "r3" } };
@@ -721,17 +771,18 @@ void settings_apply_from_lua(const std::string& changes) {
         size_t eq = item.find('=');
         if (eq == std::string::npos) continue;
         std::string k = item.substr(0, eq), v = item.substr(eq + 1);
-        if (k == "cap") { cap_action_() = v; cap_fresh_() = true; fprintf(stderr, "[settings] pad capture: %s\n", v.empty() ? "off" : v.c_str()); continue; }
+        if (k == "cap") { cap_action_() = v; cap_fresh_() = true; gpu_set_gamma_preview(v == "gamma"); fprintf(stderr, "[settings] pad capture: %s\n", v.empty() ? "off" : v.c_str()); continue; }
         if (k == "ui") { ui_open_() = v == "1"; continue; }
         const Def* d = find_def(k);
         if (!d || !allowed(*d, v)) { fprintf(stderr, "[settings] ignoring menu change '%s'\n", item.c_str()); continue; }
         values_()[k] = v;
         save = true;
         if (k == "display") { gpu_set_display_mode(display_from_name(v)); fprintf(stderr, "[settings] display = %s (applied now)\n", v.c_str()); }
+        else if (k == "gamma") { gpu_set_gamma(atoi(v.c_str())); }
         else if (k == "buttons") { gpu_set_button_set(button_set_from_name(v)); fprintf(stderr, "[settings] buttons = %s (applied now)\n", v.c_str()); }
         else if (k == "b_cycleact") { upgrades_set_source(0, v.c_str()); fprintf(stderr, "[settings] cycle active upgrade = %s (applied now)\n", v.c_str()); }
         else if (k == "b_cyclepas") { upgrades_set_source(1, v.c_str()); fprintf(stderr, "[settings] cycle passive upgrade = %s (applied now)\n", v.c_str()); }
-        else if ((k[0] == 'b' && k[1] == '_') || k == "nojump" || k == "god") fprintf(stderr, "[settings] %s = %s (applied now)\n", k.c_str(), v.c_str());
+        else if ((k[0] == 'b' && k[1] == '_') || k == "nojump" || k == "god" || k == "swapconfirm" || k == "gamma") fprintf(stderr, "[settings] %s = %s (applied now)\n", k.c_str(), v.c_str());
         else fprintf(stderr, "[settings] %s = %s (takes effect after a restart)\n", k.c_str(), v.c_str());
     }
     if (save) save_ini();

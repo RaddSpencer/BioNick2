@@ -179,6 +179,11 @@ static std::atomic<bool> g_sizeChanged{false};
 static int g_modeNow = kWindowed;
 int gpu_display_mode() { return g_modeWanted.load(); }
 void gpu_set_display_mode(int mode) { g_modeWanted = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+// The player's gamma (percent, 100 = unchanged) and whether the gamma screen's sample picture is showing. The final pass reads both.
+static std::atomic<float> g_gamma{1.0f};
+static std::atomic<bool> g_gammaPreview{false};
+void gpu_set_gamma(int percent) { g_gamma = (percent < 50 ? 50 : percent > 200 ? 200 : percent) / 100.0f; }
+void gpu_set_gamma_preview(bool on) { g_gammaPreview = on; }
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }
@@ -200,7 +205,15 @@ static DWORD WINAPI window_thread(LPVOID ev) {
     WNDCLASSW wc{}; wc.lpfnWndProc = wnd_proc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"bcr2win";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    RECT rc{ 0, 0, 1280, 720 }; AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    // BCR2_OUTRES=<height>: the size of the picture on screen (1080 is 1920x1080). The game still renders at its own internal scale and is resampled to this.
+    int ow = 1280, oh = 720;
+    if (const char* e = getenv("BCR2_OUTRES")) { int h = atoi(e); if (h >= 360 && h <= 4320) { oh = h; ow = (h * 16 + 4) / 9; } }
+    RECT work{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    if (ow > (work.right - work.left) - 40 || oh > (work.bottom - work.top) - 80) {   // a window bigger than the screen would be useless: fit it
+        const float k = std::min(((work.right - work.left) - 40) / (float)ow, ((work.bottom - work.top) - 80) / (float)oh);
+        ow = (int)(ow * k); oh = (int)(oh * k);
+    }
+    RECT rc{ 0, 0, ow, oh }; AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowW(L"bcr2win", L"Bionic Commando Rearmed 2 (recomp)", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
                            rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, wc.hInstance, nullptr);
     SetEvent((HANDLE)ev);
@@ -372,17 +385,26 @@ static bool device_init() {
         "  uint w=(d<<8)|(s&255); return float4(w&255,(w>>8)&255,(w>>16)&255,(w>>24)&255)/255.0; }\n";
     if (auto b = compile_cached(blitRaw, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psBlitRaw);
     // Present samples with a filter, so the picture can be scaled. At 1:1 every sample lands on a texel centre, which gives the texel unchanged.
-    const char* presentLut =
-        "Texture2D src:register(t0); Texture2D lut:register(t1); SamplerState smp:register(s0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
-        "float4 main(float4 p:SV_Position):SV_Target { float w,h; src.GetDimensions(w,h); float4 c=src.SampleLevel(smp,(p.xy*scale+ofs)/float2(w,h),0); if(swaprb) c=c.bgra;\n"
-        "  float3 u=(saturate(c.rgb)*255.0+0.5)/256.0;\n"
-        "  return float4(lut.SampleLevel(smp,float2(u.r,0.5),0).r, lut.SampleLevel(smp,float2(u.g,0.5),0).g, lut.SampleLevel(smp,float2(u.b,0.5),0).b, 1.0); }\n";
-    if (auto b = compile_cached(presentLut, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentLut);
-    const char* presentPlain =
-        "Texture2D src:register(t0); SamplerState smp:register(s0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
-        "float4 main(float4 p:SV_Position):SV_Target { float w,h; src.GetDimensions(w,h); float4 c=src.SampleLevel(smp,(p.xy*scale+ofs)/float2(w,h),0); return float4(swaprb? c.bgr : c.rgb,1.0); }\n";
-    if (auto b = compile_cached(presentPlain, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentPlain);
-    {
+    // The final pass. Several samples per output pixel when the picture is bigger than the window (supersampling), the game's own gamma ramp, the player's gamma,
+    // and the gamma screen's sample picture under the menu (t2) while it is open.
+    const char* presentCommon =
+        "Texture2D src:register(t0); Texture2D lut:register(t1); Texture2D prv:register(t2); SamplerState smp:register(s0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; float gam; float pv; float pad; };\n"
+        "float4 main(float4 p:SV_Position):SV_Target { float w,h; src.GetDimensions(w,h); float2 c0=p.xy*scale+ofs; float4 c;\n"
+        "  int2 n=(int2)clamp(ceil(scale-0.001),1.0,4.0);\n"
+        "  if(n.x>1||n.y>1){ float4 a=0; for(int j=0;j<n.y;j++) for(int i=0;i<n.x;i++){ float2 o=((float2(i,j)+0.5)/n-0.5)*scale; a+=src.SampleLevel(smp,(c0+o)/float2(w,h),0); } c=a/(float)(n.x*n.y); }\n"
+        "  else c=src.SampleLevel(smp,c0/float2(w,h),0);\n"
+        "  if(swaprb) c=c.bgra;\n"
+        "  float3 col=c.rgb;\n"
+        "#ifdef LUT\n"
+        "  float3 u=(saturate(col)*255.0+0.5)/256.0;\n"
+        "  col=float3(lut.SampleLevel(smp,float2(u.r,0.5),0).r, lut.SampleLevel(smp,float2(u.g,0.5),0).g, lut.SampleLevel(smp,float2(u.b,0.5),0).b);\n"
+        "#endif\n"
+        "  col=saturate(col);\n"
+        "  if(pv>0.5){ float3 im=prv.SampleLevel(smp,c0/float2(w,h),0).rgb; col=saturate(col+im*(1.0-max(col.r,max(col.g,col.b)))); }\n"
+        "  if(abs(gam-1.0)>0.001) col=pow(col,1.0/gam);\n"
+        "  return float4(col,1.0); }\n";
+    if (auto b = compile_cached(std::string("#define LUT 1\n") + presentCommon, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentLut);
+    if (auto b = compile_cached(presentCommon, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psPresentPlain);    {
         D3D11_TEXTURE2D_DESC d{}; d.Width = 256; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R10G10B10A2_UNORM; d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         g_dev->CreateTexture2D(&d, nullptr, &g_lutTex);
@@ -1479,6 +1501,22 @@ static std::wstring assets_dir() {
     return s;
 }
 // The replacement for the atlas, or null to use the game's own.
+// The sample picture for the gamma screen: assets\gamma.png, 1280x720. Without the file the screen shows only its slider.
+static ID3D11ShaderResourceView* gamma_preview_srv() {
+    static ComPtr<ID3D11Texture2D> tex; static ComPtr<ID3D11ShaderResourceView> srv; static bool tried = false;
+    if (!tried) {
+        tried = true;
+        std::vector<uint8_t> px; uint32_t w = 0, h = 0;
+        const std::wstring path = assets_dir() + L"\\gamma.png";
+        if (load_png_rgba(path, px, w, h) && w && h) {
+            D3D11_TEXTURE2D_DESC d{}; d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA sd{ px.data(), w * 4, 0 };
+            if (SUCCEEDED(g_dev->CreateTexture2D(&d, &sd, &tex))) g_dev->CreateShaderResourceView(tex.Get(), nullptr, &srv);
+        }
+        fprintf(stderr, "[gamma] sample picture %ls: %s\n", path.c_str(), srv ? "loaded" : "not found");
+    }
+    return srv.Get();
+}
 static HostTex* button_override() {
     const int s = gpu_button_set();
     if (s <= 0 || s > 3 || g_buttonFailed[s]) return nullptr;
@@ -2480,13 +2518,14 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
 }
 
 // ---- resolve ----
+static ID3D11ShaderResourceView* g_blitExtra = nullptr;                        // bound to t2 for the next blit: the gamma screen's sample picture
 static void blit(ID3D11ShaderResourceView* src, ID3D11PixelShader* ps, ID3D11RenderTargetView* dst, uint32_t dw, uint32_t dh,
                  int dx0, int dy0, int dx1, int dy1, int sx, int sy, bool swaprb, float scaleX = 1, float scaleY = 1, ID3D11ShaderResourceView* src2 = nullptr, const float* ofsOverride = nullptr) {
     ID3D11ShaderResourceView* nul[32] = {};
     g_ctx->PSSetShaderResources(0, 32, nul);
     g_ctx->OMSetRenderTargets(1, &dst, nullptr);
     invalidate_binds();
-    struct { float ofs[2]; float scale[2]; uint32_t sw; uint32_t pad[3]; } p{ { (float)(sx - dx0), (float)(sy - dy0) }, { scaleX, scaleY }, swaprb ? 1u : 0u, {} };
+    struct { float ofs[2]; float scale[2]; uint32_t sw; float gam; float pv; float pad; } p{ { (float)(sx - dx0), (float)(sy - dy0) }, { scaleX, scaleY }, swaprb ? 1u : 0u, g_gamma.load(), (g_blitExtra ? 1.0f : 0.0f), 0.0f };
     if (ofsOverride) { p.ofs[0] = ofsOverride[0]; p.ofs[1] = ofsOverride[1]; }
     upload_cb(g_cbBlit.Get(), &p, sizeof(p));
     ID3D11Buffer* cb = g_cbBlit.Get();
@@ -2505,8 +2544,9 @@ static void blit(ID3D11ShaderResourceView* src, ID3D11PixelShader* ps, ID3D11Ren
     g_ctx->RSSetScissorRects(1, &sc);
     g_ctx->PSSetShaderResources(0, 1, &src);
     if (src2) g_ctx->PSSetShaderResources(1, 1, &src2);
+    if (g_blitExtra) g_ctx->PSSetShaderResources(2, 1, &g_blitExtra);
     g_ctx->Draw(3, 0);
-    g_ctx->PSSetShaderResources(0, 2, nul);
+    g_ctx->PSSetShaderResources(0, 3, nul);
     static const char* probeEnv = getenv("BCR2_PROBE");                     // also report the probed pixel after each resolve blit
     if (probeEnv && g_trace > 1000) {
         uint32_t px = 0, py = 0; sscanf(probeEnv, "%u,%u", &px, &py);
@@ -2853,6 +2893,8 @@ static void update_display() {
             SetWindowPos(g_hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
         if (want == kExclusive) {
+            static const int kOutH = getenv("BCR2_OUTRES") ? atoi(getenv("BCR2_OUTRES")) : 0;
+            if (kOutH >= 360 && kOutH <= 4320) { DXGI_MODE_DESC md{}; md.Width = (UINT)((kOutH * 16 + 4) / 9); md.Height = (UINT)kOutH; md.Format = DXGI_FORMAT_R8G8B8A8_UNORM; g_swap->ResizeTarget(&md); }
             HRESULT hr = g_swap->SetFullscreenState(TRUE, nullptr);
             if (FAILED(hr)) { fprintf(stderr, "[display] exclusive fullscreen failed: %08lX\n", hr); g_modeWanted = want = kWindowed; }
         }
@@ -2985,7 +3027,9 @@ static void do_swap(uint32_t front) {
         const float sxs = (float)(s->w * g_resScale) / pw, sys = (float)(s->h * g_resScale) / ph, ofs[2] = { -px * sxs, -py * sys };
         ID3D11SamplerState* presentSamp = g_presentSampler.Get();
         g_ctx->PSSetSamplers(0, 1, &presentSamp);
+        g_blitExtra = g_gammaPreview.load() ? gamma_preview_srv() : nullptr;
         blit(s->srv.Get(), useRamp ? g_psPresentLut.Get() : g_psPresentPlain.Get(), g_backRtv.Get(), g_backW, g_backH, px, py, px + pw, py + ph, 0, 0, s->swapped, sxs, sys, useRamp ? g_lutSrv.Get() : nullptr, ofs);
+        g_blitExtra = nullptr;
     } else {
         float c[4] = { 0.05f, 0.0f, 0.1f, 1 };
         g_ctx->ClearRenderTargetView(g_backRtv.Get(), c);

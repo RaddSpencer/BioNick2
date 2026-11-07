@@ -532,7 +532,7 @@ if g and g._states then
   local want_sel, want_back = sw and "btn_b" or "btn_a", sw and "btn_a" or "btn_b"
   local changed = false
   for _, st in pairs(g._states) do
-    local cfg = st.btn_hint_config
+    local cfg = type(st) == "table" and st.btn_hint_config or nil
     if cfg then
       for _, e in ipairs(cfg) do
         if e.text == "menu_select" and e.btn ~= want_sel then e.btn = want_sel changed = true
@@ -540,8 +540,9 @@ if g and g._states then
       end
     end
   end
-  if changed and g._current_state and g._states[g._current_state] and g._show_btn_hint then
-    g:_show_btn_hint(g._states[g._current_state].btn_hint_config)
+  local cur_st = g._current_state and g._states[g._current_state]
+  if changed and type(cur_st) == "table" and g._show_btn_hint then
+    g:_show_btn_hint(cur_st.btn_hint_config)
   end
 end
 local cap = ""

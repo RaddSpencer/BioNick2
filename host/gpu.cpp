@@ -1500,6 +1500,22 @@ static HostTex* button_override() {
     fprintf(stderr, "[buttons] set %d loaded from %ls (%ux%u)\n", s, path.c_str(), w, h);
     return &t;
 }
+// ---- the third start-up screen (the save warning) is a 1024x256 RGBA texture. assets\splash\save_warning_color.png and save_warning_alpha.png (red, green and blue from the
+// first, alpha from the red channel of the second) replace it, so it can say PC instead of Xbox 360. Recognised by a hash of its guest memory, like the button atlas.
+static const uint64_t kSplashHash = 0x12CF43706632E13Full;                                        // the [splash] log line prints the real value
+static void splash_override(std::vector<uint8_t>& out) {
+    static bool tried = false, ok = false;
+    static std::vector<uint8_t> c, a;
+    if (!tried) {
+        tried = true;
+        uint32_t w1 = 0, h1 = 0, w2 = 0, h2 = 0;
+        const std::wstring dir = assets_dir() + L"\\splash\\";
+        ok = load_png_rgba(dir + L"save_warning_color.png", c, w1, h1) && load_png_rgba(dir + L"save_warning_alpha.png", a, w2, h2) && w1 == 1024 && h1 == 256 && w2 == 1024 && h2 == 256;
+        fprintf(stderr, "[splash] %s the replacement save warning from %ls\n", ok ? "loaded" : "could not load", dir.c_str());
+    }
+    if (!ok || out.size() != (size_t)1024 * 256 * 4) return;
+    for (size_t i = 0; i < (size_t)1024 * 256; i++) { out[i * 4] = c[i * 4]; out[i * 4 + 1] = c[i * 4 + 1]; out[i * 4 + 2] = c[i * 4 + 2]; out[i * 4 + 3] = a[i * 4]; }
+}
 static HostTex* get_texture(const FetchInfo& fi) {
     TexFmt tf;
     if (!tex_fmt(fi.fmt, tf)) { logf_once(S("texf%u", fi.fmt).c_str(), "unsupported texture format %u (%ux%u at %X)", fi.fmt, fi.w, fi.h, fi.base); return nullptr; }
@@ -1574,6 +1590,11 @@ static HostTex* get_texture(const FetchInfo& fi) {
                 if (tf.conv) unpack_rgba8(tf.conv, tmp, dst); else memcpy(dst, tmp, tf.bpb);
             }
         }
+    }
+    if (fi.fmt == 6 && hw == 1024 && hh == 256 && fi.faces == 1 && out.size() == (size_t)1024 * 256 * 4) {
+        static std::set<uint64_t> seenSplash;
+        if (seenSplash.insert(h).second) fprintf(stderr, "[splash] 1024x256 RGBA texture at %08X hash %016llX%s\n", fi.base, (unsigned long long)h, (kSplashHash && h == kSplashHash) ? " (the save warning)" : "");
+        if (kSplashHash && h == kSplashHash) splash_override(out);
     }
     { static const char* kDump = getenv("BCR2_TEXDUMP"); if (kDump) dump_texture_bmp(kDump, fi.base, fi.fmt, hw, hh, tf, out.data()); }
     const uint32_t levels = maxLevel + 1;

@@ -1,3 +1,4 @@
+#include "upgradecycle.h"
 #include "ppc_config.h"
 #include "ppc_context.h"
 #include "guestfp.h"
@@ -1812,7 +1813,7 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t* base) {
         ULONGLONG el = GetTickCount64() - t0;
         uint16_t buttons = 0;
         int16_t lx = 0, ly = 0;
-        uint8_t rt = 0;
+        uint8_t rt = 0, lt = 0;
         uint32_t cycle = 0;
         if (el >= 15000) {
             static const uint32_t kStepMs = getenv("BCR2_AUTOINPUTMS") ? (uint32_t)atoi(getenv("BCR2_AUTOINPUTMS")) : 500;   // shorter steps test rapid presses
@@ -1836,14 +1837,17 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t* base) {
               case 'l': lx = -32000; break;
               case 'r': lx = 32000; break;
               case 'T': rt = 255; break;           // right trigger
+              case 'Z': lt = 255; break;           // left trigger
+              case 'C': buttons = 0x0080; break;   // right stick click
             }
         }
         static std::atomic<uint32_t> lastCycle{0xFFFFFFFFu};
         uint32_t prev = lastCycle.exchange(cycle);
         if (prev != cycle && cycle < 24) fprintf(stderr, "[input] press step=%u buttons=%04X lx=%d ly=%d t=%lu\n", cycle, buttons, lx, ly, GetTickCount());
-        if (prev != cycle && (buttons || lx || ly || rt)) gpu_note_press();
+        if (prev != cycle && (buttons || lx || ly || rt || lt)) gpu_note_press();
         wr32(base, st, cycle + 1);                                  // packet number changes with the state
         *(uint16_t*)(base + st + 4) = _byteswap_ushort(buttons);
+        base[st + 6] = lt;
         base[st + 7] = rt;
         *(uint16_t*)(base + st + 8) = _byteswap_ushort((uint16_t)lx);
         *(uint16_t*)(base + st + 10) = _byteswap_ushort((uint16_t)ly);
@@ -1861,6 +1865,15 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t* base) {
             *(uint16_t*)(base + st + 12) = _byteswap_ushort((uint16_t)g.sThumbRX);
             *(uint16_t*)(base + st + 14) = _byteswap_ushort((uint16_t)g.sThumbRY);
         }
+    }
+    if (st) {   // LT and a click of the right stick cycle the equipped arm upgrades (upgradecycle.cpp). The game uses neither. Acts on the press, with some slack on the trigger.
+        static bool ltDown = false, r3Down = false;
+        const uint16_t b = _byteswap_ushort(*(uint16_t*)(base + st + 4));
+        const uint8_t lt = base[st + 6];
+        const bool ltNow = ltDown ? lt > 60 : lt > 140, r3Now = (b & 0x0080) != 0;
+        if (ltNow && !ltDown) upgrades_note_press(0);
+        if (r3Now && !r3Down) upgrades_note_press(1);
+        ltDown = ltNow; r3Down = r3Now;
     }
     ctx.r3.u64 = 0;
 }

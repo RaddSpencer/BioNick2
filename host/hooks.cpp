@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include "settings.h"
+#include "upgradecycle.h"
 struct ShRec { char tag; DWORD tid; uint32_t before, after, a4, a5, lr; };
 static ShRec g_shRing[64];
 static std::atomic<unsigned> g_shN{0};
@@ -508,6 +509,19 @@ PPC_FUNC(sub_82634458) {
     static const bool kSoundLog = getenv("BCR2_SOUNDLOG") != nullptr;
     static thread_local bool inside = false;
     static const bool kPcMenu = getenv("BCR2_NOPCMENU") == nullptr;
+    if (!inside && upgrades_pending()) {   // LT or a right stick click was pressed: cycle the equipped arm upgrade now
+        inside = true;
+        const PPCContext saved = ctx;
+        const uint32_t L = saved.r3.u32, funcOff = saved.r4.u32 - PPC_LOAD_U32(L + 32);
+        std::string r;
+        lua_run_chunk(ctx, base, L, upgrades_cycle_lua().c_str(), nullptr, &r);
+        if (!r.empty()) fprintf(stderr, "[upgrades] %s at frame %llu\n", r.c_str(), (unsigned long long)gpu_frame_number());
+        auto fpscr = ctx.fpscr;
+        ctx = saved;
+        ctx.fpscr = fpscr;
+        ctx.r4.u64 = PPC_LOAD_U32(L + 32) + funcOff;
+        inside = false;
+    }
     {   // The PC Settings menu: installs it into the game's menu data, then collects what the player changed there a few times a second.
         static std::atomic<uint64_t> nextPc{ 200 };
         static bool installed = false;

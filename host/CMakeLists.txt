@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 # stubs below can override the weak thunk functions
 file(GLOB PPC_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../ppc/*.cpp")
 
-add_executable(bcr2 main.cpp imports.cpp hooks.cpp gpu.cpp shaderpack.cpp settings.cpp audio.cpp generated/import_stubs.cpp ${PPC_SRC})
+add_executable(bcr2 main.cpp imports.cpp hooks.cpp gpu.cpp shaderpack.cpp settings.cpp upgradecycle.cpp audio.cpp generated/import_stubs.cpp ${PPC_SRC})
 set_source_files_properties(gpu.cpp shaderpack.cpp PROPERTIES COMPILE_OPTIONS "/O2")   # the renderer decodes textures and copies vertices
 target_link_libraries(bcr2 PRIVATE d3d11 dxgi d3dcompiler user32 gdi32 ole32)
 target_link_options(bcr2 PRIVATE /MAP:bcr2.map)

@@ -513,6 +513,22 @@ if MD and not rawget(MD, "bcr_rows") then
     return res
   end
 end
+local GR = rawget(_G, "Grenade")
+if GR and not rawget(GR, "bcr_td") then
+  GR.bcr_td = true
+  local orig_un = GR.update_normal
+  GR.bcr_orig = orig_un
+  GR.update_normal = function(self, time, rel)
+    if self._throw_down and self._init_z and managers.level then
+      local pos = self._pos
+      local ta = managers.level:tilearray()
+      local inside = ta:get_tile(pos + Vector3(-10, 0, 0)) or ta:get_tile(pos + Vector3(10, 0, 0)) or ta:get_tile(pos + Vector3(0, 0, -10)) or ta:get_tile(pos + Vector3(0, 0, 10))
+      if inside and not self.bcr_in_tile and pos.z < self._init_z - 100 then self._throw_down = false end
+      self.bcr_in_tile = inside ~= nil
+    end
+    return orig_un(self, time, rel)
+  end
+end
 local mm = r.menu_map
 local sn = mm and mm.data and mm.data._nodes and mm.data._nodes.start_game_node
 if sn and not sn.bcr_trim then

@@ -40,4 +40,3 @@ missing_entries.txt
 # downloaded art packs; only what the game uses is copied into host/assets
 assets_src/
 gamma.png
-host/assets/gamma.png

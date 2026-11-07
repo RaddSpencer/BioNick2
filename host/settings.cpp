@@ -1,4 +1,4 @@
-﻿// Settings file and the in-game PC Settings and Controls menus.
+// Settings file and the in-game PC Settings and Controls menus.
 //
 // The menus replace the Achievements entry of the game's main and pause menus (nothing in this build can show achievements) and the Controls entry of
 // Help & Options (a picture of the controller). They are built at run time, in Lua, from the same node and item classes the game's menu files use, so the
@@ -325,6 +325,13 @@ for _, which in ipairs({ { "main", main }, { "pause", pause } }) do
     menu.data._nodes.pc_settings = build(kind, menu, "pc_settings", "bcr_pc_settings", settings_items(), "bcr_display", false)
     menu.data._nodes.bcr_controls = build(kind, menu, "bcr_controls", "bcr_controls", control_items(), "bcr_b_jump", true, true)
     patch(menu, kind, "achievements_x360", "pc_settings", "bcr_pc_settings")
+    local mn = menu.data._nodes[kind]
+    if mn and mn._items then
+      for i = #mn._items, 1, -1 do
+        local nm = mn._items[i]._parameters and mn._items[i]._parameters.name
+        if nm and tostring(nm):find("^leaderboards") then table.remove(mn._items, i) end
+      end
+    end
     patch(menu, "help_options", "controls", "bcr_controls", nil)
   end
 end

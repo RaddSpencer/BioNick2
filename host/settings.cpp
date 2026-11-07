@@ -17,6 +17,7 @@
 
 int gpu_display_mode();
 void gpu_set_display_mode(int mode);
+void gpu_set_button_set(int s);
 
 namespace {
 
@@ -29,6 +30,7 @@ const Def kDefs[] = {
     { "display", "window", { "window", "borderless", "fullscreen", nullptr }, "BCR2_DISPLAY" },
     { "scale",   "auto",   { "auto", "1", "2", "3", "4", nullptr },           "BCR2_RESSCALE" },
     { "vrr",     "off",    { "off", "on", nullptr },                          "BCR2_VRR" },
+    { "buttons", "classic", { "classic", "xbox", "playstation", "switch", nullptr }, nullptr },
 };
 
 std::string ini_path() {
@@ -66,12 +68,13 @@ void load_ini() {
 void save_ini() {
     if (FILE* f = fopen(ini_path().c_str(), "w")) {
         fprintf(f, "# Bionic Commando Rearmed 2 (recomp) settings. Written by the PC Settings menu; you can edit it by hand while the game is closed.\n");
-        fprintf(f, "# display: window, borderless or fullscreen.  scale: auto, 1, 2, 3 or 4 times 1280x720.  vrr: on for a G-Sync or FreeSync display, else off.\n");
+        fprintf(f, "# display: window, borderless or fullscreen.  scale: auto, 1, 2, 3 or 4 times 1280x720.  vrr: on for a G-Sync or FreeSync display, else off.  buttons: classic, xbox, playstation or switch.\n");
         for (const Def& d : kDefs) fprintf(f, "%s=%s\n", d.key, values_()[d.key].c_str());
         fclose(f);
     }
 }
 
+int button_set_from_name(const std::string& v) { return v == "xbox" ? 1 : v == "playstation" ? 2 : v == "switch" ? 3 : 0; }
 int display_from_name(const std::string& v) { return v == "borderless" ? 1 : v == "fullscreen" ? 2 : 0; }
 const char* display_name(int m) { return m == 1 ? "borderless" : m == 2 ? "fullscreen" : "window"; }
 
@@ -97,6 +100,11 @@ local STR = {
   bcr_pc_scale_3 = "2160p",
   bcr_pc_scale_4 = "2880p",
   bcr_pc_vrr = "Variable Refresh (restart)",
+  bcr_pc_buttons = "Button Prompts",
+  bcr_pc_buttons_classic = "Classic",
+  bcr_pc_buttons_xbox = "Xbox",
+  bcr_pc_buttons_playstation = "PlayStation",
+  bcr_pc_buttons_switch = "Switch",
   bcr_pc_off = "Off",
   bcr_pc_on = "On",
 }
@@ -110,11 +118,12 @@ if not rawget(L, "bcr_orig_text") then
     return orig(self, id, ...)
   end
 end
-Global.bcr_pc = Global.bcr_pc or { display = INIT.display, scale = INIT.scale, vrr = INIT.vrr }
+Global.bcr_pc = Global.bcr_pc or { display = INIT.display, scale = INIT.scale, vrr = INIT.vrr, buttons = INIT.buttons }
 local DEFS = {
   { key = "display", text = "bcr_pc_display", options = { { "window", "bcr_pc_display_window" }, { "borderless", "bcr_pc_display_borderless" }, { "fullscreen", "bcr_pc_display_fullscreen" } } },
   { key = "scale", text = "bcr_pc_scale", options = { { "auto", "bcr_pc_scale_auto" }, { "1", "bcr_pc_scale_1" }, { "2", "bcr_pc_scale_2" }, { "3", "bcr_pc_scale_3" }, { "4", "bcr_pc_scale_4" } } },
   { key = "vrr", text = "bcr_pc_vrr", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
+  { key = "buttons", text = "bcr_pc_buttons", options = { { "classic", "bcr_pc_buttons_classic" }, { "xbox", "bcr_pc_buttons_xbox" }, { "playstation", "bcr_pc_buttons_playstation" }, { "switch", "bcr_pc_buttons_switch" } } },
 }
 local function refresh(node)
   local cur = Global.bcr_pc
@@ -208,7 +217,7 @@ void settings_apply_to_env() {
     load_ini();
     for (const Def& d : kDefs) {
         const std::string& v = values_()[d.key];
-        if (getenv(d.env)) continue;                                   // an explicit switch beats the file
+        if (!d.env || getenv(d.env)) continue;                         // no switch for this one, or an explicit switch beats the file
         if (!strcmp(d.key, "vrr")) { if (v == "on") _putenv_s(d.env, "1"); }
         else if (!strcmp(d.key, "scale")) { if (v != "auto") _putenv_s(d.env, v.c_str()); }
         else _putenv_s(d.env, v.c_str());
@@ -216,9 +225,11 @@ void settings_apply_to_env() {
     fprintf(stderr, "[settings] %s: display=%s scale=%s vrr=%s\n", ini_path().c_str(), values_()["display"].c_str(), values_()["scale"].c_str(), values_()["vrr"].c_str());
 }
 
+int settings_button_set() { std::lock_guard<std::mutex> lk(lock_()); return button_set_from_name(values_()["buttons"]); }
+
 std::string settings_install_lua() {
     std::lock_guard<std::mutex> lk(lock_());
-    std::string init = "{ display = \"" + std::string(display_name(gpu_display_mode())) + "\", scale = \"" + values_()["scale"] + "\", vrr = \"" + values_()["vrr"] + "\" }";
+    std::string init = "{ display = \"" + std::string(display_name(gpu_display_mode())) + "\", scale = \"" + values_()["scale"] + "\", vrr = \"" + values_()["vrr"] + "\", buttons = \"" + values_()["buttons"] + "\" }";
     return replace_all(lua_text(kInstallLua), "@INIT@", init);
 }
 
@@ -243,6 +254,7 @@ void settings_apply_from_lua(const std::string& changes) {
         values_()[k] = v;
         save = true;
         if (k == "display") { gpu_set_display_mode(display_from_name(v)); fprintf(stderr, "[settings] display = %s (applied now)\n", v.c_str()); }
+        else if (k == "buttons") { gpu_set_button_set(button_set_from_name(v)); fprintf(stderr, "[settings] buttons = %s (applied now)\n", v.c_str()); }
         else fprintf(stderr, "[settings] %s = %s (takes effect after a restart)\n", k.c_str(), v.c_str());
     }
     if (save) save_ini();

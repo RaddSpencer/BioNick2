@@ -1,0 +1,2 @@
+﻿Button prompt art: Kenney Input Prompts, https://kenney.nl/assets/input-prompts (c) Kenney, licensed CC0 1.0 Universal (public domain).
+The sets here (xbox.png, playstation.png, switch.png) are rearranged copies of its Xbox Series, PlayStation Series and Nintendo Switch glyphs, built by tools/bake_buttons.ps1.

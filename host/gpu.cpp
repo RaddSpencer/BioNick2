@@ -37,6 +37,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <unordered_set>
+#include <wincodec.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -1444,7 +1446,59 @@ static void dump_texture_bmp(const char* dir, uint32_t base, uint32_t fmt, uint3
     std::string stem = std::string(dir) + "\\" + S("%08X_f%u_%ux%u", base, fmt, w, h);
     write_bmp(stem + "_rgb.bmp", rgba, w, h, false);
     write_bmp(stem + "_a.bmp", rgba, w, h, true);
-    fprintf(stderr, "[texdump] %08X fmt=%u %ux%u written\n", base, fmt, w, h);
+    fprintf(stderr, "[texdump] f=%llu %08X fmt=%u %ux%u written\n", (unsigned long long)g_frame, base, fmt, w, h);
+}
+// ---- button prompts: the game's button icons are one 256x256 RGBA atlas (LT, RT, LB, RB, back, start, sticks, A, B, X, Y). The PC Settings menu can swap
+// it for art baked from another controller set (tools/bake_buttons.ps1): a 768x768 PNG laid out so the game's own glyph rectangles still land on each icon.
+// The texture is recognised by a hash of its guest memory, since its address changes between levels.
+static const uint64_t kButtonAtlasHash = 0xFF5B2AECE0D5A93Aull;               // the atlas as it is in the game's files (the [buttons] log line prints this)
+static std::atomic<int> g_buttonSet{-1};                                      // -1 not read yet, 0 the game's own art, 1 xbox, 2 playstation, 3 switch
+int settings_button_set();
+void gpu_set_button_set(int s) { g_buttonSet = s < 0 ? 0 : s > 3 ? 3 : s; }
+int gpu_button_set() { int s = g_buttonSet.load(); if (s < 0) { s = settings_button_set(); g_buttonSet = s; } return s; }
+static std::unordered_set<uint64_t> g_buttonKeys;
+static HostTex g_buttonTex[4];
+static bool g_buttonFailed[4] = {};
+static bool load_png_rgba(const std::wstring& path, std::vector<uint8_t>& rgba, uint32_t& w, uint32_t& h) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);                            // already initialised in another mode is fine
+    ComPtr<IWICImagingFactory> f;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) return false;
+    ComPtr<IWICBitmapDecoder> dec; ComPtr<IWICBitmapFrameDecode> fr; ComPtr<IWICFormatConverter> cv;
+    if (FAILED(f->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) return false;
+    if (FAILED(dec->GetFrame(0, &fr)) || FAILED(f->CreateFormatConverter(&cv))) return false;
+    if (FAILED(cv->Initialize(fr.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) return false;
+    UINT uw = 0, uh = 0; cv->GetSize(&uw, &uh);
+    w = uw; h = uh; rgba.resize((size_t)w * h * 4);
+    return SUCCEEDED(cv->CopyPixels(nullptr, w * 4, (UINT)rgba.size(), rgba.data()));
+}
+static std::wstring assets_dir() {
+    wchar_t env[MAX_PATH];
+    if (GetEnvironmentVariableW(L"BCR2_ASSETS", env, MAX_PATH)) return env;      // a checkout's host\assets, for builds that sit somewhere else
+    wchar_t w[MAX_PATH]; GetModuleFileNameW(nullptr, w, MAX_PATH);
+    std::wstring s = w; s = s.substr(0, s.find_last_of(L'\\')) + L"\\..\\assets";
+    return s;
+}
+// The replacement for the atlas, or null to use the game's own.
+static HostTex* button_override() {
+    const int s = gpu_button_set();
+    if (s <= 0 || s > 3 || g_buttonFailed[s]) return nullptr;
+    HostTex& t = g_buttonTex[s];
+    if (t.srv) return &t;
+    static const wchar_t* names[4] = { L"", L"xbox", L"playstation", L"switch" };
+    std::vector<uint8_t> px; uint32_t w = 0, h = 0;
+    const std::wstring path = assets_dir() + L"\\buttons\\" + names[s] + L".png";
+    if (!load_png_rgba(path, px, w, h) || !w || !h) { g_buttonFailed[s] = true; fprintf(stderr, "[buttons] could not load %ls\n", path.c_str()); return nullptr; }
+    // The game stores this atlas with red and blue the other way round and its shader swaps them back, so the same order goes in here.
+    for (size_t i = 0; i + 3 < px.size(); i += 4) std::swap(px[i], px[i + 2]);
+    D3D11_TEXTURE2D_DESC d{}; d.Width = w; d.Height = h; d.MipLevels = 0; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; d.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &t.tex))) { g_buttonFailed[s] = true; return nullptr; }
+    g_dev->CreateShaderResourceView(t.tex.Get(), nullptr, &t.srv);
+    g_ctx->UpdateSubresource(t.tex.Get(), 0, nullptr, px.data(), w * 4, 0);
+    g_ctx->GenerateMips(t.srv.Get());
+    t.hostW = w; t.hostH = h; t.levels = 0;
+    fprintf(stderr, "[buttons] set %d loaded from %ls (%ux%u)\n", s, path.c_str(), w, h);
+    return &t;
 }
 static HostTex* get_texture(const FetchInfo& fi) {
     TexFmt tf;
@@ -1466,6 +1520,7 @@ static HostTex* get_texture(const FetchInfo& fi) {
     auto& slot = g_texCache[key];
     if (!slot) slot = new HostTex();
     HostTex* ht = slot;
+    if (!g_buttonKeys.empty() && g_buttonKeys.count(key)) if (HostTex* o = button_override()) return o;
     if (g_trace > 1000) {
         static std::set<uint64_t> seen;
         if (seen.insert(key).second && fi.w <= 32 && fi.h <= 32) {                // small textures: show their layout and raw blocks
@@ -1495,6 +1550,11 @@ static HostTex* get_texture(const FetchInfo& fi) {
     }
     uint64_t h = range_hash(fi.base, total);
     if (mipBytes) h ^= range_hash(fi.mipBase, mipBytes) * 0x9E3779B97F4A7C15ull;
+    if (fi.fmt == 6 && fi.w == 256 && fi.h == 256 && fi.faces == 1) {
+        static std::set<uint64_t> seenAtlas;
+        if (seenAtlas.insert(key ^ h).second) fprintf(stderr, "[buttons] 256x256 RGBA texture at %08X hash %016llX%s\n", fi.base, (unsigned long long)h, (kButtonAtlasHash && h == kButtonAtlasHash) ? " (the button atlas)" : "");
+        if (kButtonAtlasHash && h == kButtonAtlasHash) g_buttonKeys.insert(key);
+    }
     if (ht->srv && h == ht->hash) return ht;
     ht->hash = h;
     g_nUploads++; g_upBytes += total + mipBytes;

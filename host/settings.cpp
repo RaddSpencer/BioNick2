@@ -566,6 +566,8 @@ if GR and not rawget(GR, "bcr_td") then
   GR.bcr_orig = orig_un
   GR.update_normal = function(self, time, rel)
     if self._throw_down and self._init_z and managers.level then
+      if self.bcr_lob == nil then self.bcr_lob = self._vel.z > 0 end
+      if self.bcr_lob and self._vel.z < 0 and self._pos.z < self._init_z - 100 then self._throw_down = false end
       local pos = self._pos
       local ta = managers.level:tilearray()
       local inside = ta:get_tile(pos + Vector3(-10, 0, 0)) or ta:get_tile(pos + Vector3(10, 0, 0)) or ta:get_tile(pos + Vector3(0, 0, -10)) or ta:get_tile(pos + Vector3(0, 0, 10))

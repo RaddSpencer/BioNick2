@@ -1129,7 +1129,7 @@ static std::vector<PackShader> g_pack;
 static bool g_packLoaded = false;
 static std::string g_manifestPath;
 static std::set<std::string> g_manifestLines;
-static const bool g_shaderRecord = getenv("BCR2_SHADERRECORD") != nullptr;
+static const bool g_shaderRecord = getenv("BCR2_NORECORD") == nullptr;   // on by default: every shader the game uses is added to the manifest, so the next start compiles it ahead of time
 
 static std::string exe_dir() {
     wchar_t w[MAX_PATH]; GetModuleFileNameW(nullptr, w, MAX_PATH);
@@ -1179,6 +1179,7 @@ static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t
     if (!g_manifestLines.insert(line).second) return;
     if (FILE* f = fopen(g_manifestPath.c_str(), "a")) { fprintf(f, "%s\n", line.c_str()); fclose(f); }
 }
+static void show_compile_progress(int pct);   // draws the "Compiling shaders... NN%" screen (defined with the sprites, below)
 static void shader_precompile() {
     manifest_read();
     if (getenv("BCR2_NOPRECOMPILE") || getenv("BCR2_SYNCSHADERS")) return;
@@ -1212,11 +1213,17 @@ static void shader_precompile() {
     const int total = g_compilePending.load();
     fprintf(stderr, "[shader] compiling ahead of time: %zu pixel shaders, %zu from the manifest (%zu not found), %d need compiling\n", nPs, nManifest, nMissing, total);
     int shown = -1;
+    const bool showProgress = total > 0 && !getenv("BCR2_NOPROGRESS");
+    if (showProgress) show_compile_progress(0);
     while (g_compilePending.load() > 0) {
         const int left = g_compilePending.load();
-        if (left != shown) { shown = left; SetWindowTextA(g_hwnd, S("Bionic Commando Rearmed 2 - preparing shaders (%d of %d)", total - left, total).c_str()); }
+        if (left != shown) {
+            shown = left; SetWindowTextA(g_hwnd, S("Bionic Commando Rearmed 2 - preparing shaders (%d of %d)", total - left, total).c_str());
+            if (showProgress) show_compile_progress((total - left) * 100 / total);
+        }
         Sleep(50);
     }
+    if (showProgress) { show_compile_progress(100); Sleep(400); show_compile_progress(-1); }
     SetWindowTextA(g_hwnd, "Bionic Commando Rearmed 2 (recomp)");
     QueryPerformanceCounter(&t1);
     fprintf(stderr, "[shader] done in %.1f s\n", (double)(t1.QuadPart - t0.QuadPart) * g_perfTicksToMs / 1000.0);
@@ -2630,6 +2637,30 @@ static void draw_sprites(int px, int py, int pw, int ph) {
         g_ctx->PSSetShaderResources(0, 1, nul);
         g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
     }
+}
+
+// The startup screen while shaders compile: white text on black in the game's own font, centred. The text is pictures of the game's rendering of it
+// (assets\keys\shader_msg, shader_d0 to shader_d9, shader_pct), laid out the way the game's text layout measured it. pct < 0 clears the sprites.
+static void show_compile_progress(int pct) {
+    if (!g_swap || !g_backRtv) return;
+    std::vector<GpuSprite> list;
+    if (pct >= 0) {
+        const float x0 = 480.45f, y0 = 336.0f, m = 4.0f, h = 48.3f;
+        list.push_back({ "shader_msg", x0 - m, y0, 250.8f, h });
+        float nx = x0 + 242.7f + 10.2f - m;
+        for (char c : std::to_string(std::min(pct, 100))) { list.push_back({ std::string("shader_d") + c, nx, y0, 22.5f, h }); nx += 14.5f; }
+        list.push_back({ "shader_pct", nx, y0, 30.7f, h });
+    }
+    gpu_set_sprites(list);
+    const float black[4] = { 0, 0, 0, 1 };
+    g_ctx->ClearRenderTargetView(g_backRtv.Get(), black);
+    if (pct >= 0) {
+        const float fit = std::min(g_backW / 1280.0f, g_backH / 720.0f);
+        const int pw = std::max((int)std::lround(1280.0f * fit), 1), ph = std::max((int)std::lround(720.0f * fit), 1);
+        draw_sprites(((int)g_backW - pw) / 2, ((int)g_backH - ph) / 2, pw, ph);
+    }
+    g_swap->Present(0, 0);
+    invalidate_binds();
 }
 
 // ---- resolve ----

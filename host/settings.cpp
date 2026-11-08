@@ -60,15 +60,15 @@ const Def kDefs[] = {
     { "b_biovision", "rt",    { BCR_SOURCES, nullptr }, nullptr },
     { "b_cyclepas",  "r3",    { BCR_SOURCES, nullptr }, nullptr },
     // The key or mouse button for each action, as well as the pad button above. Checked by kbm_known.
-    { "k_jump",      "key_space",       { nullptr }, nullptr },
-    { "k_arm",       "mouse_right",     { nullptr }, nullptr },
-    { "k_fire",      "mouse_left",      { nullptr }, nullptr },
+    { "k_jump",      "key_rshift",      { nullptr }, nullptr },
+    { "k_arm",       "key_space",       { nullptr }, nullptr },
+    { "k_fire",      "key_num0",        { nullptr }, nullptr },
     { "k_upgrade",   "key_e",           { nullptr }, nullptr },
-    { "k_next",      "mouse_wheel_up",  { nullptr }, nullptr },
-    { "k_prev",      "mouse_wheel_down", { nullptr }, nullptr },
-    { "k_cycleact",  "key_q",           { nullptr }, nullptr },
-    { "k_biovision", "key_f",           { nullptr }, nullptr },
-    { "k_cyclepas",  "key_c",           { nullptr }, nullptr },
+    { "k_next",      "key_pgdn",        { nullptr }, nullptr },
+    { "k_prev",      "key_pgup",        { nullptr }, nullptr },
+    { "k_cycleact",  "key_delete",      { nullptr }, nullptr },
+    { "k_biovision", "key_num1",        { nullptr }, nullptr },
+    { "k_cyclepas",  "key_end",         { nullptr }, nullptr },
 };
 
 std::string ini_path() {
@@ -311,7 +311,7 @@ local function refresh(node)
   end
   return node
 end
-local KDEF = { b_jump = "key_space", b_arm = "mouse_right", b_fire = "mouse_left", b_upgrade = "key_e", b_next = "mouse_wheel_up", b_prev = "mouse_wheel_down", b_cycleact = "key_q", b_biovision = "key_f", b_cyclepas = "key_c" }
+local KDEF = { b_jump = "key_rshift", b_arm = "key_space", b_fire = "key_num0", b_upgrade = "key_e", b_next = "key_pgdn", b_prev = "key_pgup", b_cycleact = "key_delete", b_biovision = "key_num1", b_cyclepas = "key_end" }
 local function kkey(key) return "k_" .. key:sub(3) end
 Global.bcr_assign = function(key, src)
   local cur = Global.bcr_pc

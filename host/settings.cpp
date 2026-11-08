@@ -1147,7 +1147,7 @@ static void restart_host() {
     std::wstring cmd = GetCommandLineW();
     wchar_t wd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, wd);
     STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, wd, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); fprintf(stderr, "[settings] started a new copy, exiting\n"); fflush(stderr); ExitProcess(0); }
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, wd, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); fprintf(stderr, "[settings] started a new copy, exiting\n"); fflush(stderr); TerminateProcess(GetCurrentProcess(), 0); }
     fprintf(stderr, "[settings] could not start a new copy (error %lu); staying open\n", GetLastError());
 }
 

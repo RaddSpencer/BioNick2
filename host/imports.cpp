@@ -1731,7 +1731,7 @@ static void ObReferenceObjectByHandle_(PPCContext& ctx, uint8_t* base) {
 
 // ---- thread configuration (object-pointer based) ----
 // Quit from the game's menu: on the console this returns to the dashboard. There is nothing to return to here, so end the process.
-static void XamLoaderLaunchTitle_(PPCContext& ctx, uint8_t*) { fprintf(stderr, "[exit] game asked to leave (lr=%08X)\n", (uint32_t)ctx.lr); fflush(stderr); ExitProcess(0); }
+static void XamLoaderLaunchTitle_(PPCContext& ctx, uint8_t*) { fprintf(stderr, "[exit] game asked to leave (lr=%08X)\n", (uint32_t)ctx.lr); fflush(stderr); TerminateProcess(GetCurrentProcess(), 0); }   // not ExitProcess: with the audio, window and shader threads running it could hang in the DLL shutdown
 static void KeSetAffinityThread_(PPCContext& ctx, uint8_t* base) {
     if (ctx.r5.u32) wr32(base, ctx.r5.u32, 0);     // previous affinity
     ctx.r3.u64 = 0;

@@ -204,7 +204,7 @@ static void note_present_for_fps() {
 
 static std::atomic<uint64_t> g_lastF9{0};
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }
+    if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); TerminateProcess(GetCurrentProcess(), 0); }
     if (m == WM_SIZE) g_sizeChanged = true;
     if (m == WM_MOUSEWHEEL) { kbm_note_wheel((short)HIWORD(w)); return 0; }
     // F9 with BCR2_SHOTDIR set: save the last few seconds if BCR2_SHOTRING is set, else about the next 3 seconds, to catch something seen during play.

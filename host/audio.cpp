@@ -84,6 +84,15 @@ int audio_out_room() {
     UINT32 pad = 0;
     HRESULT hr = g_client->GetCurrentPadding(&pad);
     if (FAILED(hr)) { device_lost("reading the device level", hr); return -1; }
+    {   // A device that stops taking samples (an endpoint change, a driver that went to sleep) leaves its buffer full for good: the game keeps running on its
+        // own clock and the sound is gone. A buffer that stays full for 1.5 s is not draining, so close the device and open it again.
+        static ULONGLONG fullSince = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (pad >= kTargetFrames) {
+            if (!fullSince) fullSince = now;
+            else if (now - fullSince > 1500) { fullSince = 0; device_lost("the device stopped taking samples", S_OK); return -1; }
+        } else fullSince = 0;
+    }
     return pad >= kTargetFrames ? 0 : (int)((kTargetFrames - pad + kFrameSamples - 1) / kFrameSamples);
 }
 

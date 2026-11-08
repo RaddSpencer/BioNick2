@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <vector>
 #include <mutex>
 
 int gpu_display_mode();
@@ -680,6 +681,38 @@ if GR and not rawget(GR, "bcr_td") then
     return orig_un(self, time, rel)
   end
 end
+local MMGR = managers.music
+local MMT = MMGR and getmetatable(MMGR) and getmetatable(MMGR).__index
+if type(MMT) == "table" and not rawget(MMT, "bcr_mlog") then
+  MMT.bcr_mlog = true
+  Global.bcr_mlog_buf = Global.bcr_mlog_buf or {}
+  local LV = {
+    level_01_harbor = "1|Puerto Calao", level_02_seaside_base = "2|Fort Arturo", level_03_jungle = "3|The Mighty Jungle", level_04_cave = "4|Agramonte Mines",
+    level_05_mountain = "5|Monte Blanco", level_06_scrambler_dish = "6|Scrambler Dish", level_06_boss_megacopter_mk1 = "7|Audience Granted", level_07_ruins = "8|Yultec Ruins",
+    level_08_inca = "9|Ancient Chambers", level_09_ceremonial_grounds = "10|Ceremonial Grounds", level_09_boss_gorilla_mk1 = "11|Something Big", level_10_bridge_vertical = "12|Bridge Ascent",
+    level_11_bridge_horizontal = "13|Puente del Sabio", level_12_cannon_facilites = "14|Air Defense Facilities", level_12_boss_aa_cannon = "15|AA Platform", level_13_descent = "16|Descent",
+    level_14_robot_factory = "17|Robot Factory", level_14_boss_gorilla_mk2 = "18|Something Huge", level_15_deadwood = "19|Deadmarsh", level_16_prison = "20|Prison Break",
+    level_17_bionic_labs = "21|Bionic Labs", level_18_boss_bionic_brubaker = "22|Confrontation", level_18_bunker = "23|Reactor", level_19_military_hq = "24|General Headquarters",
+    level_20_race = "25|Countdown", level_20_boss_megacopter_mk2 = "26|Reprisal", level_21_missiles = "27|Point of No Return", level_22_skyscraper = "28|Impact",
+  }
+  local function where()
+    local cl = managers.level and managers.level._current_level
+    if not cl then return "-|(menus)|-" end
+    local short = tostring(cl):gsub("^levels/", "")
+    return (LV[short] or "?|" .. short) .. "|" .. short
+  end
+  local o_post, o_stop = MMT.post_event, MMT.stop
+  MMT.post_event = function(self, ev, ...)
+    local b = Global.bcr_mlog_buf
+    if #b < 60 then b[#b + 1] = "PLAY|" .. where() .. "|" .. tostring(ev) end
+    return o_post(self, ev, ...)
+  end
+  MMT.stop = function(self, ...)
+    local b = Global.bcr_mlog_buf
+    if #b < 60 then b[#b + 1] = "STOP|" .. where() .. "|" end
+    return o_stop(self, ...)
+  end
+end
 local mm = r.menu_map
 local sn = mm and mm.data and mm.data._nodes and mm.data._nodes.start_game_node
 if sn and not sn.bcr_trim then
@@ -692,6 +725,10 @@ end
 if Global.bcr_apply_binds then Global.bcr_apply_binds() end
 local o = Global.bcr_pc_out
 Global.bcr_pc_out = nil
+if Global.bcr_mlog_buf and #Global.bcr_mlog_buf > 0 then
+  for _, e in ipairs(Global.bcr_mlog_buf) do o = (o and (o .. ";") or "") .. "mlog=" .. e end
+  Global.bcr_mlog_buf = {}
+end
 if Global.bcr_pc and not o then Global.bcr_pc.display = "@DISPLAY@" end
 local g = top and top.renderer and top.renderer.active_node_gui and top.renderer:active_node_gui()
 if g and g._states then
@@ -914,6 +951,23 @@ void settings_capture_filter(uint8_t* st) {
     st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w;
 }
 
+// music_log.txt beside bcr2.ini: one line for each music event the game posts, with the time, the frame, the level number and title, and the event.
+uint64_t gpu_frame_number();
+static void music_log_append(const std::string& v) {
+    static bool started = false;
+    std::string path = ini_path(); const size_t p = path.rfind("bcr2.ini"); if (p != std::string::npos) path.replace(p, std::string::npos, "music_log.txt");
+    FILE* f = fopen(path.c_str(), "a");
+    if (!f) return;
+    if (!started) { started = true; SYSTEMTIME s; GetLocalTime(&s); fprintf(f, "\n=== session started %04u-%02u-%02u %02u:%02u:%02u ===\n", s.wYear, s.wMonth, s.wDay, s.wHour, s.wMinute, s.wSecond); }
+    // v is "PLAY|<number>|<title>|<level id>|<event>" or "STOP|<number>|<title>|<level id>|"
+    std::vector<std::string> a; size_t at = 0;
+    for (;;) { size_t e = v.find('|', at); if (e == std::string::npos) { a.push_back(v.substr(at)); break; } a.push_back(v.substr(at, e - at)); at = e + 1; }
+    while (a.size() < 5) a.push_back("");
+    SYSTEMTIME s; GetLocalTime(&s);
+    fprintf(f, "%02u:%02u:%02u  frame %-7llu  level %-2s %-24s (%s)  %s %s\n", s.wHour, s.wMinute, s.wSecond, (unsigned long long)gpu_frame_number(), a[1].c_str(), a[2].c_str(), a[3].c_str(), a[0].c_str(), a[4].c_str());
+    fclose(f);
+}
+
 // The menu asked for a restart (after the player confirmed): start the same command line again and end this process. BCR2_NORESTART only logs, for tests.
 static void restart_host() {
     fprintf(stderr, "[settings] restart requested\n"); fflush(stderr);
@@ -939,6 +993,7 @@ void settings_apply_from_lua(const std::string& changes) {
         std::string k = item.substr(0, eq), v = item.substr(eq + 1);
         if (k == "cap") { cap_action_() = v; cap_fresh_() = true; gpu_set_gamma_preview(v == "gamma"); fprintf(stderr, "[settings] pad capture: %s\n", v.empty() ? "off" : v.c_str()); continue; }
         if (k == "ui") { ui_open_() = v == "1"; continue; }
+        if (k == "mlog") { music_log_append(v); continue; }
         if (k == "restart") { if (save) save_ini(); restart_host(); continue; }
         const Def* d = find_def(k);
         if (!d || !allowed(*d, v)) { fprintf(stderr, "[settings] ignoring menu change '%s'\n", item.c_str()); continue; }

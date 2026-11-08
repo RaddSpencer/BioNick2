@@ -18,6 +18,7 @@
 #include <d3d11_1.h>
 #include <dxgi1_5.h>
 #include "shaderpack.h"
+#include "kbm.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -204,6 +205,7 @@ static void note_present_for_fps() {
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }
     if (m == WM_SIZE) g_sizeChanged = true;
+    if (m == WM_MOUSEWHEEL) { kbm_note_wheel((short)HIWORD(w)); return 0; }
     // F9 with BCR2_SHOTDIR set: save the last few seconds if BCR2_SHOTRING is set, else about the next 3 seconds, to catch something seen during play.
     if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && getenv("BCR2_SHOTDIR")) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } fprintf(stderr, "[capture] F9 pressed at frame %llu\n", (unsigned long long)g_frame); }
     if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
@@ -1531,6 +1533,29 @@ static std::wstring assets_dir() {
     return s;
 }
 // The replacement for the atlas, or null to use the game's own.
+// Pictures drawn over the frame after the final pass (the key and mouse icons on the Controls screen), in the 1280x720 space of the game's menus.
+static std::mutex g_spriteLock;
+static std::vector<GpuSprite> g_sprites;
+void gpu_set_sprites(const std::vector<GpuSprite>& s) { std::lock_guard<std::mutex> lk(g_spriteLock); g_sprites = s; }
+static ComPtr<ID3D11PixelShader> g_psSprite;
+static ComPtr<ID3D11BlendState> g_blendAlpha;
+static std::unordered_map<std::string, ComPtr<ID3D11ShaderResourceView>> g_spriteTex;
+static ID3D11ShaderResourceView* sprite_srv(const std::string& icon) {
+    auto it = g_spriteTex.find(icon);
+    if (it != g_spriteTex.end()) return it->second.Get();
+    ComPtr<ID3D11ShaderResourceView> srv;
+    std::vector<uint8_t> px; uint32_t w = 0, h = 0;
+    std::wstring path = assets_dir() + L"\\keys\\" + std::wstring(icon.begin(), icon.end()) + L".png";
+    if (load_png_rgba(path, px, w, h) && w && h) {
+        D3D11_TEXTURE2D_DESC d{}; d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd{ px.data(), w * 4, 0 };
+        ComPtr<ID3D11Texture2D> tex;
+        if (SUCCEEDED(g_dev->CreateTexture2D(&d, &sd, &tex))) g_dev->CreateShaderResourceView(tex.Get(), nullptr, &srv);
+    } else fprintf(stderr, "[keys] no icon %ls\n", path.c_str());
+    g_spriteTex[icon] = srv;
+    return srv.Get();
+}
+static void draw_sprites(int px, int py, int pw, int ph);
 // The sample picture for the gamma screen: assets\gamma.png, 1280x720. Without the file the screen shows only its slider.
 static ID3D11ShaderResourceView* gamma_preview_srv() {
     static ComPtr<ID3D11Texture2D> tex; static ComPtr<ID3D11ShaderResourceView> srv; static bool tried = false;
@@ -2557,6 +2582,55 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     }
 }
 
+static void draw_sprites(int px, int py, int pw, int ph) {
+    std::vector<GpuSprite> list;
+    { std::lock_guard<std::mutex> lk(g_spriteLock); list = g_sprites; }
+    if (list.empty()) return;
+    if (!g_psSprite) {
+        const char* ps = "Texture2D src:register(t0); SamplerState smp:register(s0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; float gam; float pv; float aa; };\n"
+                         "float4 main(float4 p:SV_Position):SV_Target { return src.SampleLevel(smp,(p.xy-ofs)/scale,0); }\n";
+        if (auto b = compile_cached(ps, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psSprite);
+        D3D11_BLEND_DESC bd{}; bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA; bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO; bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        g_dev->CreateBlendState(&bd, &g_blendAlpha);
+    }
+    if (!g_psSprite || !g_blendAlpha) return;
+    for (const GpuSprite& s : list) {
+        ID3D11ShaderResourceView* srv = sprite_srv(s.icon);
+        if (!srv) continue;
+        const float dx0 = px + s.x / 1280.0f * pw, dy0 = py + s.y / 720.0f * ph, dw = s.w / 1280.0f * pw, dh = s.h / 720.0f * ph;
+        ID3D11ShaderResourceView* nul[32] = {};
+        g_ctx->PSSetShaderResources(0, 32, nul);
+        ID3D11RenderTargetView* rtv = g_backRtv.Get();
+        g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+        invalidate_binds();
+        struct { float ofs[2]; float scale[2]; uint32_t sw; float gam; float pv; float aa; } p{ { dx0, dy0 }, { dw, dh }, 0u, 1.0f, 0.0f, 0.0f };
+        upload_cb(g_cbBlit.Get(), &p, sizeof(p));
+        ID3D11Buffer* cb = g_cbBlit.Get();
+        g_ctx->PSSetConstantBuffers(2, 1, &cb);
+        g_ctx->VSSetShader(g_vsBlit.Get(), nullptr, 0);
+        g_ctx->PSSetShader(g_psSprite.Get(), nullptr, 0);
+        g_ctx->GSSetShader(nullptr, nullptr, 0);
+        g_ctx->IASetInputLayout(nullptr);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_ctx->OMSetBlendState(g_blendAlpha.Get(), nullptr, 0xFFFFFFFFu);
+        g_ctx->OMSetDepthStencilState(get_ds(0, 0, 0), 0);
+        g_ctx->RSSetState(get_rs(0, true, true, 0, 0));
+        D3D11_VIEWPORT vp{ 0, 0, (float)g_backW, (float)g_backH, 0, 1 };
+        g_ctx->RSSetViewports(1, &vp);
+        D3D11_RECT sc{ (LONG)dx0, (LONG)dy0, (LONG)std::ceil(dx0 + dw), (LONG)std::ceil(dy0 + dh) };
+        g_ctx->RSSetScissorRects(1, &sc);
+        ID3D11SamplerState* samp = g_presentSampler.Get();
+        g_ctx->PSSetSamplers(0, 1, &samp);
+        g_ctx->PSSetShaderResources(0, 1, &srv);
+        g_ctx->Draw(3, 0);
+        g_ctx->PSSetShaderResources(0, 1, nul);
+        g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+    }
+}
+
 // ---- resolve ----
 static ID3D11ShaderResourceView* g_blitExtra = nullptr;                        // bound to t2 for the next blit: the gamma screen's sample picture
 static void blit(ID3D11ShaderResourceView* src, ID3D11PixelShader* ps, ID3D11RenderTargetView* dst, uint32_t dw, uint32_t dh,
@@ -3070,6 +3144,7 @@ static void do_swap(uint32_t front) {
         g_blitExtra = g_gammaPreview.load() ? gamma_preview_srv() : nullptr;
         blit(s->srv.Get(), useRamp ? g_psPresentLut.Get() : g_psPresentPlain.Get(), g_backRtv.Get(), g_backW, g_backH, px, py, px + pw, py + ph, 0, 0, s->swapped, sxs, sys, useRamp ? g_lutSrv.Get() : nullptr, ofs);
         g_blitExtra = nullptr;
+        draw_sprites(px, py, pw, ph);
     } else {
         float c[4] = { 0.05f, 0.0f, 0.1f, 1 };
         g_ctx->ClearRenderTargetView(g_backRtv.Get(), c);

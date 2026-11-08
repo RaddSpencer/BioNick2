@@ -10,6 +10,7 @@
 // buttons, which the host reads from the pad (upgradecycle.cpp).
 #include "settings.h"
 #include "upgradecycle.h"
+#include "kbm.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -58,6 +59,16 @@ const Def kDefs[] = {
     { "b_cycleact",  "lt",    { BCR_SOURCES, nullptr }, nullptr },
     { "b_biovision", "rt",    { BCR_SOURCES, nullptr }, nullptr },
     { "b_cyclepas",  "r3",    { BCR_SOURCES, nullptr }, nullptr },
+    // The key or mouse button for each action, as well as the pad button above. Checked by kbm_known.
+    { "k_jump",      "key_space",       { nullptr }, nullptr },
+    { "k_arm",       "mouse_right",     { nullptr }, nullptr },
+    { "k_fire",      "mouse_left",      { nullptr }, nullptr },
+    { "k_upgrade",   "key_e",           { nullptr }, nullptr },
+    { "k_next",      "mouse_wheel_up",  { nullptr }, nullptr },
+    { "k_prev",      "mouse_wheel_down", { nullptr }, nullptr },
+    { "k_cycleact",  "key_q",           { nullptr }, nullptr },
+    { "k_biovision", "key_f",           { nullptr }, nullptr },
+    { "k_cyclepas",  "key_c",           { nullptr }, nullptr },
 };
 
 std::string ini_path() {
@@ -68,6 +79,7 @@ std::string ini_path() {
 
 const Def* find_def(const std::string& key) { for (const Def& d : kDefs) if (key == d.key) return &d; return nullptr; }
 bool allowed(const Def& d, const std::string& v) {
+    if (d.key[0] == 'k' && d.key[1] == '_') return kbm_known(v);
     if (!strcmp(d.key, "gamma")) { char* end = nullptr; long n = strtol(v.c_str(), &end, 10); return end && !*end && !v.empty() && n >= 50 && n <= 150; }
     for (const char* a : d.allowed) if (a && v == a) return true;
     return false;
@@ -105,7 +117,7 @@ void save_ini() {
         fprintf(f, "# scale: internal render size (1 = 720p, 2 = 1440p, 3 = 2160p).  outres: the size of the picture on screen, auto or 720, 1080, 1440, 2160 (the render is resampled to it).  gamma: percent, 50 to 150.\n");
         fprintf(f, "# nojump: on turns jumping off (the Retro rule: the Death From Above move still works).  god: on makes the player invulnerable with unlimited lives.\n");
         fprintf(f, "# swapconfirm: on makes the right face button (Xbox B) confirm and the bottom one (Xbox A) cancel in the menus.\n");
-        fprintf(f, "# b_*: the input that triggers each action: a b x y lb rb lt rt l3 r3.\n");
+        fprintf(f, "# b_*: the pad input that triggers each action: a b x y lb rb lt rt l3 r3.  k_*: its key or mouse button (key_a, key_space, key_lshift, mouse_left, mouse_wheel_up, ...).\n");
         for (const Def& d : kDefs) fprintf(f, "%s=%s\n", d.key, values_()[d.key].c_str());
         fclose(f);
     }
@@ -299,8 +311,30 @@ local function refresh(node)
   end
   return node
 end
+local KDEF = { b_jump = "key_space", b_arm = "mouse_right", b_fire = "mouse_left", b_upgrade = "key_e", b_next = "mouse_wheel_up", b_prev = "mouse_wheel_down", b_cycleact = "key_q", b_biovision = "key_f", b_cyclepas = "key_c" }
+local function kkey(key) return "k_" .. key:sub(3) end
 Global.bcr_assign = function(key, src)
   local cur = Global.bcr_pc
+  if src:find("^key_") or src:find("^mouse_") then
+    local kk = kkey(key)
+    local old = cur[kk]
+    if old == src then return end
+    for _, a in ipairs(ACTIONS) do
+      local ak = kkey(a.key)
+      if ak ~= kk and cur[ak] == src then
+        cur[ak] = old
+        push(ak, old)
+      end
+    end
+    cur[kk] = src
+    push(kk, src)
+    for _, mname in ipairs({ "menu_main", "menu_pause" }) do
+      local mm = reg[mname]
+      local n = mm and mm.data and mm.data._nodes and mm.data._nodes.bcr_controls
+      if n then refresh(n) end
+    end
+    return
+  end
   local old = cur[key]
   if old == src then return end
   for _, a in ipairs(ACTIONS) do
@@ -322,6 +356,9 @@ Global.bcr_reset_defaults = function()
   for _, a in ipairs(ACTIONS) do
     Global.bcr_pc[a.key] = a.def
     push(a.key, a.def)
+    local kk = kkey(a.key)
+    Global.bcr_pc[kk] = KDEF[a.key]
+    push(kk, KDEF[a.key])
   end
   for _, mname in ipairs({ "menu_main", "menu_pause" }) do
     local mm = reg[mname]
@@ -850,6 +887,21 @@ if pc and pc.fps == "on" and Overlay then
 elseif Global.bcr_fps_txt and alive(Global.bcr_fps_txt) then
   Global.bcr_fps_txt:set_visible(false)
 end
+local spr = ""
+if nname == "bcr_controls" and pc then
+  local names = { "jump", "arm", "fire", "upgrade", "next", "prev", "cycleact", "cyclepas", "biovision" }
+  local parts = {}
+  for i, nm in ipairs(names) do
+    parts[#parts + 1] = string.format("%d,%d,40,%s", 860, 114 + 38 * (i - 1), pc["k_" .. nm] or "")
+  end
+  parts[#parts + 1] = string.format("%d,%d,40,%s", 860, 114 + 38 * 9, "key_tab")
+  parts[#parts + 1] = string.format("%d,%d,40,%s", 860, 114 + 38 * 10, "key_escape")
+  spr = table.concat(parts, "/")
+end
+if spr ~= Global.bcr_spr then
+  Global.bcr_spr = spr
+  o = (o and (o .. ";") or "") .. "spr=" .. spr
+end
 if cap ~= Global.bcr_cap then
   Global.bcr_cap = cap
   o = (o and (o .. ";") or "") .. "cap=" .. cap
@@ -921,6 +973,43 @@ bool settings_capture_active() { std::lock_guard<std::mutex> lk(lock_()); return
 
 // cap_action_ is what the menu poll reported for the selected row: "assign:<action>" (press a button to give it to that action), "lock" (a fixed row: no buttons),
 // "reset" and "exit" (only the confirm button works; on "exit" the cancel button asks to leave without saving), or "noy" (the level start screen: Y does nothing).
+// Keys and mouse buttons into the pad state: menus get the arrows (and WASD), Enter and Escape; the game gets WASD and the arrows as the left stick, Escape as Start, Tab as Back,
+// and each action's key presses that action's pad input.
+static void kbm_inject_locked(uint8_t* st) {
+    if (!kbm_window_active()) return;
+    uint16_t raw; memcpy(&raw, st + 4, 2);
+    uint16_t w = (uint16_t)((raw >> 8) | (raw << 8));
+    int lx = (int16_t)((st[8] << 8) | st[9]), ly = (int16_t)((st[10] << 8) | st[11]);
+    const bool ui = ui_open_();
+    const std::string& cp = cap_action_();
+    const std::string mode = cp.substr(0, cp.find(':'));
+    const bool swap = values_()["swapconfirm"] == "on";
+    const uint16_t confirmBit = swap ? 0x2000 : 0x1000, cancelBit = swap ? 0x1000 : 0x2000;
+    bool up = kbm_reserved_down(VK_UP), down = kbm_reserved_down(VK_DOWN), left = kbm_reserved_down(VK_LEFT), right = kbm_reserved_down(VK_RIGHT);
+    const bool wu = kbm_reserved_down('W'), wd = kbm_reserved_down('S'), wl = kbm_reserved_down('A'), wr = kbm_reserved_down('D');
+    if (ui) {
+        if (mode != "assign") { up |= wu; down |= wd; left |= wl; right |= wr; }
+        if (up) w |= 0x0001; if (down) w |= 0x0002; if (left) w |= 0x0004; if (right) w |= 0x0008;
+        if (kbm_reserved_down(VK_RETURN)) w |= confirmBit;
+        if (kbm_reserved_down(VK_ESCAPE) || kbm_reserved_down(VK_BACK)) w |= cancelBit;
+    } else {
+        up |= wu; down |= wd; left |= wl; right |= wr;
+        if (left) lx = -32767; if (right) lx = 32767; if (up) ly = 32767; if (down) ly = -32767;
+        if (kbm_reserved_down(VK_ESCAPE)) w |= 0x0010;
+        if (kbm_reserved_down(VK_TAB)) w |= 0x0020;
+        static const char* const acts[9] = { "jump", "arm", "fire", "upgrade", "next", "prev", "cycleact", "biovision", "cyclepas" };
+        for (const char* a : acts) {
+            if (!kbm_down(values_()[std::string("k_") + a])) continue;
+            const std::string& s = values_()[std::string("b_") + a];
+            if (s == "a") w |= 0x1000; else if (s == "b") w |= 0x2000; else if (s == "x") w |= 0x4000; else if (s == "y") w |= 0x8000;
+            else if (s == "lb") w |= 0x0100; else if (s == "rb") w |= 0x0200; else if (s == "l3") w |= 0x0040; else if (s == "r3") w |= 0x0080;
+            else if (s == "lt") st[6] = 255; else if (s == "rt") st[7] = 255;
+        }
+    }
+    st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w;
+    st[8] = (uint8_t)((lx >> 8) & 0xFF); st[9] = (uint8_t)(lx & 0xFF); st[10] = (uint8_t)((ly >> 8) & 0xFF); st[11] = (uint8_t)(ly & 0xFF);
+}
+
 static void capture_locked(uint8_t* st) {
     if (cap_action_().empty()) { cap_fresh_() = true; return; }
     const std::string mode = cap_action_().substr(0, cap_action_().find(':'));
@@ -974,6 +1063,14 @@ static void capture_locked(uint8_t* st) {
 // With "Swap Confirm & Cancel" on, the bottom and right face buttons trade places while a menu is open (the Lua poll says so). Gameplay keeps the layout set on the Controls screen.
 void settings_capture_filter(uint8_t* st) {
     std::lock_guard<std::mutex> lk(lock_());
+    kbm_inject_locked(st);
+    {   // on the Controls screen a key or mouse button pressed on an action row is given to that action
+        const std::string& cp = cap_action_();
+        if (cp.compare(0, 7, "assign:") == 0) {
+            const std::string kn = kbm_new_press();
+            if (!kn.empty() && cap_pending_().empty()) cap_pending_() = cp.substr(7) + ":" + kn;
+        }
+    }
     uint16_t rawIn; memcpy(&rawIn, st + 4, 2);
     const uint16_t physIn = (uint16_t)((rawIn >> 8) | (rawIn << 8));
     capture_locked(st);
@@ -1036,8 +1133,19 @@ void settings_apply_from_lua(const std::string& changes) {
         size_t eq = item.find('=');
         if (eq == std::string::npos) continue;
         std::string k = item.substr(0, eq), v = item.substr(eq + 1);
-        if (k == "cap") { cap_action_() = v; cap_fresh_() = true; gpu_set_gamma_preview(v == "gamma"); fprintf(stderr, "[settings] pad capture: %s\n", v.empty() ? "off" : v.c_str()); continue; }
+        if (k == "cap") { cap_action_() = v; cap_fresh_() = true; if (v.compare(0, 7, "assign:") == 0) kbm_forget_edges(); gpu_set_gamma_preview(v == "gamma"); fprintf(stderr, "[settings] pad capture: %s\n", v.empty() ? "off" : v.c_str()); continue; }
         if (k == "ui") { ui_open_() = v == "1"; continue; }
+        if (k == "spr") {                                                   // "x,y,size,name/x,y,size,name/..." or empty: key icons drawn over the Controls screen
+            std::vector<GpuSprite> sp; size_t b = 0;
+            while (b < v.size()) {
+                size_t e = v.find('/', b); if (e == std::string::npos) e = v.size();
+                float x = 0, y = 0, s = 0; char nm[64] = {};
+                if (sscanf(v.substr(b, e - b).c_str(), "%f,%f,%f,%63s", &x, &y, &s, nm) == 4) if (const char* ic = kbm_icon(nm)) sp.push_back({ ic, x, y, s, s });
+                b = e + 1;
+            }
+            gpu_set_sprites(sp);
+            continue;
+        }
         if (k == "mlog") { music_log_append(v); continue; }
         if (k == "restart") { if (save) save_ini(); restart_host(); continue; }
         const Def* d = find_def(k);
@@ -1051,7 +1159,7 @@ void settings_apply_from_lua(const std::string& changes) {
         else if (k == "buttons") { gpu_set_button_set(button_set_from_name(v)); fprintf(stderr, "[settings] buttons = %s (applied now)\n", v.c_str()); }
         else if (k == "b_cycleact") { upgrades_set_source(0, v.c_str()); fprintf(stderr, "[settings] cycle active upgrade = %s (applied now)\n", v.c_str()); }
         else if (k == "b_cyclepas") { upgrades_set_source(1, v.c_str()); fprintf(stderr, "[settings] cycle passive upgrade = %s (applied now)\n", v.c_str()); }
-        else if ((k[0] == 'b' && k[1] == '_') || k == "nojump" || k == "god" || k == "swapconfirm" || k == "gamma" || k == "fps") fprintf(stderr, "[settings] %s = %s (applied now)\n", k.c_str(), v.c_str());
+        else if ((k[0] == 'b' && k[1] == '_') || (k[0] == 'k' && k[1] == '_') || k == "nojump" || k == "god" || k == "swapconfirm" || k == "gamma" || k == "fps") fprintf(stderr, "[settings] %s = %s (applied now)\n", k.c_str(), v.c_str());
         else fprintf(stderr, "[settings] %s = %s (takes effect after a restart)\n", k.c_str(), v.c_str());
     }
     if (save) save_ini();

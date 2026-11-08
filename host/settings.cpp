@@ -474,14 +474,14 @@ local function music_items()
   end
   return { track, { _meta = "item", name = "bcr_mstart", text_id = "bcr_music_start" }, { _meta = "item", name = "bcr_mstop", text_id = "bcr_music_stop" } }
 end
-local function extend_settings(menu)
+local function extend_settings(menu, kind)
   local sn = menu.data._nodes.settings
   if not sn or sn.bcr_ext then return end
   sn.bcr_ext = true
   local data = { _meta = "node", name = "bcr_tmp" }
   data[#data + 1] = { _meta = "item", name = "bcr_graphics_open", text_id = "bcr_pc_settings", next_node = "graphics_settings" }
   for _, d in ipairs(SETS) do data[#data + 1] = toggle_item(d.key, d.text, d.options) end
-  data[#data + 1] = { _meta = "item", name = "bcr_music_open", text_id = "bcr_music_title", next_node = "bcr_music" }
+  if kind ~= "pause" then data[#data + 1] = { _meta = "item", name = "bcr_music_open", text_id = "bcr_music_title", next_node = "bcr_music" } end
   data[#data + 1] = { _meta = "default_item", name = "bcr_graphics_open" }
   local tmp = MenuNode:new(data)
   wire_items(tmp)
@@ -525,7 +525,7 @@ for _, which in ipairs({ { "main", main }, { "pause", pause } }) do
     menu.data._nodes.graphics_settings = build(kind, menu, "graphics_settings", "bcr_pc_settings", gfx_items(kind), "bcr_display", false)
     menu.data._nodes.bcr_gamma = build(kind, menu, "bcr_gamma", "bcr_pc_gamma", { toggle_item("gamma", "bcr_pc_gamma", GAMMA_OPTIONS) }, "bcr_gamma", false, true, true)
     menu.data._nodes.bcr_music = build(kind, menu, "bcr_music", "bcr_music_title", music_items(), "bcr_track", false, true, true)
-    extend_settings(menu)
+    extend_settings(menu, kind)
     menu.data._nodes.bcr_controls = build(kind, menu, "bcr_controls", "bcr_controls", control_items(), "bcr_b_jump", true, true)
     local mn = menu.data._nodes[kind]
     if mn and mn._items then

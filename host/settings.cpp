@@ -665,8 +665,6 @@ for _, kn in ipairs({ "main", "pause" }) do
       local nm = mn._items[i]._parameters and mn._items[i]._parameters.name
       if nm and (tostring(nm):find("^leaderboards") or tostring(nm):find("^achievements")) then
         table.remove(mn._items, i)
-        local b3 = Global.bcr_mlog_buf
-        if b3 and #b3 < 60 then b3[#b3 + 1] = "MENU|-|menu|-|poll removed " .. tostring(nm) .. " from " .. kn end
       end
     end
   end
@@ -792,27 +790,12 @@ if type(MMT) == "table" and not rawget(MMT, "bcr_mlog") then
   end
   local o_post, o_stop = MMT.post_event, MMT.stop
   MMT.post_event = function(self, ev, ...)
-    local b = Global.bcr_mlog_buf
-    if #b < 60 then
-      local who = ""
-      local dbg = rawget(_G, "debug")
-      if type(ev) == "string" and ev:find("clear") and dbg and dbg.getinfo then
-        for lv = 2, 9 do
-          local inf = dbg.getinfo(lv, "Sl")
-          if not inf then break end
-          who = who .. " < " .. string.gsub(tostring(inf.short_src), "[;|]", "_") .. ":" .. tostring(inf.currentline)
-        end
-      end
-      b[#b + 1] = "PLAY|" .. where() .. "|" .. tostring(ev) .. who
-    end
     local cl = managers.level and managers.level._current_level
     if ev == "Play_boss_fight_special_fight" then Global.bcr_fade = false end
     if ev == "fade_out_music" then Global.bcr_fade = true end
-    if ev == "Play_area_clear" and cl and tostring(cl):find("boss_bionic_b") and not Global.bcr_fade then
-      local b2 = Global.bcr_mlog_buf
-      if #b2 < 60 then b2[#b2 + 1] = "PLAY|" .. where() .. "|(early Play_area_clear replaced by a fade out)" end
-      return o_post(self, "fade_out_music")
-    end
+    if ev == "Play_area_clear" and cl and tostring(cl):find("boss_bionic_b") and not Global.bcr_fade then ev = "fade_out_music" end
+    local b = Global.bcr_mlog_buf
+    if #b < 60 then b[#b + 1] = "PLAY|" .. where() .. "|" .. tostring(ev) end
     return o_post(self, ev, ...)
   end
   MMT.stop = function(self, ...)

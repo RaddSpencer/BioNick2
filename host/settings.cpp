@@ -745,7 +745,10 @@ if Global.bcr_prompt_wait then
     managers.menu:open_dialog_menu("bcr_restart_prompt")
   end
 end
-if Global.bcr_lastnode == "bcr_music" and nname ~= "bcr_music" and managers.music then managers.music:stop() end
+if Global.bcr_lastnode == "bcr_music" and nname ~= "bcr_music" and managers.music then
+  managers.music:stop()
+  if top and top.name == "menu_main" then managers.music:post_event(top.music_event or "Play_menu_music") end
+end
 if nname then Global.bcr_lastnode = nname end
 local fp = "@FPS@"
 if pc and pc.fps == "on" and Overlay then

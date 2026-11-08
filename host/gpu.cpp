@@ -202,12 +202,13 @@ static void note_present_for_fps() {
     if (dt >= 0.25) { g_fpsNow = (float)(frames / dt); g_msNow = (float)(1000.0 * dt / frames); frames = 0; last = now; }
 }
 
+static std::atomic<uint64_t> g_lastF9{0};
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); ExitProcess(0); }
     if (m == WM_SIZE) g_sizeChanged = true;
     if (m == WM_MOUSEWHEEL) { kbm_note_wheel((short)HIWORD(w)); return 0; }
     // F9 with BCR2_SHOTDIR set: save the last few seconds if BCR2_SHOTRING is set, else about the next 3 seconds, to catch something seen during play.
-    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && getenv("BCR2_SHOTDIR")) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } fprintf(stderr, "[capture] F9 pressed at frame %llu\n", (unsigned long long)g_frame); }
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && getenv("BCR2_SHOTDIR")) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } g_lastF9 = g_frame; fprintf(stderr, "[capture] F9 pressed at frame %llu\n", (unsigned long long)g_frame); }
     if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29))) || (m == WM_KEYDOWN && w == VK_F11)) {
         if (!(l & (1 << 30))) {                                             // ignore auto-repeat
@@ -3148,6 +3149,15 @@ static void do_swap(uint32_t front) {
     } else {
         float c[4] = { 0.05f, 0.0f, 0.1f, 1 };
         g_ctx->ClearRenderTargetView(g_backRtv.Get(), c);
+    }
+    {   // F9 again, read from the keyboard state: the window message only arrives while this window has keyboard focus, and a pad player may not have clicked it
+        static const bool kShots = getenv("BCR2_SHOTDIR") != nullptr;
+        static bool f9Prev = false;
+        if (kShots) {
+            const bool d = kbm_window_active() && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+            if (d && !f9Prev && g_frame > g_lastF9 + 90) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } fprintf(stderr, "[capture] F9 pressed (polled) at frame %llu\n", (unsigned long long)g_frame); }
+            f9Prev = d;
+        }
     }
     write_shot();
     note_present_for_fps();

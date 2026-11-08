@@ -535,7 +535,7 @@ PPC_FUNC(sub_82634458) {
                 lua_run_chunk(ctx, base, L, settings_install_lua().c_str(), nullptr, &r);
                 static std::string lastR;
                 if (r != lastR) { lastR = r; fprintf(stderr, "[settings] menu install at frame %llu: %s\n", (unsigned long long)f, r.empty() ? "(nothing returned)" : r.c_str()); }
-                if (r == "installed") installed = true;
+                if (r == "installed") { installed = true; settings_splash_menu_ready(); }
             } else {
                 lua_run_chunk(ctx, base, L, settings_poll_lua().c_str(), nullptr, &r);
                 if (r == "reinstall") installed = false;

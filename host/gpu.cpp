@@ -199,7 +199,7 @@ static void note_present_for_fps() {
     frames++;
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     const double dt = (double)(now.QuadPart - last.QuadPart) / (double)freq.QuadPart;
-    if (dt >= 0.25) { g_fpsNow = (float)(frames / dt); g_msNow = (float)(1000.0 * dt / frames); frames = 0; last = now; }
+    if (dt >= 0.5) { g_fpsNow = (float)(frames / dt); g_msNow = (float)(1000.0 * dt / frames); frames = 0; last = now; }
 }
 
 static std::atomic<uint64_t> g_lastF9{0};

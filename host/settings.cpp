@@ -48,6 +48,7 @@ const Def kDefs[] = {
     { "buttons", "xbox",    { "xbox", "playstation", "switch", nullptr },     nullptr },
     { "nojump",  "off",     { "off", "on", nullptr },                          nullptr },
     { "god",     "off",     { "off", "on", nullptr },                          nullptr },
+    { "skipsplash", "off",  { "off", "on", nullptr },                          nullptr },             // on: no legal or intro screens, straight to the title screen (read at start)
     { "swapconfirm", "off", { "off", "on", nullptr },                          nullptr },
     // Which physical input triggers each action. The defaults are the game's own layout.
     { "b_jump",      "a",     { BCR_SOURCES, nullptr }, nullptr },
@@ -115,7 +116,7 @@ void save_ini() {
         fprintf(f, "# Bionic Commando Rearmed 2 (recomp) settings. Written by the PC Settings and Controls menus; you can edit it by hand while the game is closed.\n");
         fprintf(f, "# display: window, borderless or fullscreen.  scale: auto, 1, 2, 3 or 4 times 1280x720.  vsync: on, or off to show frames at fixed times after the game tick (best on a G-Sync or FreeSync display, else it tears).  buttons: xbox, playstation or switch (the button labels).\n");
         fprintf(f, "# scale: internal render size (1 = 720p, 2 = 1440p, 3 = 2160p).  outres: the size of the picture on screen, auto or 720, 1080, 1440, 2160 (the render is resampled to it).  gamma: percent, 50 to 150.\n");
-        fprintf(f, "# nojump: on turns jumping off (the Retro rule: the Death From Above move still works).  god: on makes the player invulnerable with unlimited lives.\n");
+        fprintf(f, "# nojump: on turns jumping off (the Retro rule: the Death From Above move still works).  god: on makes the player invulnerable with unlimited lives.  skipsplash: on goes straight to the title screen at start.\n");
         fprintf(f, "# swapconfirm: on makes the right face button (Xbox B) confirm and the bottom one (Xbox A) cancel in the menus.\n");
         fprintf(f, "# b_*: the pad input that triggers each action: a b x y lb rb lt rt l3 r3.  k_*: its key or mouse button (key_a, key_space, key_lshift, mouse_left, mouse_wheel_up, ...).\n");
         for (const Def& d : kDefs) fprintf(f, "%s=%s\n", d.key, values_()[d.key].c_str());
@@ -192,6 +193,7 @@ local STR = {
   bcr_pc_buttons = "Button Labels",
   bcr_pc_nojump = "Disable Jump",
   bcr_pc_god = "God Mode",
+  bcr_pc_skipsplash = "Skip Splash Screens",
   bcr_pc_swap = "Swap Confirm & Cancel",
   bcr_exit_q = "Exit without saving changes?",
   bcr_exit_cap = "Controls",
@@ -256,6 +258,7 @@ local GFX = {
 local SETS = {
   { key = "nojump", text = "bcr_pc_nojump", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
   { key = "god", text = "bcr_pc_god", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
+  { key = "skipsplash", text = "bcr_pc_skipsplash", main_only = true, options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
   { key = "buttons", text = "bcr_pc_buttons", main_only = true, options = { { "xbox", "bcr_pc_buttons_xbox" }, { "playstation", "bcr_pc_buttons_playstation" }, { "switch", "bcr_pc_buttons_switch" } } },
   { key = "swapconfirm", text = "bcr_pc_swap", main_only = true, options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
 }
@@ -944,6 +947,7 @@ std::string lua_text(const char* embedded) {
 
 }  // namespace
 
+static std::atomic<bool> g_splashPress{false};
 void settings_apply_to_env() {
     std::lock_guard<std::mutex> lk(lock_());
     load_ini();
@@ -954,6 +958,7 @@ void settings_apply_to_env() {
         else if (!strcmp(d.key, "scale") || !strcmp(d.key, "outres")) { if (v != "auto") _putenv_s(d.env, v.c_str()); }
         else _putenv_s(d.env, v.c_str());
     }
+    g_splashPress = values_()["skipsplash"] == "on";
     gpu_set_gamma(atoi(values_()["gamma"].c_str()));
     gpu_set_texfilter(filter_from_name(values_()["filter"]));
     gpu_set_aa(aa_from_name(values_()["aa"]));
@@ -1078,7 +1083,15 @@ static void capture_locked(uint8_t* st) {
 }
 
 // With "Swap Confirm & Cancel" on, the bottom and right face buttons trade places while a menu is open (the Lua poll says so). Gameplay keeps the layout set on the Controls screen.
+// Skip Splash Screens: the startup logos and the autosave notice move on when a button is pressed, so until the menus are installed (the title screen is
+// live from then) the pad reports A pulsing. It stops before the title screen can take the press as its own.
+void settings_splash_menu_ready() { g_splashPress = false; }
+
 void settings_capture_filter(uint8_t* st) {
+    if (g_splashPress.load()) {
+        static unsigned n = 0;
+        if (((n++ / 3) & 1) == 0) { uint16_t raw; memcpy(&raw, st + 4, 2); uint16_t w = (uint16_t)((raw >> 8) | (raw << 8)); w |= 0x0100; raw = (uint16_t)((w >> 8) | (w << 8)); memcpy(st + 4, &raw, 2); }
+    }
     std::lock_guard<std::mutex> lk(lock_());
     kbm_inject_locked(st);
     {   // on the Controls screen a key or mouse button pressed on an action row is given to that action

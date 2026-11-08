@@ -175,6 +175,28 @@ static std::mutex g_vmLock;
 static uint32_t g_vmNext = 0x40000000;
 static const uint32_t kVmEnd = 0x70000000;
 
+// Freed blocks go on a list and are handed out again, so a long session (many levels in one run) does not run the arena dry. Only blocks this allocator placed itself are tracked.
+static std::map<uint32_t, uint32_t> g_vmFree;     // start -> size, 64K aligned
+static std::unordered_map<uint32_t, uint32_t> g_vmSizes;
+static void free_list_insert(std::map<uint32_t, uint32_t>& fl, uint32_t a, uint32_t sz) {
+    auto it = fl.lower_bound(a);
+    if (it != fl.begin()) { auto p = std::prev(it); if (p->first + p->second == a) { a = p->first; sz += p->second; fl.erase(p); } }
+    it = fl.lower_bound(a);
+    if (it != fl.end() && a + sz == it->first) { sz += it->second; fl.erase(it); }
+    fl[a] = sz;
+}
+static bool free_list_take(std::map<uint32_t, uint32_t>& fl, uint32_t sz, uint32_t align, uint32_t& out) {
+    for (auto it = fl.begin(); it != fl.end(); ++it) {
+        const uint32_t s = it->first, e = s + it->second, a = (s + align - 1) & ~(align - 1);
+        if ((uint64_t)a + sz > e) continue;
+        fl.erase(it);
+        if (a > s) fl[s] = a - s;
+        if (a + sz < e) fl[a + sz] = e - (a + sz);
+        out = a;
+        return true;
+    }
+    return false;
+}
 static void NtAllocateVirtualMemory_(PPCContext& ctx, uint8_t* base) {
     uint32_t baseP = ctx.r3.u32, sizeP = ctx.r4.u32, type = ctx.r5.u32;
     uint32_t addr = rd32(base, baseP), size = rd32(base, sizeP);
@@ -183,9 +205,13 @@ static void NtAllocateVirtualMemory_(PPCContext& ctx, uint8_t* base) {
     size = (size + pageSize - 1) & ~(pageSize - 1);
     std::lock_guard<std::mutex> g(g_vmLock);
     if (addr == 0 || addr == 0xFFFFFFFF) {
-        addr = (g_vmNext + 0xFFFF) & ~0xFFFFu;
-        if (uint64_t(addr) + ((size + 0xFFFF) & ~0xFFFFu) > kVmEnd) { ctx.r3.u64 = STATUS_NO_MEMORY_; return; }
-        g_vmNext = addr + ((size + 0xFFFF) & ~0xFFFFu);
+        const uint32_t rsz = (size + 0xFFFF) & ~0xFFFFu;
+        if (!free_list_take(g_vmFree, rsz, 0x10000, addr)) {
+            addr = (g_vmNext + 0xFFFF) & ~0xFFFFu;
+            if (uint64_t(addr) + rsz > kVmEnd) { ctx.r3.u64 = STATUS_NO_MEMORY_; return; }
+            g_vmNext = addr + rsz;
+        }
+        g_vmSizes[addr] = rsz;
     } else {
         addr &= ~0xFFFu;
     }
@@ -200,7 +226,22 @@ static void NtAllocateVirtualMemory_(PPCContext& ctx, uint8_t* base) {
 }
 
 
-static void NtFreeVirtualMemory_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = STATUS_SUCCESS_; } // leaks for now
+// NtFreeVirtualMemory(&base, &size, type): a release of a whole block this allocator placed goes back to the free list, and its pages are returned to the system.
+static void NtFreeVirtualMemory_(PPCContext& ctx, uint8_t* base) {
+    const uint32_t baseP = ctx.r3.u32, type = ctx.r5.u32;
+    ctx.r3.u64 = STATUS_SUCCESS_;
+    if (!baseP || !(type & 0x8000)) return;                    // only MEM_RELEASE
+    const uint32_t addr = rd32(base, baseP);
+    std::lock_guard<std::mutex> g(g_vmLock);
+    auto it = g_vmSizes.find(addr);
+    if (it == g_vmSizes.end()) return;
+    const uint32_t sz = it->second;
+    g_vmSizes.erase(it);
+    VirtualFree(base + addr, sz, MEM_DECOMMIT);               // reads as zero when committed again
+    free_list_insert(g_vmFree, addr, sz);
+    static int n = 0;
+    if (n++ < 10) fprintf(stderr, "[mem] NtFreeVirtualMemory %08X size %X returned to the pool\n", addr, sz);
+}
 
 // MmQueryStatistics(MM_STATISTICS* out)  -- struct: u32 length, then page counts
 static void MmQueryStatistics_(PPCContext& ctx, uint8_t* base) {
@@ -267,18 +308,35 @@ static void ExTerminateThread_(PPCContext& ctx, uint8_t*) {
 static uint32_t g_physBump = 0xA0000000;
 static std::mutex g_physLock;
 static std::unordered_map<uint32_t, uint32_t> g_physSizes;    // allocation address -> rounded size
+static std::map<uint32_t, uint32_t> g_physFree;               // freed ranges, start -> size
 static void MmAllocatePhysicalMemoryEx_(PPCContext& ctx, uint8_t* base) {
     uint32_t size  = ctx.r4.u32;
     uint32_t align = ctx.r8.u32 ? ctx.r8.u32 : 0x1000;
     if (align & (align - 1)) align = 0x1000;                  // must be a power of two
     uint32_t sz = (size + 0xFFF) & ~0xFFFu;
     std::lock_guard<std::mutex> g(g_physLock);
-    uint32_t addr = (g_physBump + align - 1) & ~(align - 1);
-    if ((uint64_t)addr + sz > 0xC0000000ull) { ctx.r3.u64 = 0; return; }    // out of physical range
-    g_physBump = addr + sz;
+    uint32_t addr = 0;
+    if (free_list_take(g_physFree, sz, align, addr)) memset(base + addr, 0, sz);   // a block that was freed earlier, cleared again
+    else {
+        addr = (g_physBump + align - 1) & ~(align - 1);
+        if ((uint64_t)addr + sz > 0xC0000000ull) { fprintf(stderr, "[mem] MmAllocatePhysicalMemoryEx %X: physical memory is full\n", sz); ctx.r3.u64 = 0; return; }
+        g_physBump = addr + sz;
+    }
     g_physSizes[addr] = sz;
     fprintf(stderr, "[mem] MmAllocatePhysicalMemoryEx size=%X align=%X -> %08X\n", size, align, addr);
     ctx.r3.u32 = addr;
+}
+// MmFreePhysicalMemory(type, addr): the block goes back to the free list (and a free block at the very end lowers the bump pointer).
+static void MmFreePhysicalMemory_(PPCContext& ctx, uint8_t*) {
+    const uint32_t addr = ctx.r4.u32;
+    std::lock_guard<std::mutex> g(g_physLock);
+    auto it = g_physSizes.find(addr);
+    if (it == g_physSizes.end()) return;
+    const uint32_t sz = it->second;
+    g_physSizes.erase(it);
+    free_list_insert(g_physFree, addr, sz);
+    static int n = 0;
+    if (n++ < 10) fprintf(stderr, "[mem] MmFreePhysicalMemory %08X size %X\n", addr, sz);
 }
 // MmQueryAllocationSize(addr) -> rounded size of the allocation, or 0 if unknown
 static void MmQueryAllocationSize_(PPCContext& ctx, uint8_t*) {
@@ -2309,7 +2367,7 @@ void register_all_imports() {
     register_by_name("XGetVideoMode", XGetVideoMode_);
     register_by_name("ExTerminateThread", ExTerminateThread_);
     register_by_name("MmAllocatePhysicalMemoryEx", MmAllocatePhysicalMemoryEx_);
-    register_by_name("MmFreePhysicalMemory",       NoOp_);
+    register_by_name("MmFreePhysicalMemory",       MmFreePhysicalMemory_);
     register_by_name("VdInitializeEngines",                          NoOp_);
     register_by_name("VdSetGraphicsInterruptCallback",               VdSetGraphicsInterruptCallback_);
     register_by_name("VdInitializeRingBuffer",                       VdInitializeRingBuffer_);

@@ -39,7 +39,7 @@ const Def kDefs[] = {
     { "display", "window", { "window", "borderless", "fullscreen", nullptr }, "BCR2_DISPLAY" },
     { "scale",   "auto",   { "auto", "1", "2", "3", "4", nullptr },           "BCR2_RESSCALE" },
     { "outres",  "auto",   { "auto", "720", "1080", "1440", "2160", nullptr }, "BCR2_OUTRES" },
-    { "vrr",     "off",    { "off", "on", nullptr },                          "BCR2_VRR" },
+    { "vsync",   "on",     { "on", "off", nullptr },                          "BCR2_VRR" },          // off = frames shown at fixed times after the game tick (variable refresh pacing)
     { "filter",  "default", { "default", "bilinear", "trilinear", "aniso2", "aniso4", "aniso8", "aniso16", nullptr }, nullptr },
     { "aa",      "off",    { "off", "fxaa", "fxaahigh", nullptr },            nullptr },
     { "fps",     "off",    { "off", "on", nullptr },                          nullptr },
@@ -89,6 +89,7 @@ void load_ini() {
             if (eq == std::string::npos) continue;
             std::string k = trim(l.substr(0, eq)), v = trim(l.substr(eq + 1));
             if (k == "buttons" && v == "classic") v = "xbox";          // the old "classic" prompts are gone
+            if (k == "vrr") { if (v == "on") values_()["vsync"] = "off"; continue; }   // the old variable refresh switch is now Vsync off
             const Def* d = find_def(k);
             if (d && allowed(*d, v)) values_()[k] = v;
             else fprintf(stderr, "[settings] ignoring '%s' in bcr2.ini\n", l.c_str());
@@ -100,7 +101,7 @@ void load_ini() {
 void save_ini() {
     if (FILE* f = fopen(ini_path().c_str(), "w")) {
         fprintf(f, "# Bionic Commando Rearmed 2 (recomp) settings. Written by the PC Settings and Controls menus; you can edit it by hand while the game is closed.\n");
-        fprintf(f, "# display: window, borderless or fullscreen.  scale: auto, 1, 2, 3 or 4 times 1280x720.  vrr: on for a G-Sync or FreeSync display, else off.  buttons: xbox, playstation or switch (the button labels).\n");
+        fprintf(f, "# display: window, borderless or fullscreen.  scale: auto, 1, 2, 3 or 4 times 1280x720.  vsync: on, or off to show frames at fixed times after the game tick (best on a G-Sync or FreeSync display, else it tears).  buttons: xbox, playstation or switch (the button labels).\n");
         fprintf(f, "# scale: internal render size (1 = 720p, 2 = 1440p, 3 = 2160p).  outres: the size of the picture on screen, auto or 720, 1080, 1440, 2160 (the render is resampled to it).  gamma: percent, 50 to 150.\n");
         fprintf(f, "# nojump: on turns jumping off (the Retro rule: the Death From Above move still works).  god: on makes the player invulnerable with unlimited lives.\n");
         fprintf(f, "# swapconfirm: on makes the right face button (Xbox B) confirm and the bottom one (Xbox A) cancel in the menus.\n");
@@ -141,7 +142,11 @@ local MenuNode = getmetatable(main.data._nodes.main)
 if not (MenuNode and MenuNode.new) then return "wait: node class" end
 local STR = {
   bcr_pc_settings = "Graphics Settings",
-  bcr_pc_gamma = "Gamma",
+  bcr_pc_gamma = "Gamma Correction",
+  bcr_pc_vsync = "Vsync (requires restart)",
+  bcr_pc_vsync_off = "Off (Variable Refresh)",
+  bcr_hint_start = "Start",
+  bcr_hint_stop = "Stop",
   bcr_music_title = "Music Test",
   bcr_music_track = "Track",
   bcr_pc_filter = "Texture Filtering",
@@ -157,7 +162,7 @@ local STR = {
   bcr_pc_aa_fxaa = "FXAA",
   bcr_pc_aa_fxaahigh = "FXAA (High)",
   bcr_pc_fps = "FPS Display",
-  bcr_pc_outres = "Render Resolution (restart)",
+  bcr_pc_outres = "Render Resolution (requires restart)",
   bcr_pc_outres_auto = "Auto",
   bcr_pc_outres_720 = "720p",
   bcr_pc_outres_1080 = "1080p",
@@ -165,14 +170,13 @@ local STR = {
   bcr_pc_outres_2160 = "2160p",
   bcr_pc_display = "Display Mode",
   bcr_pc_display_window = "Windowed",
-  bcr_pc_display_borderless = "Borderless",
+  bcr_pc_display_borderless = "Borderless Fullscreen",
   bcr_pc_display_fullscreen = "Exclusive Fullscreen",
-  bcr_pc_scale = "Internal Resolution (restart)",
+  bcr_pc_scale = "Internal Resolution (requires restart)",
   bcr_pc_scale_auto = "Auto",
   bcr_pc_scale_1 = "720p",
   bcr_pc_scale_2 = "1440p",
   bcr_pc_scale_3 = "2160p",
-  bcr_pc_vrr = "Variable Refresh (restart)",
   bcr_pc_buttons = "Button Labels",
   bcr_pc_nojump = "Disable Jump",
   bcr_pc_god = "God Mode",
@@ -213,8 +217,7 @@ local GLYPH = { a = 57344, b = 57345, x = 57346, y = 57347, back = 57348, start 
 local function set_labels(set)
   local t = LABELS[set] or LABELS.xbox
   for k, v in pairs(t) do STR["bcr_src_" .. k] = GLYPH[k] and utf8.char(GLYPH[k]) or v end
-  STR.bcr_music_start = utf8.char(GLYPH.x) .. " Start"
-  STR.bcr_music_stop = utf8.char(GLYPH.y) .. " Stop"
+  STR.btn_x = utf8.char(GLYPH.x)
 end
 set_labels(INIT.buttons)
 local L = managers.localization
@@ -233,16 +236,16 @@ local GFX = {
   { key = "display", text = "bcr_pc_display", options = { { "window", "bcr_pc_display_window" }, { "borderless", "bcr_pc_display_borderless" }, { "fullscreen", "bcr_pc_display_fullscreen" } } },
   { key = "scale", text = "bcr_pc_scale", options = { { "auto", "bcr_pc_scale_auto" }, { "1", "bcr_pc_scale_1" }, { "2", "bcr_pc_scale_2" }, { "3", "bcr_pc_scale_3" } } },
   { key = "outres", text = "bcr_pc_outres", options = { { "auto", "bcr_pc_outres_auto" }, { "720", "bcr_pc_outres_720" }, { "1080", "bcr_pc_outres_1080" }, { "1440", "bcr_pc_outres_1440" }, { "2160", "bcr_pc_outres_2160" } } },
-  { key = "vrr", text = "bcr_pc_vrr", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
+  { key = "vsync", text = "bcr_pc_vsync", options = { { "on", "bcr_pc_on" }, { "off", "bcr_pc_vsync_off" } } },
   { key = "filter", text = "bcr_pc_filter", options = { { "default", "bcr_pc_filter_default" }, { "bilinear", "bcr_pc_filter_bilinear" }, { "trilinear", "bcr_pc_filter_trilinear" }, { "aniso2", "bcr_pc_filter_aniso2" }, { "aniso4", "bcr_pc_filter_aniso4" }, { "aniso8", "bcr_pc_filter_aniso8" }, { "aniso16", "bcr_pc_filter_aniso16" } } },
   { key = "aa", text = "bcr_pc_aa", options = { { "off", "bcr_pc_aa_off" }, { "fxaa", "bcr_pc_aa_fxaa" }, { "fxaahigh", "bcr_pc_aa_fxaahigh" } } },
   { key = "fps", text = "bcr_pc_fps", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
 }
 local SETS = {
-  { key = "buttons", text = "bcr_pc_buttons", options = { { "xbox", "bcr_pc_buttons_xbox" }, { "playstation", "bcr_pc_buttons_playstation" }, { "switch", "bcr_pc_buttons_switch" } } },
   { key = "nojump", text = "bcr_pc_nojump", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
   { key = "god", text = "bcr_pc_god", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
-  { key = "swapconfirm", text = "bcr_pc_swap", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
+  { key = "buttons", text = "bcr_pc_buttons", main_only = true, options = { { "xbox", "bcr_pc_buttons_xbox" }, { "playstation", "bcr_pc_buttons_playstation" }, { "switch", "bcr_pc_buttons_switch" } } },
+  { key = "swapconfirm", text = "bcr_pc_swap", main_only = true, options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
 }
 local SRC = { "a", "b", "x", "y", "lb", "rb", "lt", "rt", "l3", "r3" }
 local PHYS = { a = "a", b = "b", x = "x", y = "y", lb = "left_shoulder", rb = "right_shoulder", lt = "left_trigger", rt = "right_trigger", back = "back", start = "start", l3 = "left_thumb", r3 = "right_thumb", up = "d_up", down = "d_down", left = "d_left", right = "d_right" }
@@ -332,7 +335,7 @@ local function toggle_item(key, text, options)
   for _, o in ipairs(options) do item[#item + 1] = { _meta = "option", value = o[1], text_id = o[2] } end
   return item
 end
-local RESTART_KEYS = { scale = true, outres = true, vrr = true }
+local RESTART_KEYS = { scale = true, outres = true, vsync = true }
 local function wire_items(node)
   for _, it in ipairs(node._items) do
     local key = it._parameters.bcr_key
@@ -344,7 +347,6 @@ local function wire_items(node)
           return
         end
         Global.bcr_pc[key] = v
-        if RESTART_KEYS[key] then Global.bcr_restart_pending = true end
         if key == "buttons" and Global.bcr_set_labels then Global.bcr_set_labels(v) end
         push(key, v)
         Global.bcr_apply_binds()
@@ -441,6 +443,29 @@ if MenuCallbackHandler then
   MenuCallbackHandler.vis_cb_retro_not_unlocked = function() return true end
   MenuCallbackHandler.vis_cb_retro_unlocked = function() return false end
 end
+if P and not rawget(P, "bcr_music_hooks") then
+  P.bcr_music_hooks = true
+  local o_markers = P._set_marker_positions
+  P._set_marker_positions = function(self, ...)
+    local r = o_markers(self, ...)
+    if self.name == "bcr_music" and self._left_marker and self._right_marker then
+      local ox = self.item_panel and self.item_panel:x() or 0
+      self._left_marker:set_width(90)
+      self._left_marker:set_x(640 - 310 - 90 - ox)
+      self._right_marker:set_width(90)
+      self._right_marker:set_x(640 + 310 - ox)
+    end
+    return r
+  end
+  local o_hint = P._show_btn_hint
+  P._show_btn_hint = function(self, cfg, ...)
+    if self.name == "bcr_music" then
+      local sw = Global.bcr_pc and Global.bcr_pc.swapconfirm == "on"
+      cfg = { { btn = sw and "btn_a" or "btn_b", text = "menu_back" }, { btn = sw and "btn_b" or "btn_a", text = "bcr_hint_start" }, { btn = "btn_x", text = "bcr_hint_stop" } }
+    end
+    return o_hint(self, cfg, ...)
+  end
+end
 local GAMMA_OPTIONS = {}
 for g = 50, 150, 5 do
   STR["bcr_gm_" .. g] = string.format("%.2f", g / 100)
@@ -473,7 +498,7 @@ local function music_items()
     STR["bcr_mt_" .. e] = e
     track[#track + 1] = { _meta = "option", value = e, text_id = "bcr_mt_" .. e }
   end
-  return { track, { _meta = "item", name = "bcr_mstart", text_id = "bcr_music_start" }, { _meta = "item", name = "bcr_mstop", text_id = "bcr_music_stop" } }
+  return { track }
 end
 local function extend_settings(menu, kind)
   local sn = menu.data._nodes.settings
@@ -481,15 +506,28 @@ local function extend_settings(menu, kind)
   sn.bcr_ext = true
   local data = { _meta = "node", name = "bcr_tmp" }
   data[#data + 1] = { _meta = "item", name = "bcr_graphics_open", text_id = "bcr_pc_settings", next_node = "graphics_settings" }
-  for _, d in ipairs(SETS) do data[#data + 1] = toggle_item(d.key, d.text, d.options) end
+  for _, d in ipairs(SETS) do
+    if not (kind == "pause" and d.main_only) then data[#data + 1] = toggle_item(d.key, d.text, d.options) end
+  end
   if kind ~= "pause" then data[#data + 1] = { _meta = "item", name = "bcr_music_open", text_id = "bcr_music_title", next_node = "bcr_music" } end
   data[#data + 1] = { _meta = "default_item", name = "bcr_graphics_open" }
   local tmp = MenuNode:new(data)
   wire_items(tmp)
-  for i, it in ipairs(tmp._items) do
-    if i == 1 then table.insert(sn._items, 1, it)
-    elseif sn.add_item then sn:add_item(it) else sn._items[#sn._items + 1] = it end
+  for _, it in ipairs(tmp._items) do
+    local nm = it._parameters.name
+    if nm == "bcr_graphics_open" then
+      table.insert(sn._items, 1, it)
+    elseif nm == "bcr_music_open" then
+      local at = #sn._items + 1
+      for i, x in ipairs(sn._items) do if x._parameters.name == "music_volume" then at = i + 1 end end
+      table.insert(sn._items, at, it)
+    elseif sn.add_item then
+      sn:add_item(it)
+    else
+      sn._items[#sn._items + 1] = it
+    end
   end
+  if sn.set_default_item_name then sn:set_default_item_name("bcr_graphics_open") end
   local mod = sn._parameters.modifier
   if type(mod) ~= "table" then mod = {} sn._parameters.modifier = mod end
   mod[#mod + 1] = refresh
@@ -740,7 +778,8 @@ if g and g._states then
     if cfg then
       for _, e in ipairs(cfg) do
         if e.text == "menu_select" and e.btn ~= want_sel then e.btn = want_sel changed = true
-        elseif e.text == "menu_back" and e.btn ~= want_back then e.btn = want_back changed = true end
+        elseif e.text == "menu_back" and e.btn ~= want_back then e.btn = want_back changed = true
+        elseif e.text == "bcr_hint_start" and e.btn ~= want_sel then e.btn = want_sel changed = true end
       end
     end
   end
@@ -771,9 +810,13 @@ if ui ~= Global.bcr_ui then
   Global.bcr_ui = ui
   o = (o and (o .. ";") or "") .. "ui=" .. ui
 end
-if top and top.name == "menu_main" and Global.bcr_lastnode == "graphics_settings" and nname and nname ~= "graphics_settings" and nname ~= "bcr_gamma" and Global.bcr_restart_pending then
-  Global.bcr_restart_pending = false
-  Global.bcr_prompt_wait = 6
+if pc and nname == "graphics_settings" and Global.bcr_lastnode ~= "graphics_settings" and Global.bcr_lastnode ~= "bcr_gamma" then
+  Global.bcr_gsnap = { scale = pc.scale, outres = pc.outres, vsync = pc.vsync }
+end
+if pc and top and top.name == "menu_main" and Global.bcr_lastnode == "graphics_settings" and nname and nname ~= "graphics_settings" and nname ~= "bcr_gamma" and Global.bcr_gsnap then
+  local s = Global.bcr_gsnap
+  Global.bcr_gsnap = nil
+  if s.scale ~= pc.scale or s.outres ~= pc.outres or s.vsync ~= pc.vsync then Global.bcr_prompt_wait = 6 end
 end
 if Global.bcr_prompt_wait then
   Global.bcr_prompt_wait = Global.bcr_prompt_wait - 1
@@ -838,7 +881,7 @@ void settings_apply_to_env() {
     for (const Def& d : kDefs) {
         const std::string& v = values_()[d.key];
         if (!d.env || getenv(d.env)) continue;                         // no switch for this one, or an explicit switch beats the file
-        if (!strcmp(d.key, "vrr")) { if (v == "on") _putenv_s(d.env, "1"); }
+        if (!strcmp(d.key, "vsync")) { if (v == "off") _putenv_s(d.env, "1"); }
         else if (!strcmp(d.key, "scale") || !strcmp(d.key, "outres")) { if (v != "auto") _putenv_s(d.env, v.c_str()); }
         else _putenv_s(d.env, v.c_str());
     }
@@ -847,7 +890,7 @@ void settings_apply_to_env() {
     gpu_set_aa(aa_from_name(values_()["aa"]));
     upgrades_set_source(0, values_()["b_cycleact"].c_str());
     upgrades_set_source(1, values_()["b_cyclepas"].c_str());
-    fprintf(stderr, "[settings] %s: display=%s scale=%s vrr=%s buttons=%s\n", ini_path().c_str(), values_()["display"].c_str(), values_()["scale"].c_str(), values_()["vrr"].c_str(), values_()["buttons"].c_str());
+    fprintf(stderr, "[settings] %s: display=%s scale=%s vsync=%s buttons=%s\n", ini_path().c_str(), values_()["display"].c_str(), values_()["scale"].c_str(), values_()["vsync"].c_str(), values_()["buttons"].c_str());
 }
 
 int settings_button_set() { std::lock_guard<std::mutex> lk(lock_()); return button_set_from_name(values_()["buttons"]); }
@@ -885,12 +928,14 @@ static void capture_locked(uint8_t* st) {
     uint16_t w = (uint16_t)((raw >> 8) | (raw << 8));
     if (mode == "gamma") return;                                         // the gamma screen: every button works as normal
     if (mode == "music") {                                               // the music test: X starts the track, Y stops it, and neither reaches the menu
-        uint32_t cur = (uint32_t)(w & 0xC000);
+        const uint32_t startBit = values_()["swapconfirm"] == "on" ? 0x2000 : 0x1000;      // the confirm button starts the track, X stops it
+        const uint32_t both = startBit | 0x4000;
+        uint32_t cur = (uint32_t)(w & both);
         if (cap_fresh_()) { cap_fresh_() = false; cap_prev_() = cur; }
         const uint32_t edge = cur & ~cap_prev_();
-        if (edge && cap_pending_().empty()) cap_pending_() = (edge & 0x4000) ? "!mplay" : "!mstop";
+        if (edge && cap_pending_().empty()) cap_pending_() = (edge & 0x4000) ? "!mstop" : "!mplay";
         cap_prev_() = cur;
-        w &= (uint16_t)~0xC000; st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w;
+        w &= (uint16_t)~both; st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w;
         return;
     }
     if (mode == "noy") { w &= (uint16_t)~0x8000; st[4] = (uint8_t)(w >> 8); st[5] = (uint8_t)w; return; }

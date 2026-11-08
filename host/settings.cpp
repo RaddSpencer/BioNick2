@@ -657,6 +657,20 @@ local r = managers and managers.menu and managers.menu._registered_menus
 local m = r and r.menu_main
 if not (m and m.data and m.data._nodes) then return nil end
 if not (m.data._nodes.graphics_settings and m.data._nodes.bcr_controls) then return "reinstall" end
+for _, kn in ipairs({ "main", "pause" }) do
+  local mm = r["menu_" .. kn]
+  local mn = mm and mm.data and mm.data._nodes and mm.data._nodes[kn]
+  if mn and mn._items then
+    for i = #mn._items, 1, -1 do
+      local nm = mn._items[i]._parameters and mn._items[i]._parameters.name
+      if nm and (tostring(nm):find("^leaderboards") or tostring(nm):find("^achievements")) then
+        table.remove(mn._items, i)
+        local b3 = Global.bcr_mlog_buf
+        if b3 and #b3 < 60 then b3[#b3 + 1] = "MENU|-|menu|-|poll removed " .. tostring(nm) .. " from " .. kn end
+      end
+    end
+  end
+end
 local dg = r.menu_dialog
 if dg and dg.data and dg.data._nodes and not (dg.data._nodes.bcr_confirm_exit and dg.data._nodes.bcr_restart_prompt) then return "reinstall" end
 local om = managers.menu._open_menus
@@ -768,7 +782,7 @@ if type(MMT) == "table" and not rawget(MMT, "bcr_mlog") then
     level_11_bridge_horizontal = "13|Puente del Sabio", level_12_cannon_facilites = "14|Air Defense Facilities", level_12_boss_aa_cannon = "15|AA Platform", level_13_descent = "16|Descent",
     level_14_robot_factory = "17|Robot Factory", level_14_boss_gorilla_mk2 = "18|Something Huge", level_15_deadwood = "19|Deadmarsh", level_16_prison = "20|Prison Break",
     level_17_bionic_labs = "21|Bionic Labs", level_18_boss_bionic_brubaker = "22|Confrontation", level_18_bunker = "23|Reactor", level_19_military_hq = "24|General Headquarters",
-    level_20_race = "25|Countdown", level_20_boss_megacopter_mk2 = "26|Reprisal", level_21_missiles = "27|Point of No Return", level_22_skyscraper = "28|Impact",
+    boss_bionic_b = "22|Confrontation", level_20_race = "25|Countdown", level_20_boss_megacopter_mk2 = "26|Reprisal", level_21_missiles = "27|Point of No Return", level_22_skyscraper = "28|Impact",
   }
   local function where()
     local cl = managers.level and managers.level._current_level
@@ -779,7 +793,26 @@ if type(MMT) == "table" and not rawget(MMT, "bcr_mlog") then
   local o_post, o_stop = MMT.post_event, MMT.stop
   MMT.post_event = function(self, ev, ...)
     local b = Global.bcr_mlog_buf
-    if #b < 60 then b[#b + 1] = "PLAY|" .. where() .. "|" .. tostring(ev) end
+    if #b < 60 then
+      local who = ""
+      local dbg = rawget(_G, "debug")
+      if type(ev) == "string" and ev:find("clear") and dbg and dbg.getinfo then
+        for lv = 2, 9 do
+          local inf = dbg.getinfo(lv, "Sl")
+          if not inf then break end
+          who = who .. " < " .. string.gsub(tostring(inf.short_src), "[;|]", "_") .. ":" .. tostring(inf.currentline)
+        end
+      end
+      b[#b + 1] = "PLAY|" .. where() .. "|" .. tostring(ev) .. who
+    end
+    local cl = managers.level and managers.level._current_level
+    if ev == "Play_boss_fight_special_fight" then Global.bcr_fade = false end
+    if ev == "fade_out_music" then Global.bcr_fade = true end
+    if ev == "Play_area_clear" and cl and tostring(cl):find("boss_bionic_b") and not Global.bcr_fade then
+      local b2 = Global.bcr_mlog_buf
+      if #b2 < 60 then b2[#b2 + 1] = "PLAY|" .. where() .. "|(early Play_area_clear replaced by a fade out)" end
+      return o_post(self, "fade_out_music")
+    end
     return o_post(self, ev, ...)
   end
   MMT.stop = function(self, ...)
@@ -787,6 +820,7 @@ if type(MMT) == "table" and not rawget(MMT, "bcr_mlog") then
     if #b < 60 then b[#b + 1] = "STOP|" .. where() .. "|" end
     return o_stop(self, ...)
   end
+  Global.bcr_where = where
 end
 local mm = r.menu_map
 local sn = mm and mm.data and mm.data._nodes and mm.data._nodes.start_game_node

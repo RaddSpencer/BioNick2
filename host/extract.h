@@ -16,9 +16,16 @@ struct ExtractResult {
     unsigned long long files = 0, bytes = 0;
 };
 
-// progress(done_bytes, total_bytes, current_file) is called now and then; it may be empty.
-ExtractResult extract_package(const std::string& package, const std::string& outDir,
-                              const std::function<void(unsigned long long, unsigned long long, const std::string&)>& progress);
+// progress(done_bytes, total_bytes, what) is called now and then and returns false to cancel; it may be empty.
+using ExtractProgress = std::function<bool(unsigned long long, unsigned long long, const std::string&)>;
+ExtractResult extract_package(const std::string& package, const std::string& outDir, const ExtractProgress& progress);
+
+// The package this build needs: the XBLA "World" release of Bionic Commando Rearmed 2.
+extern const char* const kPackageSha256;   // lowercase hex
+extern const char* const kPackageSha1;
+extern const char* const kPackageMd5;
+// SHA-256 of a file, read in big chunks; "" if it cannot be read or the progress callback cancelled.
+std::string file_sha256(const std::string& path, const ExtractProgress& progress);
 
 // The "bcr2 --extract <package> <outdir>" command line.
 int extract_main(int argc, char** argv);

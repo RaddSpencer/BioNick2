@@ -43,3 +43,7 @@ assets_src/
 
 # debug captures
 host/captures/
+
+# the unpacked game (made by the first-run setup)
+host/game/
+host/game.tmp/

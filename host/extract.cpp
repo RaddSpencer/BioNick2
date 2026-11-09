@@ -362,8 +362,7 @@ bool make_dirs(const std::string& path) {   // path is a directory
     return true;
 }
 
-ExtractResult extract_impl(const std::string& pkg, const std::string& outDir,
-                           const std::function<void(unsigned long long, unsigned long long, const std::string&)>& progress) {
+ExtractResult extract_impl(const std::string& pkg, const std::string& outDir, const ExtractProgress& progress) {
     ExtractResult r;
     Stfs s;
     s.h = CreateFileA(pkg.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -439,7 +438,7 @@ ExtractResult extract_impl(const std::string& pkg, const std::string& outDir,
                 else if (!s.nextBlock(blk, next)) { CloseHandle(out); r.error = "cannot follow the block chain of " + rel; return r; }
                 blk = next;
             }
-            if (progress && GetTickCount() - lastTick > 200) { lastTick = GetTickCount(); progress(done, total, rel); }
+            if (progress && GetTickCount() - lastTick > 100) { lastTick = GetTickCount(); if (!progress(done, total, rel)) { CloseHandle(out); r.error = "cancelled"; return r; } }
         }
         CloseHandle(out);
         r.files++;
@@ -467,9 +466,34 @@ ExtractResult extract_impl(const std::string& pkg, const std::string& outDir,
 
 }  // namespace
 
-ExtractResult extract_package(const std::string& package, const std::string& outDir,
-                              const std::function<void(unsigned long long, unsigned long long, const std::string&)>& progress) {
+const char* const kPackageSha256 = "22fdb63f0fef1aa948d15db130868113f59c43bd9fc35515fe74d65613b44fbe";
+const char* const kPackageSha1 = "162c25adea84fdc8534808ee0e2560bb0f7f2bcd";
+const char* const kPackageMd5 = "24a9cfc28ff5546e202aa07e40fd3923";
+
+ExtractResult extract_package(const std::string& package, const std::string& outDir, const ExtractProgress& progress) {
     return extract_impl(package, outDir, progress);
+}
+
+std::string file_sha256(const std::string& path, const ExtractProgress& progress) {
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return "";
+    LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
+    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_HASH_HANDLE h = nullptr; uint8_t out[32] = {}; std::string res;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 && BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0) {
+        std::vector<uint8_t> buf(1 << 22); unsigned long long done = 0; bool ok = true; DWORD tick = 0;
+        for (;;) {
+            DWORD got = 0;
+            if (!ReadFile(f, buf.data(), (DWORD)buf.size(), &got, nullptr)) { ok = false; break; }
+            if (!got) break;
+            BCryptHashData(h, buf.data(), got, 0); done += got;
+            if (progress && GetTickCount() - tick > 100) { tick = GetTickCount(); if (!progress(done, (unsigned long long)sz.QuadPart, "")) { ok = false; break; } }
+        }
+        if (ok && BCryptFinishHash(h, out, 32, 0) == 0) { for (uint8_t c : out) res += fmt("%02x", c); }
+    }
+    if (h) BCryptDestroyHash(h);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(f);
+    return res;
 }
 
 int extract_main(int argc, char** argv) {
@@ -478,6 +502,7 @@ int extract_main(int argc, char** argv) {
     const DWORD t0 = GetTickCount();
     auto r = extract_package(argv[2], argv[3], [&](unsigned long long d, unsigned long long t, const std::string& f) {
         fprintf(stderr, "\r%5.1f%%  %-60.60s", t ? 100.0 * d / t : 100.0, f.c_str());
+        return true;
     });
     fprintf(stderr, "\n");
     if (!r.ok) { fprintf(stderr, "extraction failed: %s\n", r.error.c_str()); return 1; }

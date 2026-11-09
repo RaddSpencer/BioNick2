@@ -9,7 +9,7 @@
 
 <div class=WordSection1>
 
-<p class=MsoTitle align=center style='text-align:center'>Bio Nick 2</p>
+<center><h1>Requirements</h1></center>
 
 <p class=MsoNormal>Bio Nick 2 is a native Windows port of Bionic Commando
 Rearmed 2 (XBLA, &quot;World&quot; release). The game's Xbox 360 code is

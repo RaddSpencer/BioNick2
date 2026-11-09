@@ -209,6 +209,7 @@ static std::atomic<uint64_t> g_lastF9{0};
 static std::atomic<bool> g_screenshotWanted{false};   // F12
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); TerminateProcess(GetCurrentProcess(), 0); }
+    kbm_note_message(h, m, w, l);
     if (m == WM_SIZE) g_sizeChanged = true;
     if (m == WM_MOUSEWHEEL) { kbm_note_wheel((short)HIWORD(w)); return 0; }
     if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) g_screenshotWanted = true;
@@ -3002,7 +3003,7 @@ static void shot_ring() {
 static void take_screenshot_if_wanted() {
     static bool f12Prev = false;
     {   // read from the keyboard state too: the window message only arrives while this window has keyboard focus
-        const bool d = kbm_window_active() && (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+        const bool d = kbm_reserved_down(VK_F12);
         if (d && !f12Prev) g_screenshotWanted = true;
         f12Prev = d;
     }
@@ -3276,7 +3277,7 @@ static void do_swap(uint32_t front) {
         static const bool kShots = true;
         static bool f9Prev = false;
         if (kShots && g_logging) {
-            const bool d = kbm_window_active() && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+            const bool d = kbm_reserved_down(VK_F9);
             if (d && !f9Prev && g_frame > g_lastF9 + 90) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } fprintf(stderr, "[capture] F9 pressed (polled) at frame %llu\n", (unsigned long long)g_frame); }
             f9Prev = d;
         }

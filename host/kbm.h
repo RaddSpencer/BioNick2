@@ -10,6 +10,7 @@ bool kbm_down(const std::string& name);           // pressed now (false when the
 std::string kbm_new_press();                      // an assignable key or button pressed since the last call, or empty
 const char* kbm_icon(const std::string& name);    // icon file (no extension) in assets\keys, or nullptr
 void kbm_note_wheel(int delta);                   // from the window procedure
+void kbm_note_message(void* hwnd, unsigned msg, unsigned long long w, long long l);   // every message the window gets, to track which keys and buttons are held
 bool kbm_reserved_down(int vk);                   // a fixed key (arrows, Enter, Escape ...) pressed now, window in front
 bool kbm_window_active();
 void kbm_forget_edges();                          // the next kbm_new_press ignores what is held now

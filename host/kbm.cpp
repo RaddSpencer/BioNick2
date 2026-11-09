@@ -43,9 +43,11 @@ std::atomic<unsigned long long> g_wheelUp{0}, g_wheelDown{0};     // GetTickCoun
 bool g_prev[sizeof kKeys / sizeof kKeys[0]] = {};
 
 const Key* find(const std::string& n) { for (const Key& k : kKeys) if (n == k.name) return &k; return nullptr; }
+// Which keys and buttons are down, kept from the window's own key and mouse messages (not read from the system-wide keyboard state).
+std::atomic<unsigned char> g_down[256];
 bool raw_down(const Key& k) {
     if (k.vk == 0) { const unsigned long long now = GetTickCount64(); return k.name[12] == 'u' ? now < g_wheelUp.load() : now < g_wheelDown.load(); }
-    return (GetAsyncKeyState(k.vk) & 0x8000) != 0;
+    return g_down[k.vk & 0xFF].load() != 0;
 }
 
 }  // namespace
@@ -63,7 +65,31 @@ void kbm_note_wheel(int delta) {
     const unsigned long long until = GetTickCount64() + 150;
     if (delta > 0) g_wheelUp = until; else if (delta < 0) g_wheelDown = until;
 }
-bool kbm_reserved_down(int vk) { return kbm_window_active() && (GetAsyncKeyState(vk) & 0x8000) != 0; }
+bool kbm_reserved_down(int vk) { return kbm_window_active() && g_down[vk & 0xFF].load() != 0; }
+// Called from the window procedure for every message: keeps the table of held keys and mouse buttons.
+void kbm_note_message(void* hwnd, unsigned msg, unsigned long long w, long long l) {
+    auto set = [](int vk, bool on) { g_down[vk & 0xFF] = on ? 1 : 0; };
+    switch (msg) {
+      case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP: {
+        const bool on = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        int vk = (int)w; const bool ext = (l >> 24) & 1; const int scan = (int)((l >> 16) & 0xFF);
+        if (vk == VK_SHIFT) { set(VK_SHIFT, on); vk = scan == 0x36 ? VK_RSHIFT : VK_LSHIFT; }
+        else if (vk == VK_CONTROL) { set(VK_CONTROL, on); vk = ext ? VK_RCONTROL : VK_LCONTROL; }
+        else if (vk == VK_MENU) { set(VK_MENU, on); vk = ext ? VK_RMENU : VK_LMENU; }
+        set(vk, on);
+        break; }
+      case WM_LBUTTONDOWN: case WM_LBUTTONUP: set(VK_LBUTTON, msg == WM_LBUTTONDOWN); goto mouse;
+      case WM_RBUTTONDOWN: case WM_RBUTTONUP: set(VK_RBUTTON, msg == WM_RBUTTONDOWN); goto mouse;
+      case WM_MBUTTONDOWN: case WM_MBUTTONUP: set(VK_MBUTTON, msg == WM_MBUTTONDOWN); goto mouse;
+      case WM_XBUTTONDOWN: case WM_XBUTTONUP: set(HIWORD(w) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2, msg == WM_XBUTTONDOWN); goto mouse;
+      case WM_KILLFOCUS: case WM_CAPTURECHANGED: if (msg == WM_KILLFOCUS) for (auto& d : g_down) d = 0; break;
+      case WM_ACTIVATEAPP: if (!w) for (auto& d : g_down) d = 0; break;
+    }
+    return;
+mouse:   // keep receiving the button-up when the pointer has left the window
+    if (g_down[VK_LBUTTON] || g_down[VK_RBUTTON] || g_down[VK_MBUTTON] || g_down[VK_XBUTTON1] || g_down[VK_XBUTTON2]) { if (GetCapture() != (HWND)hwnd) SetCapture((HWND)hwnd); }
+    else if (GetCapture() == (HWND)hwnd) ReleaseCapture();
+}
 void kbm_forget_edges() { for (int i = 0; i < kNumKeys; i++) g_prev[i] = kbm_window_active() && raw_down(kKeys[i]); }
 std::string kbm_new_press() {
     const bool active = kbm_window_active();

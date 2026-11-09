@@ -3,99 +3,6 @@
 <head>
 <meta http-equiv=Content-Type content="text/html; charset=windows-1252">
 <meta name=Generator content="Microsoft Word 15 (filtered)">
-<style>
-<!--
- /* Font Definitions */
- @font-face
-	{font-family:"Cambria Math";
-	panose-1:2 4 5 3 5 4 6 3 2 4;}
-@font-face
-	{font-family:Calibri;
-	panose-1:2 15 5 2 2 2 4 3 2 4;}
-@font-face
-	{font-family:Consolas;
-	panose-1:2 11 6 9 2 2 4 3 2 4;}
- /* Style Definitions */
- p.MsoNormal, li.MsoNormal, div.MsoNormal
-	{margin-top:0in;
-	margin-right:0in;
-	margin-bottom:6.0pt;
-	margin-left:0in;
-	line-height:110%;
-	font-size:11.0pt;
-	font-family:"Calibri",sans-serif;}
-h1
-	{margin-top:16.0pt;
-	margin-right:0in;
-	margin-bottom:6.0pt;
-	margin-left:0in;
-	line-height:110%;
-	page-break-after:avoid;
-	font-size:16.0pt;
-	font-family:"Calibri",sans-serif;
-	color:#1F3864;}
-h2
-	{margin-top:12.0pt;
-	margin-right:0in;
-	margin-bottom:5.0pt;
-	margin-left:0in;
-	line-height:110%;
-	page-break-after:avoid;
-	font-size:13.0pt;
-	font-family:"Calibri",sans-serif;
-	color:#2F5496;}
-p.MsoListBullet, li.MsoListBullet, div.MsoListBullet
-	{margin-top:0in;
-	margin-right:0in;
-	margin-bottom:4.0pt;
-	margin-left:.5in;
-	text-indent:-.25in;
-	line-height:110%;
-	font-size:11.0pt;
-	font-family:"Calibri",sans-serif;}
-p.MsoTitle, li.MsoTitle, div.MsoTitle
-	{margin-top:0in;
-	margin-right:0in;
-	margin-bottom:10.0pt;
-	margin-left:0in;
-	line-height:110%;
-	font-size:24.0pt;
-	font-family:"Calibri",sans-serif;
-	color:#1F3864;
-	font-weight:bold;}
-p.Code, li.Code, div.Code
-	{mso-style-name:Code;
-	margin-top:0in;
-	margin-right:6.0pt;
-	margin-bottom:0in;
-	margin-left:6.0pt;
-	line-height:110%;
-	background:#F2F2F2;
-	font-size:11.0pt;
-	font-family:"Calibri",sans-serif;}
-p.TableText, li.TableText, div.TableText
-	{mso-style-name:"Table Text";
-	margin:0in;
-	font-size:10.0pt;
-	font-family:"Calibri",sans-serif;}
-.MsoChpDefault
-	{font-family:"Calibri",sans-serif;}
-.MsoPapDefault
-	{margin-bottom:6.0pt;
-	line-height:110%;}
-@page WordSection1
-	{size:8.5in 11.0in;
-	margin:1.0in 1.0in 1.0in 1.0in;}
-div.WordSection1
-	{page:WordSection1;}
- /* List Definitions */
- ol
-	{margin-bottom:0in;}
-ul
-	{margin-bottom:0in;}
--->
-</style>
-
 </head>
 
 <body lang=EN-US style='word-wrap:break-word'>
@@ -103,9 +10,6 @@ ul
 <div class=WordSection1>
 
 <p class=MsoTitle align=center style='text-align:center'>Bio Nick 2</p>
-
-<p class=MsoTitle><img width=623 height=208 id="Picture 1"
-src="README_files/image001.jpg"></p>
 
 <p class=MsoNormal>Bio Nick 2 is a native Windows port of Bionic Commando
 Rearmed 2 (XBLA, &quot;World&quot; release). The game's Xbox 360 code is

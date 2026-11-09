@@ -28,6 +28,7 @@ std::string gpu_fps_text();
 void gpu_set_texfilter(int mode);
 void gpu_set_aa(int mode);
 
+bool bcr2_log_requested();
 namespace {
 
 // Function statics: settings_apply_to_env runs from another file's static initialiser, possibly before this file's globals would exist.
@@ -983,7 +984,7 @@ void settings_apply_to_env() {
     gpu_set_aa(aa_from_name(values_()["aa"]));
     upgrades_set_source(0, values_()["b_cycleact"].c_str());
     upgrades_set_source(1, values_()["b_cyclepas"].c_str());
-    fprintf(stderr, "[settings] %s: display=%s scale=%s vsync=%s buttons=%s\n", ini_path().c_str(), values_()["display"].c_str(), values_()["scale"].c_str(), values_()["vsync"].c_str(), values_()["buttons"].c_str());
+    if (bcr2_log_requested()) fprintf(stderr, "[settings] %s: display=%s scale=%s vsync=%s buttons=%s\n", ini_path().c_str(), values_()["display"].c_str(), values_()["scale"].c_str(), values_()["vsync"].c_str(), values_()["buttons"].c_str());
 }
 
 int settings_button_set() { std::lock_guard<std::mutex> lk(lock_()); return button_set_from_name(values_()["buttons"]); }

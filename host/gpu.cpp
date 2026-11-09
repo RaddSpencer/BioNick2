@@ -124,6 +124,7 @@ static HWND g_hwnd = nullptr;
 static std::atomic<int> g_shotBurstLeft{0};
 static std::atomic<int> g_shotStep{1};
 static std::atomic<bool> g_ringDump{false};
+bool bcr2_log_requested();   // main.cpp: true when --log was given, also before main() runs
 static const int g_shotRingSize = getenv("BCR2_SHOTRING") ? atoi(getenv("BCR2_SHOTRING")) : 0;
 static uint64_t g_frame = 0;
 static ComPtr<ID3D11Device> g_dev;
@@ -150,7 +151,7 @@ static const int g_resScale = [] {
         if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) s = (int)std::max((dm.dmPelsWidth + 1279) / 1280, (dm.dmPelsHeight + 719) / 720);
     }
     s = s < 1 ? 1 : s > 4 ? 4 : s;
-    fprintf(stderr, "[display] render scale %dx (%dx%d)\n", s, 1280 * s, 720 * s);
+    if (bcr2_log_requested()) fprintf(stderr, "[display] render scale %dx (%dx%d)\n", s, 1280 * s, 720 * s);
     return s;
 }();
 static bool g_devOk = false, g_noOverwriteSrv = false;
@@ -202,13 +203,16 @@ static void note_present_for_fps() {
     if (dt >= 0.5) { g_fpsNow = (float)(frames / dt); g_msNow = (float)(1000.0 * dt / frames); frames = 0; last = now; }
 }
 
+extern bool g_logging;   // main.cpp: --log (or BCR2_LOG=1). Off by default: no log output, no shader recording, no F9 capture.
 static std::atomic<uint64_t> g_lastF9{0};
+static std::atomic<bool> g_screenshotWanted{false};   // F12
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); TerminateProcess(GetCurrentProcess(), 0); }
     if (m == WM_SIZE) g_sizeChanged = true;
     if (m == WM_MOUSEWHEEL) { kbm_note_wheel((short)HIWORD(w)); return 0; }
-    // F9 with BCR2_SHOTDIR set: save the last few seconds if BCR2_SHOTRING is set, else about the next 3 seconds, to catch something seen during play.
-    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && getenv("BCR2_SHOTDIR")) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } g_lastF9 = g_frame; fprintf(stderr, "[capture] F9 pressed at frame %llu\n", (unsigned long long)g_frame); }
+    if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) g_screenshotWanted = true;
+    // F9 (only with --log and BCR2_SHOTDIR set): save the last few seconds if BCR2_SHOTRING is set, else about the next 3 seconds, to catch something seen during play.
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && g_logging && getenv("BCR2_SHOTDIR")) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } g_lastF9 = g_frame; fprintf(stderr, "[capture] F9 pressed at frame %llu\n", (unsigned long long)g_frame); }
     if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29))) || (m == WM_KEYDOWN && w == VK_F11)) {
         if (!(l & (1 << 30))) {                                             // ignore auto-repeat
@@ -1129,7 +1133,7 @@ static std::vector<PackShader> g_pack;
 static bool g_packLoaded = false;
 static std::string g_manifestPath;
 static std::set<std::string> g_manifestLines;
-static const bool g_shaderRecord = getenv("BCR2_NORECORD") == nullptr;   // on by default: every shader the game uses is added to the manifest, so the next start compiles it ahead of time
+static bool shader_recording() { static const bool on = g_logging && getenv("BCR2_NORECORD") == nullptr; return on; }   // with --log: every shader the game uses is added to the manifest, so the next start compiles it ahead of time
 
 static std::string exe_dir() {
     wchar_t w[MAX_PATH]; GetModuleFileNameW(nullptr, w, MAX_PATH);
@@ -1162,7 +1166,7 @@ static void manifest_read() {
 }
 // Records a shader the game used: its container, plus the words that differ from it.
 static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen) {
-    if (!g_shaderRecord || !pack_load()) return;
+    if (!shader_recording() || !pack_load()) return;
     const PackShader* best = nullptr; size_t bestDiff = (size_t)-1;
     for (const PackShader& p : g_pack) {
         if (p.isVs != isVs || p.words != code.size()) continue;
@@ -1228,7 +1232,7 @@ static void shader_precompile() {
     QueryPerformanceCounter(&t1);
     fprintf(stderr, "[shader] done in %.1f s\n", (double)(t1.QuadPart - t0.QuadPart) * g_perfTicksToMs / 1000.0);
     if (FILE* f = fopen(stampPath.c_str(), "w")) { fputs(stampWant.c_str(), f); fclose(f); }
-    if (!g_shaderRecord) { std::vector<uint8_t>().swap(g_packData); g_pack.clear(); g_packLoaded = false; }   // no longer needed
+    if (!shader_recording()) { std::vector<uint8_t>().swap(g_packData); g_pack.clear(); g_packLoaded = false; }   // no longer needed
 }
 
 static inline uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
@@ -2984,8 +2988,53 @@ static void shot_ring(const char* dir) {
         fprintf(stderr, "[capture] frame %llu: saved the previous %d images in %.1f s\n", (unsigned long long)g_frame, saved, (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs / 1000.0);
     }
 }
+// F12: save what is on screen as a PNG in <exe>\..\screenshots. The copy is made here, in the frame; encoding and writing happen on another thread.
+static void take_screenshot_if_wanted() {
+    static bool f12Prev = false;
+    {   // read from the keyboard state too: the window message only arrives while this window has keyboard focus
+        const bool d = kbm_window_active() && (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+        if (d && !f12Prev) g_screenshotWanted = true;
+        f12Prev = d;
+    }
+    static const uint64_t kAt = getenv("BCR2_F12AT") ? _atoi64(getenv("BCR2_F12AT")) : 0;   // test aid: press F12 at this frame
+    if (kAt && g_frame == kAt) g_screenshotWanted = true;
+    if (!g_screenshotWanted.exchange(false)) return;
+    D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
+    d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return;
+    g_ctx->CopyResource(st.Get(), g_backTex.Get());
+    D3D11_MAPPED_SUBRESOURCE ms; if (FAILED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) return;
+    const bool bgra = d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    auto px = std::make_shared<std::vector<uint8_t>>((size_t)d.Width * d.Height * 4);
+    for (uint32_t y = 0; y < d.Height; y++) {
+        const uint8_t* s = (const uint8_t*)ms.pData + (size_t)y * ms.RowPitch; uint8_t* o = px->data() + (size_t)y * d.Width * 4;
+        for (uint32_t x = 0; x < d.Width; x++) { o[x * 4] = bgra ? s[x * 4] : s[x * 4 + 2]; o[x * 4 + 1] = s[x * 4 + 1]; o[x * 4 + 2] = bgra ? s[x * 4 + 2] : s[x * 4]; o[x * 4 + 3] = 255; }
+    }
+    g_ctx->Unmap(st.Get(), 0);
+    SYSTEMTIME t; GetLocalTime(&t);
+    const std::string dir = exe_dir() + "\\..\\screenshots";
+    const std::string path = dir + S("\\bcr2_%04d-%02d-%02d_%02d-%02d-%02d-%03d.png", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    const uint32_t w = d.Width, h = d.Height;
+    std::thread([px, dir, path, w, h] {
+        CreateDirectoryA(dir.c_str(), nullptr);
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        ComPtr<IWICImagingFactory> f; ComPtr<IWICBitmapEncoder> enc; ComPtr<IWICStream> stream; ComPtr<IWICBitmapFrameEncode> frame; bool ok = false;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f))) && SUCCEEDED(f->CreateStream(&stream)) &&
+            SUCCEEDED(stream->InitializeFromFilename(std::wstring(path.begin(), path.end()).c_str(), GENERIC_WRITE)) &&
+            SUCCEEDED(f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) && SUCCEEDED(enc->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
+            SUCCEEDED(enc->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr))) {
+            WICPixelFormatGUID pf = GUID_WICPixelFormat32bppBGRA;
+            ok = SUCCEEDED(frame->SetSize(w, h)) && SUCCEEDED(frame->SetPixelFormat(&pf)) && SUCCEEDED(frame->WritePixels(h, w * 4, (UINT)px->size(), px->data())) &&
+                 SUCCEEDED(frame->Commit()) && SUCCEEDED(enc->Commit());
+        }
+        frame.Reset(); enc.Reset(); stream.Reset(); f.Reset();
+        if (SUCCEEDED(co)) CoUninitialize();
+        fprintf(stderr, "[screenshot] %s %s\n", ok ? "saved" : "FAILED", path.c_str());
+    }).detach();
+}
 static void write_shot() {
-    static const char* dir = getenv("BCR2_SHOTDIR");
+    take_screenshot_if_wanted();
+    static const char* dir = g_logging ? getenv("BCR2_SHOTDIR") : nullptr;
     if (!dir) return;
     if (g_shotRingSize > 0) shot_ring(dir);
     static const int every = getenv("BCR2_SHOTEVERY") ? std::max(atoi(getenv("BCR2_SHOTEVERY")), 1) : 60;
@@ -3214,7 +3263,7 @@ static void do_swap(uint32_t front) {
     {   // F9 again, read from the keyboard state: the window message only arrives while this window has keyboard focus, and a pad player may not have clicked it
         static const bool kShots = getenv("BCR2_SHOTDIR") != nullptr;
         static bool f9Prev = false;
-        if (kShots) {
+        if (kShots && g_logging) {
             const bool d = kbm_window_active() && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
             if (d && !f9Prev && g_frame > g_lastF9 + 90) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } fprintf(stderr, "[capture] F9 pressed (polled) at frame %llu\n", (unsigned long long)g_frame); }
             f9Prev = d;

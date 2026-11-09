@@ -47,3 +47,5 @@ host/captures/
 # the unpacked game (made by the first-run setup)
 host/game/
 host/game.tmp/
+
+host/screenshots/

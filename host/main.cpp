@@ -370,7 +370,17 @@ unsigned dbg_intr_issued();
 unsigned dbg_intr_done();
 
 void dbg_dump_waits(unsigned minMs);
+bool bcr2_log_requested() { static const bool r = getenv("BCR2_LOG") != nullptr || strstr(GetCommandLineA(), "--log") != nullptr; return r; }   // usable before main(), by static initialisers
+bool g_logging = false;   // --log (or BCR2_LOG=1): log output, shader recording and F9 capture. Off by default.
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc;) {   // --log can come anywhere; the rest of the command line is as before
+        if (!strcmp(argv[i], "--log")) { g_logging = true; for (int j = i; j < argc; j++) argv[j] = argv[j + 1]; argc--; } else i++;
+    }
+    if (getenv("BCR2_LOG")) g_logging = true;
+    if (!g_logging) freopen("NUL", "w", stderr);   // nothing is logged unless asked for
+    else if (GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_UNKNOWN) {   // no console or redirect to log to: write bcr2.log beside the exe
+        char p[MAX_PATH]; GetModuleFileNameA(nullptr, p, MAX_PATH); std::string s = p; s = s.substr(0, s.find_last_of('\\')) + "\\bcr2.log"; freopen(s.c_str(), "w", stderr);
+    }
     if (argc >= 2 && !strcmp(argv[1], "--extract")) return extract_main(argc, argv);   // unpack the game from its content package, from the command line
     std::string frBase, frRoot; char* frArgv[3];
     if (argc < 2) {   // started without arguments: use the unpacked game in host\game, asking for the game file and unpacking it first if need be

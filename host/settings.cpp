@@ -39,7 +39,7 @@ std::map<std::string, std::string>& values_() { static std::map<std::string, std
 #define BCR_SOURCES "a", "b", "x", "y", "lb", "rb", "lt", "rt", "l3", "r3"
 struct Def { const char* key; const char* def; const char* allowed[20]; const char* env; };
 const Def kDefs[] = {
-    { "display", "window", { "window", "borderless", "fullscreen", nullptr }, "BCR2_DISPLAY" },
+    { "display", "window", { "window", "borderless", nullptr }, "BCR2_DISPLAY" },
     { "scale",   "auto",   { "auto", "1", "2", "3", "4", nullptr },           "BCR2_RESSCALE" },
     { "outres",  "auto",   { "auto", "720", "1080", "1440", "2160", nullptr }, "BCR2_OUTRES" },
     { "vsync",   "on",     { "on", "off", nullptr },                          "BCR2_VRR" },          // off = frames shown at fixed times after the game tick (variable refresh pacing)
@@ -112,7 +112,7 @@ void load_ini() {
 void save_ini() {
     if (FILE* f = fopen(ini_path().c_str(), "w")) {
         fprintf(f, "# Bionic Commando Rearmed 2 (recomp) settings. Written by the PC Settings and Controls menus; you can edit it by hand while the game is closed.\n");
-        fprintf(f, "# display: window, borderless or fullscreen.  scale: auto, 1, 2, 3 or 4 times 1280x720.  vsync: on, or off to show frames at fixed times after the game tick (best on a G-Sync or FreeSync display, else it tears).  buttons: xbox, playstation or switch (the button labels).\n");
+        fprintf(f, "# display: window or borderless.  scale: auto, 1, 2, 3 or 4 times 1280x720.  vsync: on, or off to show frames at fixed times after the game tick (best on a G-Sync or FreeSync display, else it tears).  buttons: xbox, playstation or switch (the button labels).\n");
         fprintf(f, "# scale: internal render size (1 = 720p, 2 = 1440p, 3 = 2160p).  outres: the size of the picture on screen, auto or 720, 1080, 1440, 2160 (the render is resampled to it).  gamma: percent, 50 to 150.\n");
         fprintf(f, "# nojump: on turns jumping off (the Retro rule: the Death From Above move still works).  god: on makes the player invulnerable with unlimited lives.  skipsplash: on goes straight to the title screen at start.\n");
         fprintf(f, "# swapconfirm: on makes the right face button (Xbox B) confirm and the bottom one (Xbox A) cancel in the menus.\n");
@@ -133,8 +133,8 @@ bool& cap_fresh_() { static bool b = false; return b; }
 uint32_t& cap_prev_() { static uint32_t m = 0; return m; }
 bool& ui_open_() { static bool b = false; return b; }
 bool& cap_block_() { static bool b = false; return b; }
-int display_from_name(const std::string& v) { return v == "borderless" ? 1 : v == "fullscreen" ? 2 : 0; }
-const char* display_name(int m) { return m == 1 ? "borderless" : m == 2 ? "fullscreen" : "window"; }
+int display_from_name(const std::string& v) { return v == "borderless" || v == "fullscreen" ? 1 : 0; }   // "fullscreen" (exclusive) was removed from old ini files means borderless
+const char* display_name(int m) { return m >= 1 ? "borderless" : "window"; }
 
 // The PC Settings and Controls menus, in Lua. @INIT@ becomes a table of the current values. No -- comments: this text is also handed to the game as one line while testing.
 //
@@ -182,7 +182,8 @@ local STR = {
   bcr_pc_display = "Display Mode",
   bcr_pc_display_window = "Windowed",
   bcr_pc_display_borderless = "Borderless Fullscreen",
-  bcr_pc_display_fullscreen = "Exclusive Fullscreen",
++
+
   bcr_pc_scale = "Internal Resolution (requires restart)",
   bcr_pc_scale_auto = "Auto",
   bcr_pc_scale_1 = "720p",
@@ -245,7 +246,7 @@ end
 Global.bcr_pc = Global.bcr_pc or INIT
 Global.bcr_set_labels = set_labels
 local GFX = {
-  { key = "display", text = "bcr_pc_display", options = { { "window", "bcr_pc_display_window" }, { "borderless", "bcr_pc_display_borderless" }, { "fullscreen", "bcr_pc_display_fullscreen" } } },
+  { key = "display", text = "bcr_pc_display", options = { { "window", "bcr_pc_display_window" }, { "borderless", "bcr_pc_display_borderless" } } },
   { key = "scale", text = "bcr_pc_scale", options = { { "auto", "bcr_pc_scale_auto" }, { "1", "bcr_pc_scale_1" }, { "2", "bcr_pc_scale_2" }, { "3", "bcr_pc_scale_3" } } },
   { key = "outres", text = "bcr_pc_outres", options = { { "auto", "bcr_pc_outres_auto" }, { "720", "bcr_pc_outres_720" }, { "1080", "bcr_pc_outres_1080" }, { "1440", "bcr_pc_outres_1440" }, { "2160", "bcr_pc_outres_2160" } } },
   { key = "vsync", text = "bcr_pc_vsync", options = { { "on", "bcr_pc_on" }, { "off", "bcr_pc_vsync_off" } } },

@@ -175,13 +175,13 @@ static uint32_t g_vbPos = 0, g_ibPos = 0;
 static uint64_t g_draws = 0, g_resolves = 0, g_drawsFrame = 0;
 
 // Display modes. The window thread only asks; the GPU thread owns the swap chain and makes the change between frames.
-// Alt+Enter or F11: windowed fullscreen. Shift+Alt+Enter: exclusive fullscreen. BCR2_DISPLAY=window|borderless|fullscreen picks the starting mode.
+// Alt+Enter or F11: windowed fullscreen. BCR2_DISPLAY=window|borderless picks the starting mode. (Exclusive fullscreen was removed.)
 enum DisplayMode { kWindowed = 0, kBorderless = 1, kExclusive = 2 };
 static std::atomic<int> g_modeWanted{kWindowed};
 static std::atomic<bool> g_sizeChanged{false};
 static int g_modeNow = kWindowed;
 int gpu_display_mode() { return g_modeWanted.load(); }
-void gpu_set_display_mode(int mode) { g_modeWanted = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+void gpu_set_display_mode(int mode) { g_modeWanted = mode <= 0 ? kWindowed : kBorderless; }   // exclusive fullscreen was removed: it misbehaved when switching back to a window
 // The player's gamma (percent, 100 = unchanged) and whether the gamma screen's sample picture is showing. The final pass reads both.
 static std::atomic<float> g_gamma{1.0f};
 static std::atomic<bool> g_gammaPreview{false};
@@ -217,7 +217,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29))) || (m == WM_KEYDOWN && w == VK_F11)) {
         if (!(l & (1 << 30))) {                                             // ignore auto-repeat
-            int want = (m == WM_SYSKEYDOWN && (GetKeyState(VK_SHIFT) & 0x8000)) ? kExclusive : kBorderless;
+            int want = kBorderless;
             g_modeWanted = g_modeWanted.load() == kWindowed ? want : kWindowed;
         }
         return 0;
@@ -355,7 +355,7 @@ static bool device_init() {
         if (SUCCEEDED(g_swap->GetParent(IID_PPV_ARGS(&factory)))) factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
         if (const char* mode = getenv("BCR2_DISPLAY")) {
             if (!strcmp(mode, "borderless")) g_modeWanted = kBorderless;
-            else if (!strcmp(mode, "fullscreen")) g_modeWanted = kExclusive;
+            else if (!strcmp(mode, "fullscreen")) g_modeWanted = kBorderless;   // exclusive fullscreen is gone: the old name means borderless
         }
         D3D11_SAMPLER_DESC sd2{}; sd2.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; sd2.AddressU = sd2.AddressV = sd2.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; sd2.MaxLOD = D3D11_FLOAT32_MAX;
         g_dev->CreateSamplerState(&sd2, &g_presentSampler);

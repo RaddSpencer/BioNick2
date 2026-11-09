@@ -1219,7 +1219,7 @@ static std::unordered_map<uint32_t, std::string> g_paths;      // handle -> host
 struct DirState { std::vector<WIN32_FIND_DATAA> entries; size_t next = 0; bool init = false; };
 static std::unordered_map<uint32_t, DirState> g_dirs;
 static std::unordered_map<uint32_t, uint32_t> g_objOfHandle, g_handleOfObj;   // handle <-> guest object pointer
-static uint32_t g_nextHandle = 0x1000;
+static std::atomic<uint32_t> g_nextHandle{ 0x1000 };   // one counter for every kind of handle (files, events, threads, notification listeners, enumerators): separate ranges ran into each other after about 1000 handles
 
 static std::string read_ansi(uint8_t* base, uint32_t strPtr) {
     if (!strPtr) return "";
@@ -1293,7 +1293,7 @@ static void create_content_file(PPCContext& ctx, uint8_t* base, const std::strin
         set_iosb(base, iosb, st, 0); ctx.r3.u64 = st; return;
     }
     uint32_t gh;
-    { std::lock_guard<std::mutex> g(g_fileLock); gh = g_nextHandle; g_nextHandle += 4; g_files[gh] = h; g_paths[gh] = path; }
+    { std::lock_guard<std::mutex> g(g_fileLock); gh = g_nextHandle.fetch_add(4); g_files[gh] = h; g_paths[gh] = path; }
     wr32(base, outHandle, gh);
     uint32_t info = !existed ? 2 : (disposition == 0 || disposition >= 4) ? 3 : 1;   // CREATED / OVERWRITTEN / OPENED
     set_iosb(base, iosb, STATUS_SUCCESS_, info);
@@ -1323,7 +1323,7 @@ static void NtCreateFile_(PPCContext& ctx, uint8_t* base) {
         set_iosb(base, iosb, st, 0); ctx.r3.u64 = st; return;
     }
     uint32_t gh;
-    { std::lock_guard<std::mutex> g(g_fileLock); gh = g_nextHandle; g_nextHandle += 4; g_files[gh] = h; g_paths[gh] = path; }
+    { std::lock_guard<std::mutex> g(g_fileLock); gh = g_nextHandle.fetch_add(4); g_files[gh] = h; g_paths[gh] = path; }
     wr32(base, outHandle, gh);
     set_iosb(base, iosb, STATUS_SUCCESS_, 1);   // FILE_OPENED
     fprintf(stderr, "[file] NtCreateFile \"%s\" -> handle %08X\n", name.c_str(), gh);
@@ -1523,7 +1523,7 @@ static void NtQueryDirectoryFile_(PPCContext& ctx, uint8_t* base) {
 static void NtCreateEvent_(PPCContext& ctx, uint8_t* base) {
     HANDLE h = CreateEventA(nullptr, ctx.r5.u32 == 0 /*manual reset*/, ctx.r6.u32 != 0, nullptr);
     uint32_t gh;
-    { std::lock_guard<std::mutex> g(g_fileLock); gh = g_nextHandle; g_nextHandle += 4; g_files[gh] = h; }
+    { std::lock_guard<std::mutex> g(g_fileLock); gh = g_nextHandle.fetch_add(4); g_files[gh] = h; }
     wr32(base, ctx.r3.u32, gh);
 	fprintf(stderr, "[evt] create handle=%08X type=%u initial=%u lr=%08X\n", gh, ctx.r5.u32, ctx.r6.u32, (uint32_t)ctx.lr);
     ctx.r3.u64 = STATUS_SUCCESS_;
@@ -1537,9 +1537,8 @@ static void NtClose_(PPCContext& ctx, uint8_t*) {
     ctx.r3.u64 = STATUS_SUCCESS_;
 }
 
-static std::atomic<uint32_t> g_listenerNext{0x2000};
 static void XamNotifyCreateListener_(PPCContext& ctx, uint8_t*) {
-    uint32_t gh = g_listenerNext.fetch_add(4);
+    uint32_t gh = g_nextHandle.fetch_add(4);
     HANDLE h = CreateEventA(nullptr, TRUE, FALSE, nullptr);      // manual-reset, not signalled
     { std::lock_guard<std::mutex> g(g_fileLock); g_files[gh] = h; }
     ctx.r3.u64 = gh;
@@ -1705,7 +1704,7 @@ static void ExCreateThread_(PPCContext& ctx, uint8_t* base) {
     HANDLE h = CreateThread(nullptr, 64ull << 20, GuestThreadProc, ts,
                             CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     uint32_t gh;
-    { std::lock_guard<std::mutex> g(g_fileLock); gh = g_nextHandle; g_nextHandle += 4; g_files[gh] = h;
+    { std::lock_guard<std::mutex> g(g_fileLock); gh = g_nextHandle.fetch_add(4); g_files[gh] = h;
       g_objOfHandle[gh] = tobj; g_handleOfObj[tobj] = gh; }
     if (hP) wr32(base, hP, gh);
     if (idP) wr32(base, idP, tid);
@@ -2102,7 +2101,6 @@ static void XamContentGetDeviceData_(PPCContext& ctx, uint8_t* base) {
 
 // XamContentCreateEnumerator(user, deviceId, type, flags, itemsPerEnum, u32* bufferSize, u32* handle)
 // sizeof(XCONTENT_DATA) = 0x134: {u32 device; u32 type; wchar name[128]; char file[42]; pad}
-static std::atomic<uint32_t> g_enumNext{0x3000};
 static std::string save_base();
 // each save is a folder in host\saves; "<folder>.xcontent" beside it keeps the XCONTENT_DATA the game created it with.
 // A folder without one still lists, under its folder name.
@@ -2136,7 +2134,7 @@ static std::vector<std::vector<uint8_t>> list_saves(uint32_t type) {
 }
 static void XamContentCreateEnumerator_(PPCContext& ctx, uint8_t* base) {
     uint32_t id = ctx.r4.u32, type = ctx.r5.u32, items = ctx.r7.u32, sizeOut = ctx.r8.u32, handleOut = ctx.r9.u32;
-    uint32_t gh = g_enumNext.fetch_add(4);
+    uint32_t gh = g_nextHandle.fetch_add(4);
     ContentEnum e;
     if (id == kFakeDeviceId || id == 0) e.items = list_saves(type);    // 0 = any device
     fprintf(stderr, "[save] XamContentCreateEnumerator user=%u dev=%u type=%u flags=%08X items=%u -> %08X found=%zu lr=%08X\n",

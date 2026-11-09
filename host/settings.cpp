@@ -151,6 +151,20 @@ local main, pause = reg.menu_main, reg.menu_pause
 if not (main and main.data and main.data._nodes and main.data._nodes.main) then return "wait: menu_main" end
 local MenuNode = getmetatable(main.data._nodes.main)
 if not (MenuNode and MenuNode.new) then return "wait: node class" end
+do   -- The Achievements and Leaderboards rows are hidden at the item class, so a menu node that is built again (after the profile loads, say) can't bring them back
+  local its = main.data._nodes.main._items
+  local cmt = its and its[1] and getmetatable(its[1])
+  local cls = cmt and cmt.__index
+  if type(cls) == "table" and not rawget(cls, "bcr_vis") and type(cls.visible) == "function" then
+    cls.bcr_vis = true
+    local ov = cls.visible
+    cls.visible = function(self, ...)
+      local nm = self._parameters and self._parameters.name
+      if nm and (string.find(tostring(nm), "^achievements") or string.find(tostring(nm), "^leaderboards")) then return false end
+      return ov(self, ...)
+    end
+  end
+end
 local STR = {
   bcr_pc_settings = "Graphics Settings",
   bcr_pc_gamma = "Gamma Correction",

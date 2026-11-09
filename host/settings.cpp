@@ -182,8 +182,6 @@ local STR = {
   bcr_pc_display = "Display Mode",
   bcr_pc_display_window = "Windowed",
   bcr_pc_display_borderless = "Borderless Fullscreen",
-+
-
   bcr_pc_scale = "Internal Resolution (requires restart)",
   bcr_pc_scale_auto = "Auto",
   bcr_pc_scale_1 = "720p",

@@ -378,8 +378,16 @@ int main(int argc, char** argv) {
     }
     if (getenv("BCR2_LOG")) g_logging = true;
     if (!g_logging) freopen("NUL", "w", stderr);   // nothing is logged unless asked for
-    else if (GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_UNKNOWN) {   // no console or redirect to log to: write bcr2.log beside the exe
-        char p[MAX_PATH]; GetModuleFileNameA(nullptr, p, MAX_PATH); std::string s = p; s = s.substr(0, s.find_last_of('\\')) + "\\bcr2.log"; freopen(s.c_str(), "w", stderr);
+    else {   // with logging on, the log goes to _debug_logs beside the exe (BCR2_LOGFILE names another file)
+        char p[MAX_PATH]; GetModuleFileNameA(nullptr, p, MAX_PATH); std::string dir = p; dir = dir.substr(0, dir.find_last_of('\\'));
+        std::string file;
+        if (const char* e = getenv("BCR2_LOGFILE")) file = e;
+        else {
+            const std::string logs = dir + "\\_debug_logs"; CreateDirectoryA(logs.c_str(), nullptr);
+            SYSTEMTIME t; GetLocalTime(&t); char n[64]; snprintf(n, sizeof n, "\\bcr2_%04d-%02d-%02d_%02d-%02d-%02d.log", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+            file = logs + n;
+        }
+        if (!freopen(file.c_str(), "w", stderr)) freopen("NUL", "w", stderr);
     }
     if (argc >= 2 && !strcmp(argv[1], "--extract")) return extract_main(argc, argv);   // unpack the game from its content package, from the command line
     std::string frBase, frRoot; char* frArgv[3];

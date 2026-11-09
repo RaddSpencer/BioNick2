@@ -125,7 +125,7 @@ static std::atomic<int> g_shotBurstLeft{0};
 static std::atomic<int> g_shotStep{1};
 static std::atomic<bool> g_ringDump{false};
 bool bcr2_log_requested();   // main.cpp: true when --log was given, also before main() runs
-static const int g_shotRingSize = getenv("BCR2_SHOTRING") ? atoi(getenv("BCR2_SHOTRING")) : 0;
+static const int g_shotRingSize = getenv("BCR2_SHOTRING") ? atoi(getenv("BCR2_SHOTRING")) : (bcr2_log_requested() ? 90 : 0);   // with --log, F9 saves the last 3 s by default
 static uint64_t g_frame = 0;
 static ComPtr<ID3D11Device> g_dev;
 static ComPtr<ID3D11DeviceContext> g_ctx;
@@ -212,7 +212,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_MOUSEWHEEL) { kbm_note_wheel((short)HIWORD(w)); return 0; }
     if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) g_screenshotWanted = true;
     // F9 (only with --log and BCR2_SHOTDIR set): save the last few seconds if BCR2_SHOTRING is set, else about the next 3 seconds, to catch something seen during play.
-    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && g_logging && getenv("BCR2_SHOTDIR")) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } g_lastF9 = g_frame; fprintf(stderr, "[capture] F9 pressed at frame %llu\n", (unsigned long long)g_frame); }
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && g_logging) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } g_lastF9 = g_frame; fprintf(stderr, "[capture] F9 pressed at frame %llu\n", (unsigned long long)g_frame); }
     if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29))) || (m == WM_KEYDOWN && w == VK_F11)) {
         if (!(l & (1 << 30))) {                                             // ignore auto-repeat
@@ -2965,7 +2965,16 @@ static void save_shot(ID3D11Texture2D* st, const D3D11_TEXTURE2D_DESC& d, uint64
 }
 // BCR2_SHOTRING=n with BCR2_SHOTDIR: keep the last n images, one every 2 frames, in memory. F9 then saves them, so something rare can be caught after it is seen.
 // BCR2_SHOTRINGAT=frame does the same as pressing F9 at that frame, for testing.
-static void shot_ring(const char* dir) {
+// Where F9 captures go: BCR2_SHOTDIR if set, else a new folder _debug_capture\f9_<frame> beside the exe.
+static std::string capture_session_dir(uint64_t frame) {
+    if (const char* e = getenv("BCR2_SHOTDIR")) return e;
+    const std::string base = exe_dir() + "\\_debug_capture";
+    CreateDirectoryA(base.c_str(), nullptr);
+    const std::string d = base + S("\\f9_%llu", (unsigned long long)frame);
+    CreateDirectoryA(d.c_str(), nullptr);
+    return d;
+}
+static void shot_ring() {
     static const int kN = g_shotRingSize;
     static const uint64_t kAt = getenv("BCR2_SHOTRINGAT") ? _atoi64(getenv("BCR2_SHOTRINGAT")) : 0;
     static std::vector<ComPtr<ID3D11Texture2D>> tex; static std::vector<uint64_t> frames; static int next = 0; static uint32_t w = 0, h = 0;
@@ -2982,6 +2991,7 @@ static void shot_ring(const char* dir) {
     if (g_ringDump.exchange(false) || (kAt && g_frame == kAt)) {
         LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
         int saved = 0;
+        const std::string dirS = capture_session_dir(g_frame); const char* dir = dirS.c_str();
         draw_ring_dump(dir);
         for (int i = 0; i < kN; i++) { const int k = (next + i) % kN; if (frames[k] != ~0ull) { save_shot(tex[k].Get(), d, frames[k], dir); saved++; } }
         QueryPerformanceCounter(&b);
@@ -3034,13 +3044,15 @@ static void take_screenshot_if_wanted() {
 }
 static void write_shot() {
     take_screenshot_if_wanted();
-    static const char* dir = g_logging ? getenv("BCR2_SHOTDIR") : nullptr;
-    if (!dir) return;
-    if (g_shotRingSize > 0) shot_ring(dir);
-    static const int every = getenv("BCR2_SHOTEVERY") ? std::max(atoi(getenv("BCR2_SHOTEVERY")), 1) : 60;
+    if (!g_logging) return;
+    if (g_shotRingSize > 0) shot_ring();
+    static const char* envDir = getenv("BCR2_SHOTDIR");                       // set: a frame every BCR2_SHOTEVERY (default 60) goes there as well
+    static const int every = envDir ? (getenv("BCR2_SHOTEVERY") ? std::max(atoi(getenv("BCR2_SHOTEVERY")), 1) : 60) : 0;
+    static std::string burstDir;
     bool burst = g_shotBurstLeft.load() > 0;
-    if (burst) { g_shotBurstLeft--; if (g_frame % g_shotStep.load() != 0) return; }
-    if (!burst && (g_frame % every) != 0) return;
+    if (burst) { if (burstDir.empty()) burstDir = capture_session_dir(g_frame); g_shotBurstLeft--; if (g_frame % g_shotStep.load() != 0) return; }
+    else { burstDir.clear(); if (!every || (g_frame % every) != 0) return; }
+    const char* dir = burst ? burstDir.c_str() : envDir;
     D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
     d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
     ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return;
@@ -3261,7 +3273,7 @@ static void do_swap(uint32_t front) {
         g_ctx->ClearRenderTargetView(g_backRtv.Get(), c);
     }
     {   // F9 again, read from the keyboard state: the window message only arrives while this window has keyboard focus, and a pad player may not have clicked it
-        static const bool kShots = getenv("BCR2_SHOTDIR") != nullptr;
+        static const bool kShots = true;
         static bool f9Prev = false;
         if (kShots && g_logging) {
             const bool d = kbm_window_active() && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;

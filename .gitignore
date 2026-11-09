@@ -49,3 +49,6 @@ host/game/
 host/game.tmp/
 
 host/screenshots/
+
+# release builds
+release/

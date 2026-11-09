@@ -492,6 +492,33 @@ if P and not rawget(P, "bcr_music_hooks") then
       self._right_marker:set_width(90)
       self._right_marker:set_x(640 + 310 - ox)
     end
+    -- The game sets the lines to the selected row's text as it is now, and doesn't redo it when a choice changes, so a longer choice runs into them.
+    -- Set them for the longest choice of the highlighted row instead.
+    local hi = self._highlighted_item
+    local opts = hi and hi.options
+    if self.name ~= "bcr_music" and self._left_marker and self._right_marker and type(opts) == "table" and #opts > 1 and self.row_items then
+      local hn = hi._parameters and hi._parameters.name
+      local ri
+      for _, r2 in ipairs(self.row_items) do if r2.name == hn then ri = r2 break end end
+      local gp = ri and ri.gui_panel
+      if gp and gp.text_rect and gp.set_text and ri.option_text then
+        local cur, optc = gp:text(), tostring(ri.option_text)
+        if #cur >= #optc and string.sub(cur, #cur - #optc + 1) == optc then
+          local label = string.sub(cur, 1, #cur - #optc)
+          local maxw = 0
+          for _, o in ipairs(opts) do
+            local id = o._parameters and o._parameters.text_id
+            gp:set_text(label .. (id and managers.localization:text(id) or ""))
+            local _, _, w = gp:text_rect()
+            if w > maxw then maxw = w end
+          end
+          gp:set_text(cur)
+          local cx = gp:x() + gp:w() / 2
+          self._left_marker:set_x(cx - maxw / 2 - self._left_marker:w() - 4)
+          self._right_marker:set_x(cx + maxw / 2 + 4)
+        end
+      end
+    end
     return r
   end
   local o_hint = P._show_btn_hint
@@ -964,15 +991,16 @@ std::string lua_text(const char* embedded) {
 }  // namespace
 
 static std::atomic<bool> g_splashPress{false};
+static std::vector<const char*> g_ownEnv;   // the switches settings_apply_to_env set from the ini (not ones the user set): a restarted copy must not inherit them, or they would beat its own, newer ini
 void settings_apply_to_env() {
     std::lock_guard<std::mutex> lk(lock_());
     load_ini();
     for (const Def& d : kDefs) {
         const std::string& v = values_()[d.key];
         if (!d.env || getenv(d.env)) continue;                         // no switch for this one, or an explicit switch beats the file
-        if (!strcmp(d.key, "vsync")) { if (v == "off") _putenv_s(d.env, "1"); }
-        else if (!strcmp(d.key, "scale") || !strcmp(d.key, "outres")) { if (v != "auto") _putenv_s(d.env, v.c_str()); }
-        else _putenv_s(d.env, v.c_str());
+        if (!strcmp(d.key, "vsync")) { if (v == "off") { _putenv_s(d.env, "1"); g_ownEnv.push_back(d.env); } }
+        else if (!strcmp(d.key, "scale") || !strcmp(d.key, "outres")) { if (v != "auto") { _putenv_s(d.env, v.c_str()); g_ownEnv.push_back(d.env); } }
+        else { _putenv_s(d.env, v.c_str()); g_ownEnv.push_back(d.env); }
     }
     g_splashPress = values_()["skipsplash"] == "on";
     gpu_set_gamma(atoi(values_()["gamma"].c_str()));
@@ -1160,6 +1188,7 @@ static void music_log_append(const std::string& v) {
 static void restart_host() {
     fprintf(stderr, "[settings] restart requested\n"); fflush(stderr);
     if (getenv("BCR2_NORESTART")) return;
+    for (const char* e : g_ownEnv) _putenv_s(e, "");   // the new copy reads the ini again, instead of inheriting this copy's values
     std::wstring cmd = GetCommandLineW();
     wchar_t wd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, wd);
     STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};

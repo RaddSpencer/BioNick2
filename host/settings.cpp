@@ -521,22 +521,43 @@ local function gfx_items(kind)
 end
 )LUA"
 R"LUA(
-local MUSIC_EVENTS = {}
-do
-  local ev = managers.music and managers.music.music_events and managers.music:music_events("")
-  if type(ev) == "table" then
-    for _, e in pairs(ev) do
-      local s = tostring(e)
-      if s:find("^[Pp]lay_") then MUSIC_EVENTS[#MUSIC_EVENTS + 1] = s end
-    end
-  end
-  table.sort(MUSIC_EVENTS)
-end
+local MUSIC_TRACKS = {
+  { "Play_menu_music", "Title Screen" },
+  { "Play_prologue", "Introduction" },
+  { "Play_cinematic_exciting", "Confidence" },
+  { "Play_map_theme", "Stage Select" },
+  { "Play_intro", "Introduction II" },
+  { "Play_papagayan_anthem", "Papagayan Anthem" },
+  { "Play_boss_fight_regular_dialog", "Tough Guy" },
+  { "Play_boss_fight_regular_fight", "Beatdown" },
+  { "Play_area_clear", "Stage Clear" },
+  { "Play_facility", "Infiltration" },
+  { "Play_jungle_theme", "Flutes of Ektanadu" },
+  { "Play_mountain_slide", "Mountainslide" },
+  { "Play_cave_environment", "Leap of Faith (BCR2 Remix)" },
+  { "play_cliffs_and_caves", "Absolute Zero" },
+  { "Play_boss_fight_special_dialog", "Confrontation" },
+  { "Play_boss_fight_special_fight", "Duel" },
+  { "Play_mystery_01", "Impending Danger" },
+  { "Play_cinematic_sad", "Tears for the Fallen" },
+  { "Play_mystery_02", "Imminent Danger" },
+  { "play_main_theme_shuffle_mix", "Bionic Commando Rearmed (BCR2 Remix)" },
+  { "Play_cinematic_stressful", "Stress Fracture" },
+  { "Play_intense_intro_loop", "Heat Wave (BCR2 Remix)" },
+  { "Play_boss_fight_final_dialog", "Impact" },
+  { "Play_boss_fight_final_fight", "The Last Goodbye" },
+  { "Play_challenge_room", "Okay, We'll Move (BCR2 Remix)" },
+  { "Play_escape_from_prison", "Prison Escape" },
+  { "Play_helicopter_rail", "Time to Move" },
+  { "Play_credits", "A Fond Farewell" },
+  { "Play_main_menu_credits", "BCR2 Chipstep Remix" },
+  { "Play_death_stinger", "Defeat" },
+}
 local function music_items()
   local track = { _meta = "item", name = "bcr_track", text_id = "bcr_music_track", type = "CoreMenuItemToggle.ItemToggle" }
-  for _, e in ipairs(MUSIC_EVENTS) do
-    STR["bcr_mt_" .. e] = e
-    track[#track + 1] = { _meta = "option", value = e, text_id = "bcr_mt_" .. e }
+  for i, t in ipairs(MUSIC_TRACKS) do
+    STR["bcr_mt_" .. i] = t[2]
+    track[#track + 1] = { _meta = "option", value = t[1], text_id = "bcr_mt_" .. i }
   end
   return { track }
 end
@@ -684,7 +705,7 @@ if A == "!mplay" or A == "!mstop" then
     managers.music:stop()
     managers.music:post_event(tk:value())
   else
-    managers.music:stop()
+    managers.music:post_event("fade_out_music")
   end
 elseif A == "!exit" then
   managers.menu:open_dialog_menu("bcr_confirm_exit")

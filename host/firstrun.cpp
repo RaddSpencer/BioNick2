@@ -2,6 +2,7 @@
 // known checksum, unpacks it beside the host (host\game) and offers to start. Later runs find the unpacked game and skip all of this.
 #include "firstrun.h"
 #include "extract.h"
+#include "paths.h"
 #define NOMINMAX
 #include <windows.h>
 #include <shlobj.h>
@@ -71,7 +72,7 @@ bool game_is_unpacked(const std::string& gameDir) {
     return exists(gameDir + "\\basefile.bin") && exists(gameDir + "\\extracted_out\\assets\\all.bundle") && exists(gameDir + "\\.complete");
 }
 
-std::string game_dir() { return exe_dir() + "\\..\\game"; }
+std::string game_dir() { return bcr2_data_root() + "\\game"; }
 
 bool first_run_setup(std::string& basefile, std::string& contentRoot) {
     const std::string dir = game_dir();

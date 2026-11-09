@@ -1,3 +1,4 @@
+#include "paths.h"
 #include "upgradecycle.h"
 #include "settings.h"
 #include "ppc_config.h"
@@ -2175,7 +2176,7 @@ static std::string save_base() {                       // host\saves, beside the
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
     std::string s = exe;
     size_t p = s.find_last_of('\\');
-    s = (p == std::string::npos ? std::string(".") : s.substr(0, p)) + "\\..\\saves";
+    s = bcr2_data_root() + "\\saves";
     CreateDirectoryA(s.c_str(), nullptr);
     return s;
 }

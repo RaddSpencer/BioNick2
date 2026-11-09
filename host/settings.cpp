@@ -9,6 +9,7 @@
 // button prompts apply at once. Button bindings are applied by the Lua itself, in the game's input layer (see kInstallLua), except the two upgrade cycle
 // buttons, which the host reads from the pad (upgradecycle.cpp).
 #include "settings.h"
+#include "paths.h"
 #include "upgradecycle.h"
 #include "kbm.h"
 #include <windows.h>
@@ -73,11 +74,7 @@ const Def kDefs[] = {
     { "k_cyclepas",  "key_end",         { nullptr }, nullptr },
 };
 
-std::string ini_path() {
-    char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    std::string s = exe; size_t p = s.find_last_of('\\');
-    return (p == std::string::npos ? std::string(".") : s.substr(0, p)) + "\\..\\bcr2.ini";
-}
+std::string ini_path() { return bcr2_data_root() + "\\bcr2.ini"; }
 
 const Def* find_def(const std::string& key) { for (const Def& d : kDefs) if (key == d.key) return &d; return nullptr; }
 bool allowed(const Def& d, const std::string& v) {

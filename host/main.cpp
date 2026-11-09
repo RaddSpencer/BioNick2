@@ -366,10 +366,18 @@ static DWORD WINAPI GuestMain(LPVOID) {
 
 #include "extract.h"
 #include "firstrun.h"
+#include "paths.h"
 unsigned dbg_intr_issued();
 unsigned dbg_intr_done();
 
 void dbg_dump_waits(unsigned minMs);
+std::string bcr2_data_root() {
+    static const std::string r = [] {
+        char p[MAX_PATH]; GetModuleFileNameA(nullptr, p, MAX_PATH); std::string d = p; d = d.substr(0, d.find_last_of('\\'));
+        return GetFileAttributesA((d + "\\assets").c_str()) != INVALID_FILE_ATTRIBUTES ? d : d + "\\..";
+    }();
+    return r;
+}
 bool bcr2_log_requested() { static const bool r = getenv("BCR2_LOG") != nullptr || strstr(GetCommandLineA(), "--log") != nullptr; return r; }   // usable before main(), by static initialisers
 bool g_logging = false;   // --log (or BCR2_LOG=1): log output, shader recording and F9 capture. Off by default.
 int main(int argc, char** argv) {

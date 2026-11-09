@@ -18,6 +18,7 @@
 #include <d3d11_1.h>
 #include <dxgi1_5.h>
 #include "shaderpack.h"
+#include "paths.h"
 #include "kbm.h"
 #include <atomic>
 #include <condition_variable>
@@ -1155,7 +1156,7 @@ static void manifest_read() {
     if (const char* e = getenv("BCR2_SHADERMANIFEST")) g_manifestPath = e;
     else {                                                                   // beside the exe, or in the host folder above it during development
         g_manifestPath = exe_dir() + "\\shader_manifest.txt";
-        const std::string up = exe_dir() + "\\..\\shader_manifest.txt";
+        const std::string up = bcr2_data_root() + "\\shader_manifest.txt";
         if (GetFileAttributesA(g_manifestPath.c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributesA(up.c_str()) != INVALID_FILE_ATTRIBUTES) g_manifestPath = up;
     }
     if (FILE* f = fopen(g_manifestPath.c_str(), "r")) {
@@ -1541,8 +1542,7 @@ static std::wstring assets_dir() {
     wchar_t env[MAX_PATH];
     if (GetEnvironmentVariableW(L"BCR2_ASSETS", env, MAX_PATH)) return env;      // a checkout's host\assets, for builds that sit somewhere else
     wchar_t w[MAX_PATH]; GetModuleFileNameW(nullptr, w, MAX_PATH);
-    std::wstring s = w; s = s.substr(0, s.find_last_of(L'\\')) + L"\\..\\assets";
-    return s;
+    const std::string a = bcr2_data_root() + "\\assets"; return std::wstring(a.begin(), a.end());
 }
 // The replacement for the atlas, or null to use the game's own.
 // Pictures drawn over the frame after the final pass (the key and mouse icons on the Controls screen), in the 1280x720 space of the game's menus.
@@ -3022,7 +3022,7 @@ static void take_screenshot_if_wanted() {
     }
     g_ctx->Unmap(st.Get(), 0);
     SYSTEMTIME t; GetLocalTime(&t);
-    const std::string dir = exe_dir() + "\\..\\screenshots";
+    const std::string dir = bcr2_data_root() + "\\screenshots";
     const std::string path = dir + S("\\bcr2_%04d-%02d-%02d_%02d-%02d-%02d-%03d.png", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
     const uint32_t w = d.Width, h = d.Height;
     std::thread([px, dir, path, w, h] {

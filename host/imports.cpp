@@ -507,6 +507,19 @@ static void gpu_exec(uint8_t* base, const uint32_t* p, uint32_t n, int depth) {
             for (uint32_t k = 0; k < cnt && k < 8; k++) fprintf(stderr, " %08X", b[k]);
             fprintf(stderr, "\n");
         }
+        {   // BCR2_DRAWLOG=first,last game frames: every draw packet with its index count, the tile mask and select, and whether a predicate lets it run
+            extern uint64_t gpu_frame_number();
+            static uint64_t dlA = 0, dlB = 0; static const char* dlE = getenv("BCR2_DRAWLOG");
+            static bool dlP = (dlE && sscanf(dlE, "%llu,%llu", (unsigned long long*)&dlA, (unsigned long long*)&dlB), true); (void)dlP;
+            if (dlE && (op == 0x22 || op == 0x36)) {
+                uint64_t f = gpu_frame_number();
+                if (f >= dlA && f <= dlB) {
+                    uint32_t init = op == 0x36 ? b[0] : b[1];
+                    bool fireDl = !(hdr & 1) || (((uint64_t)g_binSelHi << 32 | g_binSelLo) & ((uint64_t)g_binMaskHi << 32 | g_binMaskLo)) != 0;
+                    fprintf(stderr, "[dl] f=%llu op=%02X ni=%u mask=%08X sel=%08X %s\n", (unsigned long long)f, op, init >> 16, g_binMaskLo, g_binSelLo, (hdr & 1) ? (fireDl ? "pred-fire" : "pred-skip") : "always");
+                }
+            }
+        }
         if (hdr & 1) {                                  // log only: what a predicate check would decide here
             static uint32_t predFire[128], predSkip[128]; static uint32_t predN = 0;
             bool fire = (((uint64_t)g_binSelHi << 32 | g_binSelLo) & ((uint64_t)g_binMaskHi << 32 | g_binMaskLo)) != 0;

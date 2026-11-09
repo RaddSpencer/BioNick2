@@ -1997,6 +1997,23 @@ static ID3D11RenderTargetView* g_curRtv[4] = {}; static ID3D11DepthStencilView* 
 static void invalidate_binds() { memset(g_curRtv, 0, sizeof(g_curRtv)); g_curDsv = nullptr; }
 
 static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBase, uint32_t dmaSize);
+// Draw ring (BCR2_SHOTRING): every draw of the last 240 frames, written to draws.txt in the capture folder when F9 is pressed.
+struct RingDraw { uint32_t vs, ps, num, vf, pitch, edram, win, vfw, vzero, vhash; };
+static std::map<uint64_t, std::vector<RingDraw>> g_drawRing;
+static void draw_ring_add(uint64_t frame, uint32_t vs, uint32_t ps, uint32_t num, uint32_t vf, uint32_t pitch, uint32_t edram, uint32_t win, uint32_t vfw, uint32_t vzero, uint32_t vhash) {
+    auto& v = g_drawRing[frame];
+    v.push_back({ vs, ps, num, vf, pitch, edram, win, vfw, vzero, vhash });
+    while (g_drawRing.size() > 240) g_drawRing.erase(g_drawRing.begin());
+}
+static void draw_ring_dump(const char* dir) {
+    FILE* f = fopen((std::string(dir) + "\\draws.txt").c_str(), "w");
+    if (!f) return;
+    for (auto& kv : g_drawRing) {
+        fprintf(f, "F %llu %zu\n", (unsigned long long)kv.first, kv.second.size());
+        for (auto& d : kv.second) fprintf(f, "%08X %08X %u %08X %u %u %08X %u %u %08X\n", d.vs, d.ps, d.num, d.vf, d.pitch, d.edram, d.win, d.vfw, d.vzero, d.vhash);
+    }
+    fclose(f);
+}
 static void do_resolve();
 static void sync_depth_alias(Rt* depth, uint32_t base, uint32_t pitch);
 
@@ -2109,6 +2126,18 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
 
     XShader* vs = build_shader(g_vsCode, true, 0xFFFFFFFFu);
     g_vsHash = (uint32_t)((unsigned long long)vs->hash >> 32);
+    if (g_shotRingSize > 0) {   // the draw ring: what was drawn in each of the last frames, saved beside the F9 images
+        const uint32_t vf0 = vs->vf.empty() ? 0 : (g_regs[R_FETCH + vs->vf[0].slot * 2] & ~3u);
+        uint32_t vfw = 0, vzero = 0, vhash = 0;   // the first vertex stream: its size in words, how many are zero, and a checksum (to tell a draw fed stale or empty vertices)
+        if (vf0 && !vs->vf.empty()) {
+            vfw = (g_regs[R_FETCH + vs->vf[0].slot * 2 + 1] >> 2) & 0xFFFFFF;
+            const uint32_t* w = (const uint32_t*)phys(vf0);
+            const uint32_t lim = vfw < 65536 ? vfw : 65536;
+            vhash = 2166136261u;
+            for (uint32_t i = 0; i < lim; i++) { vzero += w[i] == 0; vhash = (vhash ^ w[i]) * 16777619u; }
+        }
+        draw_ring_add(g_frame, g_vsHash, (uint32_t)((unsigned long long)g_psHash), num, vf0, g_regs[R_SURFACE_INFO] & 0x3FFF, edram, g_regs[R_WINDOW_OFFSET], vfw, vzero, vhash);
+    }
     uint32_t misc = g_regs[R_CONTEXT_MISC], pcntl = g_regs[R_PROGRAM_CNTL];
     uint32_t paramGen = ((pcntl >> 18) & 1) ? ((misc >> 8) & 0xFF) : 0xFFFFFFFFu;
     bool depthOnly = edram == 5;
@@ -2513,7 +2542,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     } probe(rtvs[0], rw, rh, 0);
     {   // experiment: BCR2_SKIPVS=<hash> leaves out draws using this vertex shader, to test what depends on them
         static const char* kSkip = getenv("BCR2_SKIPVS");
-        if (kSkip && S("%016llX", (unsigned long long)vs->hash) == kSkip) return;
+        if (kSkip && S("%016llX", (unsigned long long)vs->hash).compare(0, strlen(kSkip), kSkip) == 0) return;   // a prefix is enough (the draw ring shows the first 8 digits)
     }
     if (useIdx) {
         uint32_t bytes = drawCount * 4;
@@ -2949,6 +2978,7 @@ static void shot_ring(const char* dir) {
     if (g_ringDump.exchange(false) || (kAt && g_frame == kAt)) {
         LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
         int saved = 0;
+        draw_ring_dump(dir);
         for (int i = 0; i < kN; i++) { const int k = (next + i) % kN; if (frames[k] != ~0ull) { save_shot(tex[k].Get(), d, frames[k], dir); saved++; } }
         QueryPerformanceCounter(&b);
         fprintf(stderr, "[capture] frame %llu: saved the previous %d images in %.1f s\n", (unsigned long long)g_frame, saved, (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs / 1000.0);

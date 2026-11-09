@@ -491,6 +491,20 @@ static void lua_run_chunk(PPCContext& ctx, uint8_t* base, uint32_t L, const char
     if (top >= 8 && PPC_LOAD_U32(top - 8 + 4) == 4 && (status != 0 || tag)) {
         static int nl = 0;
         if (nl++ < 200000) fprintf(stderr, "[lua-run] %s f=%llu status=%u: %s\n", tag ? tag : "god mode", (unsigned long long)gpu_frame_number(), status, (const char*)(base + PPC_LOAD_U32(top - 8) + 16));
+        if (tag && status == 0 && !strncmp((const char*)(base + PPC_LOAD_U32(top - 8) + 16), "DUMP=", 5)) {   // a test chunk asks for the words of a guest object
+            const uint32_t wa = (uint32_t)strtoul((const char*)(base + PPC_LOAD_U32(top - 8) + 21), nullptr, 16);
+            fprintf(stderr, "[dump] f=%llu %08X:", (unsigned long long)gpu_frame_number(), wa);
+            for (uint32_t o = 0; o < 0x280; o += 4) fprintf(stderr, " %08X", PPC_LOAD_U32(wa + o));
+            fprintf(stderr, "\n");
+        }
+        if (tag && status == 0 && !strncmp((const char*)(base + PPC_LOAD_U32(top - 8) + 16), "WATCH=", 6)) {   // a test chunk asks for a data breakpoint on a guest address
+            extern void hw_watch_set(uint32_t);
+            const uint32_t wa = (uint32_t)strtoul((const char*)(base + PPC_LOAD_U32(top - 8) + 22), nullptr, 16) + (getenv("BCR2_WATCHOFF") ? (uint32_t)strtoul(getenv("BCR2_WATCHOFF"), nullptr, 16) : 0);
+            fprintf(stderr, "[lua-run] words at %08X:", wa);
+            for (uint32_t o = 0; o < 0x80; o += 4) fprintf(stderr, " %08X", PPC_LOAD_U32(wa + o));
+            fprintf(stderr, "\n");
+            hw_watch_set(wa);
+        }
     }
     PPC_STORE_U32(L + 8, PPC_LOAD_U32(L + 32) + topOff);
     ctx.r1.u64 = oldSp;
@@ -505,6 +519,7 @@ PPC_FUNC(sub_82634458) {
     static const char* const kRun = getenv("BCR2_LUARUN");
     static const bool kGunFix = getenv("BCR2_NOGUNFIX") == nullptr;
     static const bool kDfaLimit = getenv("BCR2_NODFALIMIT") == nullptr;
+    static const bool kBeltFix = getenv("BCR2_NOBELTFIX") == nullptr;
     static const bool kNoMusic = getenv("BCR2_NOMUSIC") != nullptr;
     static const bool kSoundLog = getenv("BCR2_SOUNDLOG") != nullptr;
     static thread_local bool inside = false;
@@ -548,7 +563,7 @@ PPC_FUNC(sub_82634458) {
             inside = false;
         }
     }
-    if (kGod || kRun || kGunFix || kNoMusic || kSoundLog || kDfaLimit) {
+    if (kGod || kRun || kGunFix || kNoMusic || kSoundLog || kDfaLimit || kBeltFix) {
         // About once a second, while this thread is already inside Lua. New players and levels are picked up the next time around.
         static const uint64_t kEvery = getenv("BCR2_LUAEVERY") ? _atoi64(getenv("BCR2_LUAEVERY")) : 60;   // frames between runs, for tests that need finer timing
         static std::atomic<uint64_t> nextFrame{ 300 };
@@ -616,6 +631,26 @@ PPC_FUNC(sub_82634458) {
             if (kDfaLimit) lua_run_chunk(ctx, base, L, kDfaLimitLua, "dfa limit");
             if (kNoMusic) lua_run_chunk(ctx, base, L, kNoMusicLua, nullptr);
             if (kSoundLog) lua_run_chunk(ctx, base, L, kSoundLogLua, "sound");
+            // Factory (level 17) belt chunks: each chunk's animation (the boxes riding the belt, a 3.33 s loop) starts when the chunk is created, and chunks are created
+            // one after the other as the player walks on, so neighbouring chunks run out of step and a box jumps where two chunks meet. This sets the animation time of each
+            // new chunk to that of a chunk already running. BCR2_NOBELTFIX turns it off.
+            static const char* const kBeltLua =
+                "if not (World and World.find_units_quick and Global) then return nil end "
+                "local old = Global.bcr_belt or {} local now, list, ref = {}, {}, nil "
+                "for _, u in ipairs(World:find_units_quick('all')) do "
+                  "if string.sub(tostring(u:name():key()), 1, 6) == 'ed4a00' then "
+                    "local k = string.match(tostring(u), '(%x+)%]$') or tostring(u) list[#list + 1] = { u, k } "
+                    "if old[k] then now[k] = true ref = ref or u end "
+                  "end "
+                "end "
+                "for _, e in ipairs(list) do "
+                  "if not now[e[2]] then "
+                    "if ref then local len = ref:anim_length() if len and len > 0 then e[1]:anim_set_time(ref:anim_time() % len) end else ref = e[1] end "
+                    "now[e[2]] = true "
+                  "end "
+                "end "
+                "Global.bcr_belt = now return nil";
+            if (kBeltFix) lua_run_chunk(ctx, base, L, kBeltLua, "belt");
             if (kGunFix) lua_run_chunk(ctx, base, L, kGunLua, nullptr);
             if (kGod) lua_run_chunk(ctx, base, L, kGodLua, nullptr);
             if (kRun) lua_run_chunk(ctx, base, L, kRun, "test");
@@ -1240,6 +1275,104 @@ PPC_FUNC(sub_82371260) {                                                     // 
     __imp__sub_82371260(ctx, base);
     uint32_t ib = be32_at(base, self + 892), ie = be32_at(base, self + 896);
     fprintf(stderr, "[rope] submit f=%llu tid=%lu this=%08X dirty=%u indices %d -> %d\n", (unsigned long long)gpu_frame_number(), GetCurrentThreadId(), self, dirty, (int)(ie0 - ib0) / 2, (int)(ie - ib) / 2);
+}
+
+// BCR2_AWAKELOG: each time an object's awake flag (+220) flips, with the reason string the decision left at +228.
+extern "C" void __imp__sub_8236B4A0(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_8236B4A0) {
+    static const bool on = getenv("BCR2_AWAKELOG") != nullptr;
+    if (!on) { __imp__sub_8236B4A0(ctx, base); return; }
+    const uint32_t self = ctx.r3.u32;
+    const uint8_t was = *(base + self + 220);
+    __imp__sub_8236B4A0(ctx, base);
+    const uint8_t now = *(base + self + 220);
+    if (was != now) {
+        const uint32_t rs = be32_at(base, self + 228);
+        fprintf(stderr, "[awake] f=%llu obj=%08X %u->%u reason=%08X \"%.40s\" parent=%08X\n", (unsigned long long)gpu_frame_number(), self, was, now, rs,
+                (rs >= 0x82000000u && rs < 0x83000000u) ? (const char*)(base + rs) : "?", be32_at(base, self + 52));
+    }
+}
+
+// BCR2_GRPLOG=frame: from that frame, each call of the group sync (82473620) and group update (82470E40)
+extern "C" void __imp__sub_82473620(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82473620) {
+    static const uint64_t kAt = getenv("BCR2_GRPLOG") ? _atoi64(getenv("BCR2_GRPLOG")) : 0;
+    static int n = 0;
+    if (kAt && gpu_frame_number() >= kAt && n < 300) {
+        n++;
+        uint32_t a = ctx.r3.u32, b = ctx.r4.u32;
+        fprintf(stderr, "[grp] sync f=%llu this=%08X dt=%.4f paused=%u tid=%lu\n", (unsigned long long)gpu_frame_number(), a, ctx.f1.f64, (unsigned)*(base + a + 225), GetCurrentThreadId()); (void)b;
+    }
+    __imp__sub_82473620(ctx, base);
+}
+extern "C" void __imp__sub_82470E40(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82470E40) {
+    static const uint64_t kAt = getenv("BCR2_GRPLOG") ? _atoi64(getenv("BCR2_GRPLOG")) : 0;
+    static int n = 0;
+    {   // Mass units (the background props a level's editor data scatters) switch on when the camera is within sqrt(R2) of them in the ground plane, with R2 = 9e6 (3000)
+        // for every definition. A prop 2950 behind the camera's plane therefore only appears once the camera is within about 550 of it: mid-screen, in plain view (the belt
+        // chunks in the factory level pop in like that). Widen the range so a prop is live before any part of it can be on screen, at any aspect ratio.
+        static const float kR2 = getenv("BCR2_NOMASSFIX") ? 0.0f : (getenv("BCR2_MASSR") ? (float)atof(getenv("BCR2_MASSR")) * (float)atof(getenv("BCR2_MASSR")) : 25000000.0f);
+        if (kR2 > 0) {
+            const uint32_t eb = be32_at(base, ctx.r3.u32 + 32), ee = be32_at(base, ctx.r3.u32 + 36);
+            if (eb >= 0x40000000u && ee > eb && ee < 0x7F000000u && (ee - eb) / 32 < 4096) {
+                uint32_t want; memcpy(&want, &kR2, 4); want = _byteswap_ulong(want);
+                for (uint32_t e = eb; e < ee; e += 32) {
+                    const uint32_t p = be32_at(base, e + 20);
+                    if (p < 0x40000000u || p >= 0x7F000000u) continue;
+                    const uint32_t q = be32_at(base, p + 4);
+                    if (q < 0x40000010u || q >= 0x7F000000u) continue;
+                    const uint32_t u = be32_at(base, q - 16 + 60);
+                    if (u < 0x40000000u || u >= 0x7F000000u) continue;
+                    uint32_t* r2 = (uint32_t*)(base + u + 68);
+                    if (*r2 == _byteswap_ulong(0x4B095440u)) *r2 = want;   // exactly the stock 9e6
+                }
+            }
+        }
+    }
+    if (kAt && gpu_frame_number() >= kAt && n < 300) {
+        n++;
+        if (n == 1) {
+            auto cf = [&](uint32_t o) { uint32_t v = be32_at(base, o); float f; memcpy(&f, &v, 4); return f; };
+            fprintf(stderr, "[grp] consts f27=%g f22=%g f23=%g f25=%g f24=%g\n", cf(0x82000000u + 11156), cf(0x82000000u + 11492), cf(0x82010000u - 24956), cf(0x82000000u + 14836), cf(0x82000000u + 11160));
+        }
+        uint32_t a = ctx.r3.u32, b = ctx.r4.u32, t = be32_at(base, b + 404);
+        auto fl = [&](uint32_t o) { uint32_t v = be32_at(base, o); float f; memcpy(&f, &v, 4); return f; };
+        if (n == 1) {
+            const uint32_t rb = be32_at(base, a + 48), re = be32_at(base, a + 52);
+            fprintf(stderr, "[grp] ranges (%u):", (re - rb) / 20);
+            for (uint32_t p = rb; p + 20 <= re && p < rb + 20 * 8; p += 20) {
+                uint32_t r8 = be32_at(base, p + 8), r12 = be32_at(base, p + 12); float f8, f12; memcpy(&f8, &r8, 4); memcpy(&f12, &r12, 4);
+                fprintf(stderr, " [%d..%d r=%g/%g cur=%d]", (int)be32_at(base, p), (int)be32_at(base, p + 4), f8, f12, (int)be32_at(base, p + 16));
+            }
+            fprintf(stderr, " flag84=%u\n", (unsigned)*(base + a + 84));
+            const uint32_t eb = be32_at(base, a + 32);
+            for (uint32_t i = 0; i < 229 && eb; i++) {
+                const uint32_t e = eb + i * 32, p = be32_at(base, e + 20), q = (p >= 0x40000000u && p < 0x7F000000u) ? be32_at(base, p + 4) : 0, u = (q >= 0x40000010u && q < 0x7F000000u) ? be32_at(base, q - 16 + 60) : 0;
+                if (u < 0x40000000u || u >= 0x7F000000u) { fprintf(stderr, "[grp] ent %d pos=%.0f,%.0f,%.0f unit=none (p=%08X q=%08X)\n", (int)i, fl(e), fl(e + 4), fl(e + 8), p, q); continue; }
+                fprintf(stderr, "[grp] ent %d pos=%.0f,%.0f,%.0f def=%08X R2=%g [64]=%g [72]=%g\n", (int)i, fl(e), fl(e + 4), fl(e + 8), u, fl(u + 68), fl(u + 64), fl(u + 72));
+            }
+        }
+        fprintf(stderr, "[grp] update f=%llu this=%08X src=%08X oldpos=%.1f,%.1f,%.1f newpos=%.1f,%.1f,%.1f src48=%.1f,%.1f,%.1f entries=%d\n", (unsigned long long)gpu_frame_number(), a, b,
+                fl(a + 20), fl(a + 24), fl(a + 28), fl(t + 48), fl(t + 52), fl(t + 56), fl(b + 48), fl(b + 52), fl(b + 56), (int)(be32_at(base, a + 36) - be32_at(base, a + 32)) / 32);
+    }
+    __imp__sub_82470E40(ctx, base);
+}
+
+extern "C" void __imp__sub_82467AB8(PPCContext& __restrict__ ctx, uint8_t* base);
+PPC_FUNC(sub_82467AB8) {                                                     // mass-unit group: move one entry (r4) between the lists of distance bands
+    static const uint64_t kAt = getenv("BCR2_GRPLOG") ? _atoi64(getenv("BCR2_GRPLOG")) : 0;
+    static int n = 0;
+    if (kAt && gpu_frame_number() >= kAt && n < 400) {
+        n++;
+        auto ok = [](uint32_t o) { return o >= 0x40000000u && o < 0x7F000000u; };
+        auto fl = [&](uint32_t o) { if (!ok(o)) return -1.0f; uint32_t v = be32_at(base, o); float f; memcpy(&f, &v, 4); return f; };
+        const uint32_t list = ctx.r3.u32, idx = ctx.r4.u32;
+        const uint32_t e = ok(list) && ok(be32_at(base, list)) ? be32_at(base, list) + idx * 32 : 0;
+        uint32_t p = ok(e) ? be32_at(base, e + 20) : 0, q = ok(p) ? be32_at(base, p + 4) : 0, u = ok(q) ? be32_at(base, q - 16 + 60) : 0;
+        fprintf(stderr, "[grp] move f=%llu idx=%d e=%08X pos=%.0f,%.0f,%.0f d2=%g R=%g lr=%08X\n", (unsigned long long)gpu_frame_number(), (int)idx, e, fl(e), fl(e + 4), fl(e + 8), fl(e + 16), fl(u + 68), (uint32_t)ctx.lr);
+    }
+    __imp__sub_82467AB8(ctx, base);
 }
 
 // BCR2_BUCKETWATCH=frame: from that frame, a data breakpoint on the atom list of a render bucket, to name the code that sorts and draws it

@@ -204,7 +204,11 @@ static DWORD WINAPI hw_watch_thread(LPVOID arg) {
         SuspendThread(t);
         CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if (GetThreadContext(t, &c)) {
-            if (direct) {
+            if (direct && getenv("BCR2_HWWATCH4")) {                // BCR2_HWWATCH4=stride (hex): four words, phys + 0..3 strides
+                const DWORD64 st = strtoul(getenv("BCR2_HWWATCH4"), nullptr, 16);
+                c.Dr0 = (DWORD64)(g_base + phys); c.Dr1 = c.Dr0 + st; c.Dr2 = c.Dr0 + 2 * st; c.Dr3 = c.Dr0 + 3 * st;
+                c.Dr7 = 0x1 | 0x4 | 0x10 | 0x40 | (0xDull << 16) | (0xDull << 20) | (0xDull << 24) | (0xDull << 28);
+            } else if (direct) {
                 c.Dr0 = (DWORD64)(g_base + phys);
                 c.Dr7 = 0x1 | ((getenv("BCR2_HWWATCHRW") ? 0xFull : 0xDull) << 16);          // BCR2_HWWATCHRW: reads too
             } else {

@@ -87,3 +87,9 @@ Actions are `jump`, `arm`, `fire`, `upgrade`, `next`, `prev`, `cycleact`, `biovi
 ## Known issues
 
 - On the Robot Factory level, boxes on the background conveyor belt sometimes pop in or out. The cause is not found yet.
+
+## AI Disclosure
+
+AI coding tools were used in developing and debugging this port. My focus has been on matching the original game as closely as possible while comparing builds with hardware and emulated references, identifying discrepancies, testing gameplay and prioritizing fixes.
+
+The project uses the original game assets from the player's own Xbox 360 copy. No copyrighted code or copyrighted/trademarked assets are included.

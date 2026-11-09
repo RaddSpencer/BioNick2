@@ -14,10 +14,11 @@ target_include_directories(bcr2 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ppc
     ${CMAKE_CURRENT_SOURCE_DIR}/generated
     C:/dev/XenonRecomp/thirdparty/simde)
+set(BCR2_GUEST_OPT "/O2" CACHE STRING "Optimisation flag for the recompiled game code: /O2 (fastest), /Os or /O1 (smaller).")
 option(BCR2_OPTIMIZE_GUEST "Optimise the recompiled game code." ON)
 if(BCR2_OPTIMIZE_GUEST)
     # Guest memory is shared between threads and read through byte-swapping macros, so keep aliasing rules off.
-    target_compile_options(bcr2 PRIVATE /O2 /w -msse4.1 /clang:-fno-strict-aliasing)
+    target_compile_options(bcr2 PRIVATE ${BCR2_GUEST_OPT} /w -msse4.1 /clang:-fno-strict-aliasing)
 else()
     target_compile_options(bcr2 PRIVATE /Od /w -msse4.1)
 endif()

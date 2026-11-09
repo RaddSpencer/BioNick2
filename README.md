@@ -1,4 +1,4 @@
-﻿# Bio Nick 2
+# Bio Nick 2
 
 <p align="center"><img src="docs/images/bionick2-logo.png" alt="Bio Nick 2" width="520"></p>
 
@@ -92,4 +92,4 @@ Actions are `jump`, `arm`, `fire`, `upgrade`, `next`, `prev`, `cycleact`, `biovi
 
 AI coding tools were used in developing and debugging this port. My focus has been on matching the original game as closely as possible while comparing builds with hardware and emulated references, identifying discrepancies, testing gameplay and prioritizing fixes.
 
-The project uses the original game assets from the player's own Xbox 360 copy. No copyrighted code or copyrighted/trademarked assets are included.
+The project uses the original game assets from the player's own Xbox 360 copy. No original game files are included, and the game’s code is not distributed in its original form.

@@ -538,10 +538,10 @@ PPC_FUNC(sub_82634458) {
         inside = false;
     }
     {   // The PC Settings menu: installs it into the game's menu data, then collects what the player changed there a few times a second.
-        static std::atomic<uint64_t> nextPc{ 200 };
+        static std::atomic<uint64_t> nextPc{ getenv("BCR2_PCINSTALLAT") ? (uint64_t)_atoi64(getenv("BCR2_PCINSTALLAT")) : 200 };   // BCR2_PCINSTALLAT: a test aid, installs the PC menus late
         static bool installed = false;
         uint64_t due = nextPc.load(), f = gpu_frame_number();
-        if (kPcMenu && !inside && f >= due && nextPc.compare_exchange_strong(due, f + (installed ? 4 : 30))) {
+        if (kPcMenu && !inside && f >= due && nextPc.compare_exchange_strong(due, f + (installed ? 4 : 2))) {   // until installed, try every 2 frames: a player who presses Start the moment the title appears reaches the main menu within about 20 frames, and a menu already built keeps the Achievements and Leaderboards rows
             inside = true;
             const PPCContext saved = ctx;
             const uint32_t L = saved.r3.u32, funcOff = saved.r4.u32 - PPC_LOAD_U32(L + 32);

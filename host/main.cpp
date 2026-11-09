@@ -364,11 +364,13 @@ static DWORD WINAPI GuestMain(LPVOID) {
     return 0;
 }
 
+#include "extract.h"
 unsigned dbg_intr_issued();
 unsigned dbg_intr_done();
 
 void dbg_dump_waits(unsigned minMs);
 int main(int argc, char** argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--extract")) return extract_main(argc, argv);   // first-time setup: unpack the game from its content package
     {   // Windows 11 throttles a process whose window is covered or unfocused: it may ignore the 1 ms timer below, so Sleep(1) can take about 15 ms, and it may
         // move threads to slower cores. The game's threads are timed in milliseconds, so opt out. BCR2_ALLOWTHROTTLE keeps the Windows default, for comparison.
         if (!getenv("BCR2_ALLOWTHROTTLE")) {

@@ -52,6 +52,7 @@ const Def kDefs[] = {
     { "god",     "off",     { "off", "on", nullptr },                          nullptr },
     { "skipsplash", "off",  { "off", "on", nullptr },                          nullptr },             // on: no legal or intro screens, straight to the title screen (read at start)
     { "swapconfirm", "off", { "off", "on", nullptr },                          nullptr },
+    { "language", "auto",   { "auto", "english", "french", "german", "spanish", "italian", nullptr }, nullptr },   // the game's text language (read at start); auto follows Windows
     // Which physical input triggers each action. The defaults are the game's own layout.
     { "b_jump",      "a",     { BCR_SOURCES, nullptr }, nullptr },
     { "b_arm",       "b",     { BCR_SOURCES, nullptr }, nullptr },
@@ -116,6 +117,7 @@ void save_ini() {
         fprintf(f, "# scale: internal render size (1 = 720p, 2 = 1440p, 3 = 2160p).  outres: the size of the picture on screen, auto or 720, 1080, 1440, 2160 (the render is resampled to it).  gamma: percent, 50 to 150.\n");
         fprintf(f, "# nojump: on turns jumping off (the Retro rule: the Death From Above move still works).  god: on makes the player invulnerable with unlimited lives.  skipsplash: on goes straight to the title screen at start.\n");
         fprintf(f, "# swapconfirm: on makes the right face button (Xbox B) confirm and the bottom one (Xbox A) cancel in the menus.\n");
+        fprintf(f, "# language: auto (your Windows display language if the game has it, else English), english, french, german, spanish or italian. Read at start.\n");
         fprintf(f, "# b_*: the pad input that triggers each action: a b x y lb rb lt rt l3 r3.  k_*: its key or mouse button (key_a, key_space, key_lshift, mouse_left, mouse_wheel_up, ...).\n");
         for (const Def& d : kDefs) fprintf(f, "%s=%s\n", d.key, values_()[d.key].c_str());
         fclose(f);
@@ -206,6 +208,13 @@ local STR = {
   bcr_pc_god = "God Mode",
   bcr_pc_skipsplash = "Skip Splash Screens",
   bcr_pc_swap = "Swap Confirm & Cancel",
+  bcr_pc_language = "Language (requires restart)",
+  bcr_pc_lang_auto = "Auto (Windows)",
+  bcr_pc_lang_english = "English",
+  bcr_pc_lang_french = "French",
+  bcr_pc_lang_german = "German",
+  bcr_pc_lang_spanish = "Spanish",
+  bcr_pc_lang_italian = "Italian",
   bcr_exit_q = "Exit without saving changes?",
   bcr_exit_cap = "Controls",
   bcr_restart_q = "Some changes need a restart. Save and restart now?",
@@ -265,6 +274,7 @@ local GFX = {
   { key = "filter", text = "bcr_pc_filter", options = { { "default", "bcr_pc_filter_default" }, { "bilinear", "bcr_pc_filter_bilinear" }, { "trilinear", "bcr_pc_filter_trilinear" }, { "aniso2", "bcr_pc_filter_aniso2" }, { "aniso4", "bcr_pc_filter_aniso4" }, { "aniso8", "bcr_pc_filter_aniso8" }, { "aniso16", "bcr_pc_filter_aniso16" } } },
   { key = "aa", text = "bcr_pc_aa", options = { { "off", "bcr_pc_aa_off" }, { "fxaa", "bcr_pc_aa_fxaa" }, { "fxaahigh", "bcr_pc_aa_fxaahigh" } } },
   { key = "fps", text = "bcr_pc_fps", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
+  { key = "language", text = "bcr_pc_language", options = { { "auto", "bcr_pc_lang_auto" }, { "english", "bcr_pc_lang_english" }, { "french", "bcr_pc_lang_french" }, { "german", "bcr_pc_lang_german" }, { "spanish", "bcr_pc_lang_spanish" }, { "italian", "bcr_pc_lang_italian" } } },
 }
 local SETS = {
   { key = "nojump", text = "bcr_pc_nojump", options = { { "off", "bcr_pc_off" }, { "on", "bcr_pc_on" } } },
@@ -386,7 +396,7 @@ local function toggle_item(key, text, options)
   for _, o in ipairs(options) do item[#item + 1] = { _meta = "option", value = o[1], text_id = o[2] } end
   return item
 end
-local RESTART_KEYS = { scale = true, outres = true, vsync = true }
+local RESTART_KEYS = { scale = true, outres = true, vsync = true, language = true }
 local function wire_items(node)
   for _, it in ipairs(node._items) do
     local key = it._parameters.bcr_key
@@ -925,12 +935,12 @@ if ui ~= Global.bcr_ui then
   o = (o and (o .. ";") or "") .. "ui=" .. ui
 end
 if pc and nname == "graphics_settings" and Global.bcr_lastnode ~= "graphics_settings" and Global.bcr_lastnode ~= "bcr_gamma" then
-  Global.bcr_gsnap = { scale = pc.scale, outres = pc.outres, vsync = pc.vsync }
+  Global.bcr_gsnap = { scale = pc.scale, outres = pc.outres, vsync = pc.vsync, language = pc.language }
 end
 if pc and top and top.name == "menu_main" and Global.bcr_lastnode == "graphics_settings" and nname and nname ~= "graphics_settings" and nname ~= "bcr_gamma" and Global.bcr_gsnap then
   local s = Global.bcr_gsnap
   Global.bcr_gsnap = nil
-  if s.scale ~= pc.scale or s.outres ~= pc.outres or s.vsync ~= pc.vsync then Global.bcr_prompt_wait = 6 end
+  if s.scale ~= pc.scale or s.outres ~= pc.outres or s.vsync ~= pc.vsync or s.language ~= pc.language then Global.bcr_prompt_wait = 6 end
 end
 if Global.bcr_prompt_wait then
   Global.bcr_prompt_wait = Global.bcr_prompt_wait - 1
@@ -1026,6 +1036,26 @@ void settings_apply_to_env() {
 }
 
 int settings_button_set() { std::lock_guard<std::mutex> lk(lock_()); return button_set_from_name(values_()["buttons"]); }
+
+// The console language the game is told (ExGetXConfigSetting): the "language" setting, or with "auto" the Windows display language when the game has it.
+// Xbox 360 values: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, 11 Polish, 12 Russian. BCR2 has text for English, French, German,
+// Spanish and Italian; for any other value it shows English.
+uint32_t settings_xlanguage() {
+    std::lock_guard<std::mutex> lk(lock_());
+    std::string v = values_()["language"];
+    if (v.empty() || v == "auto") {
+        switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
+            case LANG_FRENCH: v = "french"; break;
+            case LANG_GERMAN: v = "german"; break;
+            case LANG_SPANISH: v = "spanish"; break;
+            case LANG_ITALIAN: v = "italian"; break;
+            default: v = "english"; break;
+        }
+    }
+    static const struct { const char* name; uint32_t code; } kCodes[] = { { "english", 1 }, { "german", 3 }, { "french", 4 }, { "spanish", 5 }, { "italian", 6 } };
+    for (const auto& c : kCodes) if (v == c.name) return c.code;
+    return 1;
+}
 
 std::string settings_install_lua() {
     std::lock_guard<std::mutex> lk(lock_());

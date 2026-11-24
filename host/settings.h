@@ -20,3 +20,7 @@ void settings_apply_from_lua(const std::string& changes);
 // else reads the state.
 void settings_capture_filter(uint8_t* state);
 bool settings_capture_active();
+
+// The Xbox 360 console language to report to the game (ExGetXConfigSetting): the "language" setting, or with "auto" the Windows display language when
+// the game has text for it, else English.
+uint32_t settings_xlanguage();

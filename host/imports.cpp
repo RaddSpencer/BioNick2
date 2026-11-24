@@ -1655,7 +1655,7 @@ static void NtWaitForMultipleObjectsEx_(PPCContext& ctx, uint8_t* base) {
 static void ExGetXConfigSetting_(PPCContext& ctx, uint8_t* base) {
     uint32_t cat = ctx.r3.u32, setting = ctx.r4.u32, buf = ctx.r5.u32, bufSize = ctx.r6.u32, reqP = ctx.r7.u32;
     uint32_t value = 0, size = 4;
-    if (cat == 3 && setting == 9) value = 1;                 // user language: English
+    if (cat == 3 && setting == 9) value = settings_xlanguage();   // user language: the Language setting (settings.cpp)
     else fprintf(stderr, "[xconfig] category %u setting %u -> returning 0\n", cat, setting);
     if (reqP) wr32(base, reqP, size);
     if (bufSize < size) { ctx.r3.u64 = 0xC0000023; return; } // STATUS_BUFFER_TOO_SMALL
@@ -2357,6 +2357,7 @@ void register_all_imports() {
     register_by_name("NtWaitForSingleObjectEx",    NtWaitForSingleObjectEx_);
 	register_by_name("NtWaitForMultipleObjectsEx", NtWaitForMultipleObjectsEx_);
     register_by_name("ExGetXConfigSetting", ExGetXConfigSetting_);
+    register_by_name("XGetLanguage", [](PPCContext& ctx, uint8_t*) { ctx.r3.u64 = settings_xlanguage(); });   // imported but not seen called: BCR2 asks ExGetXConfigSetting
     register_by_name("NtOpenFile", NtOpenFile_);
     register_by_name("NtQueryDirectoryFile", NtQueryDirectoryFile_);
     register_by_name("ExCreateThread",  ExCreateThread_);
